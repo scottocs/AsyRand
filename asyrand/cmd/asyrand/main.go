@@ -5,18 +5,16 @@ import (
 	"crypto/ed25519"
 	"flag"
 	"fmt"
+	asig "github.com/scottocs/Tyche/asyrand/crypto"
 	"log"
 	"net"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/scottocs/asyrand/asyrand/internal/asyrand"
-	"github.com/scottocs/asyrand/asyrand/internal/config"
-	asig "github.com/scottocs/asyrand/asyrand/internal/crypto"
-	"github.com/scottocs/asyrand/asyrand/internal/dkg"
-	"github.com/scottocs/asyrand/asyrand/internal/p2p"
-	"github.com/scottocs/asyrand/asyrand/internal/pvss"
+	"github.com/scottocs/Tyche/asyrand/config"
+	asyrand "github.com/scottocs/Tyche/asyrand/protocol"
+	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 
@@ -24,8 +22,7 @@ type runtimeKeys struct {
 	ids        []p2p.NodeID
 	keys       map[p2p.NodeID]asig.KeyPair
 	pubs       map[string]ed25519.PublicKey
-	dkg        dkg.Result
-	pvssKeys   map[p2p.NodeID]pvss.KeyPair
+	pvssKeys   map[p2p.NodeID]asig.PVSSKeyPair
 	pvssPublic map[p2p.NodeID]kyber.Point
 	blsKeys    map[p2p.NodeID]asig.BLSKeyPair
 	blsPublic  map[string]kyber.Point
@@ -37,12 +34,15 @@ type runStats struct {
 }
 
 func main() {
-	configPath := flag.String("config", "configs/local_8.json", "cluster configuration file")
+	configPath := flag.String("config", "", "cluster configuration file")
 	nodeID := flag.String("node", "", "node id for single-process TCP deployment; empty starts an in-memory local cluster")
 	transport := flag.String("transport", "", "transport override: memory or tcp")
 	duration := flag.Duration("duration", 0, "optional run duration, for example 5m")
 	flag.Parse()
 
+	if *configPath == "" {
+		log.Fatal("-config is required")
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal(err)
@@ -94,26 +94,26 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 
 	for epoch := 0; epoch < cfg.Round; epoch++ {
 		type result struct {
-			beacon *asyrand.Beacon
-			fast   bool
-			err    error
+			beacon   *asyrand.Beacon
+			consumed bool
+			err      error
 		}
 		results := make(chan result, len(nodes))
 		for _, node := range nodes {
 			go func(node *asyrand.Node) {
-				beacon, fast, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
-				results <- result{beacon: beacon, fast: fast, err: err}
+				beacon, consumed, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
+				results <- result{beacon: beacon, consumed: consumed, err: err}
 			}(node)
 		}
 		var sample *asyrand.Beacon
-		fastCount := 0
+		consumedCount := 0
 		for range nodes {
 			res := <-results
 			if res.err != nil {
 				return res.err
 			}
-			if res.fast {
-				fastCount++
+			if res.consumed {
+				consumedCount++
 			}
 			if sample == nil {
 				sample = res.beacon
@@ -124,7 +124,7 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 			continue
 		}
 		stats.beacons.Add(1)
-		fmt.Printf("epoch=%d source=%s fast=%d/%d commit=%s random=%x\n", sample.Epoch, sample.Source, fastCount, len(nodes), sample.CommitID, sample.Random[:8])
+		fmt.Printf("epoch=%d source=%s consumed=%d/%d commit=%s random=%x\n", sample.Epoch, sample.Source, consumedCount, len(nodes), sample.CommitID, sample.Random[:8])
 	}
 	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
 	return nil
@@ -161,7 +161,7 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
 
 	for produced := 0; produced < cfg.Round; {
-		beacon, fast, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
+		beacon, consumed, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
 		if err != nil {
 			return err
 		}
@@ -171,7 +171,7 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		}
 		produced++
 		stats.beacons.Add(1)
-		fmt.Printf("node=%s epoch=%d source=%s fast=%t commit=%s random=%x\n", node.ID, beacon.Epoch, beacon.Source, fast, beacon.CommitID, beacon.Random[:8])
+		fmt.Printf("node=%s epoch=%d source=%s consumed=%t commit=%s random=%x\n", node.ID, beacon.Epoch, beacon.Source, consumed, beacon.CommitID, beacon.Random[:8])
 	}
 	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
 	if cfg.LingerMS > 0 {
@@ -193,12 +193,12 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	if err != nil {
 		return runtimeKeys{}, err
 	}
-	pvssKeys := make(map[p2p.NodeID]pvss.KeyPair, len(ids))
+	pvssKeys := make(map[p2p.NodeID]asig.PVSSKeyPair, len(ids))
 	pvssPublic := make(map[p2p.NodeID]kyber.Point, len(ids))
 	blsKeys := make(map[p2p.NodeID]asig.BLSKeyPair, len(ids))
 	blsPublic := make(map[string]kyber.Point, len(ids))
 	for _, id := range ids {
-		pvssKeys[id] = pvss.KeyPairFromSeed(nodeSeeds[id])
+		pvssKeys[id] = asig.PVSSKeyPairFromSeed(nodeSeeds[id])
 		pvssPublic[id] = pvssKeys[id].Public
 		blsKeys[id] = asig.NewBLSKeyPairFromSeed(nodeSeeds[id])
 		blsPublic[string(id)] = blsKeys[id].Public
@@ -207,25 +207,20 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	if err != nil {
 		return runtimeKeys{}, err
 	}
-	dkgResult, err := dkg.SetupFromSeed(ids, seed, cfg.F+1)
-	if err != nil {
-		return runtimeKeys{}, err
-	}
 	return runtimeKeys{
-		ids: ids, keys: keys, pubs: pubs, dkg: dkgResult, pvssKeys: pvssKeys,
+		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys,
 		pvssPublic: pvssPublic, blsKeys: blsKeys, blsPublic: blsPublic, seed: seed,
 	}, nil
 }
 
 func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Transport) (*asyrand.Node, error) {
-	pvssScheme, err := pvss.NewScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPublic)
+	pvssScheme, err := asig.NewScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPublic)
 	if err != nil {
 		return nil, err
 	}
 	return asyrand.NewNode(asyrand.NodeConfig{
 		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
 		Public: rt.pubs, BLS: rt.blsKeys[id], BLSPublic: rt.blsPublic,
-		CoinShare: rt.dkg.Shares[id], CoinPublic: rt.dkg.Public,
 		Transport: transport, PVSS: pvssScheme,
 	})
 }
@@ -340,14 +335,14 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label, beacons, float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
 		queueTotal, queueMax,
 		asyrand.AvgDuration(perf.PVSSShareTotal, perf.PVSSShareCount), asyrand.AvgDuration(perf.PVSSVerifyTotal, perf.PVSSVerifyCount),
 		asyrand.AvgDuration(perf.PVSSPreReconTotal, perf.PVSSPreReconCount), asyrand.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
-		asyrand.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount), asyrand.AvgDuration(perf.ABAHandleTotal, perf.ABAHandleCount),
+		asyrand.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount),
 		asyrand.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount), asyrand.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount))
 }
 

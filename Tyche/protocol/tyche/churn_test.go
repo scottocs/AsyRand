@@ -1,0 +1,629 @@
+package tyche
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math/rand"
+	"os"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/scottocs/Tyche/Tyche/crypto"
+	"github.com/scottocs/Tyche/Tyche/protocol/aba"
+	"github.com/scottocs/Tyche/utils/p2p"
+	"go.dedis.ch/kyber/v3"
+)
+
+func TestBeaconChurnCrashAndJoin10000Epochs(t *testing.T) {
+	if os.Getenv("TYCHE_CHURN_TEST") != "1" {
+		t.Skip("set TYCHE_CHURN_TEST=1 to run the 8-node/f=2 crash-and-join churn test")
+	}
+	epochs := envInt("TYCHE_CHURN_EPOCHS", 10000)
+	reportEvery := envInt("TYCHE_CHURN_REPORT_EVERY", 1000)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(epochs)*2*time.Second)
+	defer cancel()
+
+	cluster := newChurnCluster(t, ctx, 8, 2)
+	failures := map[int]p2p.NodeID{
+		max(2, epochs/4): "node6",
+		max(3, epochs/2): "node7",
+	}
+	joins := map[int]p2p.NodeID{
+		max(2, epochs/4) + 1: "node8",
+		max(3, epochs/2) + 1: "node9",
+	}
+
+	start := time.Now()
+	for epoch := 1; epoch <= epochs; epoch++ {
+		if failed := failures[epoch]; failed != "" {
+			t.Logf("epoch=%d event=delete node=%s active_before=%v members_before=%v", epoch, failed, cluster.activeIDs(), cluster.members())
+			cluster.crashAndRemove(t, failed)
+			t.Logf("epoch=%d event=deleted node=%s active_after=%v members_after=%v", epoch, failed, cluster.activeIDs(), cluster.members())
+		}
+		if joiner := joins[epoch]; joiner != "" {
+			t.Logf("epoch=%d event=join node=%s active_before=%v members_before=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
+			cluster.join(t, ctx, joiner)
+			t.Logf("epoch=%d event=joined node=%s active_after=%v members_after=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
+		}
+		cluster.runEpoch(t, ctx, uint64(epoch), 10*time.Second)
+		if reportEvery > 0 && epoch%reportEvery == 0 {
+			t.Logf("completed %d/%d churn epochs in %s active=%v members=%v", epoch, epochs, time.Since(start), cluster.activeIDs(), cluster.members())
+		}
+	}
+}
+
+func TestBeaconRandomChurn1000Epochs(t *testing.T) {
+	if os.Getenv("TYCHE_RANDOM_CHURN_TEST") != "1" {
+		t.Skip("set TYCHE_RANDOM_CHURN_TEST=1 to run the random crash-and-join churn test")
+	}
+	epochs := envInt("TYCHE_CHURN_EPOCHS", 1000)
+	reportEvery := envInt("TYCHE_CHURN_REPORT_EVERY", 100)
+	eventEvery := envInt("TYCHE_CHURN_EVENT_EVERY", 25)
+	epochTimeout := time.Duration(envInt("TYCHE_CHURN_EPOCH_TIMEOUT_MS", 10000)) * time.Millisecond
+	minN := envInt("TYCHE_CHURN_MIN_N", 4)
+	maxN := envInt("TYCHE_CHURN_MAX_N", 13)
+	seed := int64(envInt("TYCHE_CHURN_SEED", 20260521))
+	rng := rand.New(rand.NewSource(seed))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(epochs)*2*time.Second)
+	defer cancel()
+
+	cluster := newChurnCluster(t, ctx, 8, 2)
+	nextJoin := 8
+	start := time.Now()
+	t.Logf("random churn seed=%d epochs=%d initial_n=8 min_n=%d max_n=%d event_every=%d", seed, epochs, minN, maxN, eventEvery)
+	for epoch := 1; epoch <= epochs; epoch++ {
+		if eventEvery > 0 && epoch%eventEvery == 0 {
+			if cluster.randomChurn(t, ctx, rng, uint64(epoch), minN, maxN, &nextJoin) {
+				cluster.assertMembershipBounds(t, minN, maxN)
+			}
+		}
+		cluster.assertMembershipBounds(t, minN, maxN)
+		cluster.runEpoch(t, ctx, uint64(epoch), epochTimeout)
+		cluster.reconcileProtocolRemovals(t, uint64(epoch))
+		if reportEvery > 0 && epoch%reportEvery == 0 {
+			t.Logf("completed %d/%d random churn epochs in %s active=%v members=%v", epoch, epochs, time.Since(start), cluster.activeIDs(), cluster.members())
+		}
+	}
+}
+
+type churnCluster struct {
+	net       *p2p.MemoryNetwork
+	nodes     map[p2p.NodeID]*Node
+	active    map[p2p.NodeID]bool
+	stopped   map[p2p.NodeID]bool
+	cancels   map[p2p.NodeID]context.CancelFunc
+	pvssEpoch uint64
+}
+
+type churnResult struct {
+	beacon Beacon
+	err    error
+}
+
+func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnCluster {
+	t.Helper()
+	ids := make([]p2p.NodeID, n)
+	for i := range ids {
+		ids[i] = p2p.NodeID(fmt.Sprintf("node%d", i))
+	}
+	pp, keys, err := crypto.Setup("churn-config-0", f+1, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &churnCluster{
+		net:     p2p.NewMemoryNetwork(),
+		nodes:   make(map[p2p.NodeID]*Node, n),
+		active:  make(map[p2p.NodeID]bool, n),
+		stopped: make(map[p2p.NodeID]bool, n),
+		cancels: make(map[p2p.NodeID]context.CancelFunc, n),
+	}
+	blsPublic := defaultBLSPublic(ids)
+	for _, id := range ids {
+		scheme, err := crypto.NewScheme(id, keys[id].Private, pp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 4, PVSS: scheme, BLSPublic: blsPublic, Transport: c.net.NewTransport(id, 32768)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nodeCtx, cancel := context.WithCancel(parent)
+		node.Start(nodeCtx)
+		c.nodes[id] = node
+		c.active[id] = true
+		c.cancels[id] = cancel
+	}
+	return c
+}
+
+func (c *churnCluster) crashAndRemove(t *testing.T, id p2p.NodeID) {
+	t.Helper()
+	if !c.active[id] {
+		return
+	}
+	c.active[id] = false
+	c.cancels[id]()
+	if err := c.nodes[id].Transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		node.removeMemberLocked(id)
+		node.mu.Unlock()
+	}
+}
+
+func (c *churnCluster) reconcileProtocolRemovals(t *testing.T, epoch uint64) {
+	t.Helper()
+	members := c.members()
+	for _, id := range c.activeIDs() {
+		if contains(members, id) {
+			continue
+		}
+		t.Logf("epoch=%d event=aba_deleted node=%s n_after=%d f_after=%d stopped=%v active_before=%v members_after=%v", epoch, id, len(members), c.currentF(t), c.stoppedActiveIDs(), c.activeIDs(), members)
+		c.active[id] = false
+		delete(c.stopped, id)
+		if cancel := c.cancels[id]; cancel != nil {
+			cancel()
+		}
+		if node := c.nodes[id]; node != nil {
+			if err := node.Transport.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Logf("epoch=%d event=aba_delete_closed node=%s active_after=%v members_after=%v", epoch, id, c.activeIDs(), members)
+	}
+}
+
+func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *rand.Rand, epoch uint64, minN int, maxN int, nextJoin *int) bool {
+	t.Helper()
+	n := len(c.members())
+	pendingStop := len(c.stoppedActiveIDs()) > 0
+	canDelete := n > minN && !pendingStop
+	canJoin := n < maxN && !pendingStop
+	if !canDelete && !canJoin {
+		return false
+	}
+	deleteNode := canDelete && (!canJoin || rng.Intn(2) == 0)
+	if deleteNode {
+		ids := c.producingActiveIDs()
+		victim := ids[rng.Intn(len(ids))]
+		beforeMembers := c.members()
+		beforeF := c.currentF(t)
+		t.Logf("epoch=%d event=stop_produce node=%s n_before=%d f_before=%d active_before=%v members_before=%v", epoch, victim, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers)
+		c.stopProducer(victim)
+		afterMembers := c.members()
+		t.Logf("epoch=%d event=stopped_produce node=%s n_after=%d f_after=%d stopped=%v active_after=%v members_after=%v", epoch, victim, len(afterMembers), c.currentF(t), c.stoppedActiveIDs(), c.activeIDs(), afterMembers)
+		return true
+	}
+	joiner := p2p.NodeID(fmt.Sprintf("node%d", *nextJoin))
+	(*nextJoin)++
+	beforeMembers := c.members()
+	beforeF := c.currentF(t)
+	t.Logf("epoch=%d event=join node=%s n_before=%d f_before=%d active_before=%v members_before=%v", epoch, joiner, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers)
+	c.join(t, parent, joiner)
+	afterMembers := c.members()
+	t.Logf("epoch=%d event=joined node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
+	return true
+}
+
+func (c *churnCluster) stopProducer(id p2p.NodeID) {
+	if c.active[id] {
+		c.stopped[id] = true
+		c.nodes[id].SetProducing(false)
+	}
+}
+
+func (c *churnCluster) assertMembershipBounds(t *testing.T, minN int, maxN int) {
+	t.Helper()
+	refMembers := c.members()
+	n := len(refMembers)
+	if n < minN || n > maxN {
+		t.Fatalf("membership size out of bounds: n=%d min=%d max=%d members=%v active=%v", n, minN, maxN, refMembers, c.activeIDs())
+	}
+	f := c.currentF(t)
+	if f >= n {
+		t.Fatalf("invalid failure threshold: f=%d n=%d members=%v", f, n, refMembers)
+	}
+	if 3*f+1 > n {
+		t.Fatalf("invalid BFT threshold: f=%d n=%d members=%v", f, n, refMembers)
+	}
+	active := c.activeIDs()
+	if len(active) != n {
+		t.Fatalf("active/member mismatch: active=%v members=%v", active, refMembers)
+	}
+	if !sameNodeIDs(active, refMembers) {
+		t.Fatalf("active/member mismatch: active=%v members=%v", active, refMembers)
+	}
+	refVersion := c.currentConfigVersion(t)
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		nodeMembers := append([]p2p.NodeID(nil), node.State.Members...)
+		nodeF := node.State.F
+		nodeVersion := node.State.ConfigVersion
+		node.mu.Unlock()
+		if !sameNodeIDs(refMembers, nodeMembers) || nodeF != f {
+			t.Fatalf("membership mismatch on %s: ref_members=%v ref_f=%d node_members=%v node_f=%d", node.ID, refMembers, f, nodeMembers, nodeF)
+		}
+		if nodeVersion != refVersion {
+			t.Fatalf("config version mismatch on %s: ref=%d got=%d", node.ID, refVersion, nodeVersion)
+		}
+	}
+}
+
+func (c *churnCluster) currentF(t *testing.T) int {
+	t.Helper()
+	ref := c.reference(t)
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	return ref.State.F
+}
+
+func (c *churnCluster) currentConfigVersion(t *testing.T) uint64 {
+	t.Helper()
+	ref := c.reference(t)
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	return ref.State.ConfigVersion
+}
+
+func sameNodeIDs(a []p2p.NodeID, b []p2p.NodeID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aa := append([]p2p.NodeID(nil), a...)
+	bb := append([]p2p.NodeID(nil), b...)
+	sort.Slice(aa, func(i, j int) bool { return aa[i] < aa[j] })
+	sort.Slice(bb, func(i, j int) bool { return bb[i] < bb[j] })
+	for i := range aa {
+		if aa[i] != bb[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.NodeID) {
+	t.Helper()
+	ref := c.reference(t)
+	currentMembers := c.members()
+	targetMembers := append(append([]p2p.NodeID(nil), currentMembers...), joiner)
+	sort.Slice(targetMembers, func(i, j int) bool { return targetMembers[i] < targetMembers[j] })
+	ref.mu.Lock()
+	version := ref.State.ConfigVersion
+	activation := ref.State.Epoch + 1
+	f := ref.State.F
+	ref.mu.Unlock()
+	targetF := (len(targetMembers) - 1) / 3
+
+	c.pvssEpoch++
+	pp, keys, err := crypto.Setup(fmt.Sprintf("churn-config-%d", c.pvssEpoch), targetF+1, targetMembers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinerScheme, err := crypto.NewScheme(joiner, keys[joiner].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitment, _, err := joinerScheme.Share(joiner, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := JoinRequest{
+		ConfigVersion:   version,
+		ContextEpoch:    activation - 1,
+		Joiner:          joiner,
+		PublicKey:       string(joiner) + "-pk",
+		CandidateParams: pp,
+		Object:          Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
+		FirstCoinEpoch:  activation - 1,
+		ActivationEpoch: activation,
+	}
+	rho := JoinDigest(req)
+	tau := TransitionIndex{ConfigVersion: version, Seq: 1}
+	signers := c.activeIDs()
+	need := 2*f + 1
+	if len(signers) < need {
+		t.Fatalf("not enough active signers for join: active=%v need=%d", signers, need)
+	}
+	cert := JoinCertificate{Request: req}
+	for _, signer := range signers[:need] {
+		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, c.nodes[signer], tau, rho))
+		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, c.nodes[signer], tau, rho, activation))
+	}
+	for _, node := range c.activeNodes() {
+		node.RegisterPVSSKey(pp.Epoch, keys[node.ID].Private)
+		if err := node.InstallJoinCertificate(cert); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.addJoinerNode(t, parent, joiner, targetMembers, pp, keys)
+}
+
+func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PublicParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
+	t.Helper()
+	blsPublic := defaultBLSPublic(members)
+	for _, node := range c.activeNodes() {
+		scheme, err := crypto.NewScheme(node.ID, keys[node.ID].Private, pp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		node.mu.Lock()
+		node.PVSS = scheme
+		node.BLSPublic = blsPublic
+		node.mu.Unlock()
+	}
+}
+
+func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2p.NodeID, members []p2p.NodeID, pp crypto.PublicParams, keys map[p2p.NodeID]crypto.KeyPair) {
+	t.Helper()
+	scheme, err := crypto.NewScheme(id, keys[id].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := c.reference(t)
+	ref.mu.Lock()
+	f := ref.State.F
+	ref.mu.Unlock()
+	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 4, PVSS: scheme, BLSPublic: defaultBLSPublic(members), Transport: c.net.NewTransport(id, 32768)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyRuntimeState(t, ref, node)
+	nodeCtx, cancel := context.WithCancel(parent)
+	node.Start(nodeCtx)
+	c.nodes[id] = node
+	c.active[id] = true
+	c.cancels[id] = cancel
+}
+
+func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint64, timeout time.Duration) {
+	t.Helper()
+	c.refillCandidateLists()
+	source, seq := nextSourceSeq(c.reference(t))
+	for c.stopped[source] {
+		c.applyABAFalse(t, parent, epoch, source, seq)
+		c.refillCandidateLists()
+		source, seq = nextSourceSeq(c.reference(t))
+	}
+	sourceNode := c.nodes[source]
+	if sourceNode == nil || !c.active[source] {
+		t.Fatalf("selected inactive source %s at epoch %d active=%v members=%v", source, epoch, c.activeIDs(), c.members())
+	}
+	if !c.stopped[source] && !c.allActiveStored(source, seq) {
+		sourceNode.mu.Lock()
+		sourceNode.State.ProducerSeq = sourceNode.State.Seqs[source]
+		sourceNode.mu.Unlock()
+		if _, err := sourceNode.Produce(parent); err != nil {
+			t.Fatalf("produce source=%s seq=%d epoch=%d: %v", source, seq, epoch, err)
+		}
+	}
+	if !c.stopped[source] {
+		c.waitStoredCurrent(t, parent, source, seq)
+	}
+
+	epochCtx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	active := c.activeNodes()
+	results := make(chan churnResult, len(active))
+	for _, node := range active {
+		go func(node *Node) {
+			beacon, err := node.RunEpochAt(epochCtx, epoch)
+			results <- churnResult{beacon: beacon, err: err}
+		}(node)
+	}
+	var first Beacon
+	for i := 0; i < len(active); i++ {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				t.Fatalf("epoch %d failed: %v\n%s", epoch, res.err, dumpNodes(active))
+			}
+			if i == 0 {
+				first = res.beacon
+				continue
+			}
+			if !bytes.Equal(first.Random, res.beacon.Random) || first.Source != res.beacon.Source || first.Seq != res.beacon.Seq {
+				t.Fatalf("epoch %d beacon mismatch: first=%+v got=%+v", epoch, first, res.beacon)
+			}
+		case <-epochCtx.Done():
+			t.Fatalf("epoch %d timed out\n%s", epoch, dumpNodes(active))
+		}
+	}
+}
+
+func (c *churnCluster) refillCandidateLists() {
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		if len(node.State.SCL) == 0 {
+			node.refillSCLLocked()
+		}
+		node.mu.Unlock()
+	}
+}
+
+func (c *churnCluster) applyABAFalse(t *testing.T, ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64) {
+	t.Helper()
+	instance := aba.EpochInstance(epoch, source)
+	t.Logf("epoch=%d event=aba_false node=%s seq=%d stopped=%v active=%v members=%v", epoch, source, seq, c.stoppedActiveIDs(), c.activeIDs(), c.members())
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		if node.State.PendingABAs[instance] == nil {
+			node.State.PendingABAs[instance] = &PendingABA{Instance: instance, Epoch: epoch, Source: source, Seq: seq}
+		}
+		node.mu.Unlock()
+		_ = node.ABA.Propose(ctx, instance, false)
+		node.handleABADecision(ctx, aba.Decision{Instance: instance, Value: false})
+	}
+}
+
+func (c *churnCluster) allActiveStored(source p2p.NodeID, seq uint64) bool {
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		obj, ok := node.State.ComQ[source][seq]
+		version := node.State.ConfigVersion
+		node.mu.Unlock()
+		if !ok || obj.ConfigVersion != version {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *churnCluster) waitStoredCurrent(t *testing.T, ctx context.Context, source p2p.NodeID, seq uint64) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if c.allActiveStored(source, seq) {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for current stored object %s/%d", source, seq)
+		}
+	}
+}
+
+func (c *churnCluster) activeNodes() []*Node {
+	ids := c.activeIDs()
+	nodes := make([]*Node, 0, len(ids))
+	for _, id := range ids {
+		nodes = append(nodes, c.nodes[id])
+	}
+	return nodes
+}
+
+func (c *churnCluster) activeIDs() []p2p.NodeID {
+	ids := make([]p2p.NodeID, 0, len(c.active))
+	for id, active := range c.active {
+		if active {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (c *churnCluster) producingActiveIDs() []p2p.NodeID {
+	ids := make([]p2p.NodeID, 0, len(c.active))
+	for id, active := range c.active {
+		if active && !c.stopped[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (c *churnCluster) stoppedActiveIDs() []p2p.NodeID {
+	ids := make([]p2p.NodeID, 0, len(c.stopped))
+	for id, stopped := range c.stopped {
+		if stopped && c.active[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (c *churnCluster) members() []p2p.NodeID {
+	ref := c.reference(nil)
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	return append([]p2p.NodeID(nil), ref.State.Members...)
+}
+
+func (c *churnCluster) reference(t *testing.T) *Node {
+	for _, id := range c.activeIDs() {
+		if node := c.nodes[id]; node != nil {
+			return node
+		}
+	}
+	if t != nil {
+		t.Fatal("no active nodes")
+	}
+	panic("no active nodes")
+}
+
+func copyRuntimeState(t *testing.T, src *Node, dst *Node) {
+	t.Helper()
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	dst.mu.Lock()
+	defer dst.mu.Unlock()
+	dst.State.ConfigVersion = src.State.ConfigVersion
+	dst.State.Members = append([]p2p.NodeID(nil), src.State.Members...)
+	dst.State.F = src.State.F
+	dst.State.Epoch = src.State.Epoch
+	dst.State.RPrev = append([]byte(nil), src.State.RPrev...)
+	dst.State.SCL = append([]p2p.NodeID(nil), src.State.SCL...)
+	dst.State.RSQ = append([]p2p.NodeID(nil), src.State.RSQ...)
+	dst.State.Seqs = copySeqs(src.State.Seqs)
+	dst.State.RmMark = copyRmMark(src.State.RmMark)
+	dst.State.ComQ = copyComQ(src.State.ComQ)
+	dst.State.QueueLen = src.State.QueueLen
+	dst.State.ProducerSeq = dst.State.Seqs[dst.ID]
+	dst.RBC.N, dst.RBC.F = len(dst.State.Members), dst.State.F
+	dst.ABA.N, dst.ABA.F = len(dst.State.Members), dst.State.F
+	for epoch, seed := range src.beaconSeeds {
+		dst.beaconSeeds[epoch] = append([]byte(nil), seed...)
+	}
+}
+
+func copySeqs(in map[p2p.NodeID]uint64) map[p2p.NodeID]uint64 {
+	out := make(map[p2p.NodeID]uint64, len(in))
+	for id, seq := range in {
+		out[id] = seq
+	}
+	return out
+}
+
+func copyRmMark(in map[p2p.NodeID]int64) map[p2p.NodeID]int64 {
+	out := make(map[p2p.NodeID]int64, len(in))
+	for id, mark := range in {
+		out[id] = mark
+	}
+	return out
+}
+
+func copyComQ(in map[p2p.NodeID]map[uint64]Object) map[p2p.NodeID]map[uint64]Object {
+	out := make(map[p2p.NodeID]map[uint64]Object, len(in))
+	for id, q := range in {
+		out[id] = make(map[uint64]Object, len(q))
+		for seq, obj := range q {
+			out[id][seq] = obj
+		}
+	}
+	return out
+}
+
+func defaultBLSPublic(ids []p2p.NodeID) map[string]kyber.Point {
+	out := make(map[string]kyber.Point, len(ids))
+	for _, id := range ids {
+		kp := crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(id)))
+		out[string(id)] = kp.Public
+	}
+	return out
+}
+
+func signedJoinAck(t *testing.T, node *Node, tau TransitionIndex, rho string) JoinAck {
+	t.Helper()
+	sig, err := crypto.SignBLS(string(node.ID), node.BLS.Private, joinAckBytes(tau, rho))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return JoinAck{Transition: tau, RequestDigest: rho, Signer: node.ID, Signature: sig}
+}
+
+func signedJoinCommit(t *testing.T, node *Node, tau TransitionIndex, rho string, activation uint64) JoinCommit {
+	t.Helper()
+	sig, err := crypto.SignBLS(string(node.ID), node.BLS.Private, joinCommitBytes(tau, rho, activation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return JoinCommit{Transition: tau, RequestDigest: rho, ActivationEpoch: activation, Signer: node.ID, Signature: sig}
+}

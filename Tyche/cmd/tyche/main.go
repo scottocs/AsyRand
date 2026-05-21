@@ -1,0 +1,411 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/scottocs/Tyche/Tyche/crypto"
+	"github.com/scottocs/Tyche/Tyche/protocol/tyche"
+	"github.com/scottocs/Tyche/utils/p2p"
+)
+
+type runStats struct {
+	beacons atomic.Uint64
+}
+
+type metricSnapshot struct {
+	sentMessages uint64
+	sentBytes    uint64
+	recvMessages uint64
+	recvBytes    uint64
+}
+
+const transportBuffer = 262144
+
+func main() {
+	n := flag.Int("n", 8, "number of local memory nodes")
+	epochs := flag.Int("epochs", 1000, "number of beacon epochs")
+	f := flag.Int("f", -1, "Byzantine fault threshold; defaults to (n-1)/3")
+	transport := flag.String("transport", "memory", "transport type: memory or tcp")
+	nodeID := flag.String("node", "", "node id for tcp mode, for example node0")
+	peersRaw := flag.String("peers", "", "comma-separated tcp peers, for example node0=1.1.1.1:9000,node1=2.2.2.2:9000")
+	listenAddr := flag.String("listen", "", "tcp listen address, for example 0.0.0.0:9000; defaults to listen_ip plus this node's peer port")
+	listenIP := flag.String("listen-ip", "0.0.0.0", "tcp listen ip used when -listen is empty")
+	queueLen := flag.Int("queue-len", 8, "per-source commitment queue length")
+	producerMS := flag.Int("producer-ms", 20, "producer interval in milliseconds")
+	prefillMS := flag.Int("prefill-ms", 3000, "producer prefill time in milliseconds")
+	epochTimeoutMS := flag.Int("epoch-timeout-ms", 10000, "timeout per epoch in milliseconds")
+	reportMS := flag.Int("report-ms", 5000, "periodic metrics interval in milliseconds")
+	flag.Parse()
+
+	opts := runOptions{
+		n: *n, epochs: *epochs, f: *f, transport: strings.ToLower(*transport),
+		nodeID: p2p.NodeID(*nodeID), peersRaw: *peersRaw, listenAddr: *listenAddr, listenIP: *listenIP,
+		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
+		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS,
+	}
+	if err := run(opts); err != nil {
+		log.Fatal(err)
+	}
+}
+
+type runOptions struct {
+	n              int
+	epochs         int
+	f              int
+	transport      string
+	nodeID         p2p.NodeID
+	peersRaw       string
+	listenAddr     string
+	listenIP       string
+	queueLen       int
+	producerMS     int
+	prefillMS      int
+	epochTimeoutMS int
+	reportMS       int
+}
+
+func run(opts runOptions) error {
+	if opts.transport != "memory" && opts.transport != "tcp" {
+		return fmt.Errorf("unsupported transport %q", opts.transport)
+	}
+	if opts.n <= 0 {
+		return fmt.Errorf("-n must be positive")
+	}
+	if opts.epochs <= 0 {
+		return fmt.Errorf("-epochs must be positive")
+	}
+	if opts.f < 0 {
+		opts.f = (opts.n - 1) / 3
+	}
+	if 3*opts.f+1 > opts.n {
+		return fmt.Errorf("invalid fault threshold: need n >= 3f+1, got n=%d f=%d", opts.n, opts.f)
+	}
+	if opts.queueLen <= 0 {
+		opts.queueLen = 8
+	}
+	if opts.producerMS <= 0 {
+		opts.producerMS = 20
+	}
+	if opts.prefillMS < 0 {
+		opts.prefillMS = 0
+	}
+	if opts.epochTimeoutMS <= 0 {
+		opts.epochTimeoutMS = 10000
+	}
+	if opts.transport == "tcp" {
+		return runTCP(opts)
+	}
+	return runMemory(opts)
+}
+
+func runMemory(opts runOptions) error {
+	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
+	defer cancel()
+
+	ids, pp, keys, err := setupRuntime(opts.n, opts.f)
+	if err != nil {
+		return err
+	}
+
+	net := p2p.NewMemoryNetwork()
+	nodes := make([]*tyche.Node, 0, len(ids))
+	for _, id := range ids {
+		scheme, err := crypto.NewScheme(id, keys[id].Private, pp)
+		if err != nil {
+			return err
+		}
+		node, err := tyche.NewNode(tyche.Config{
+			ID:        id,
+			Members:   ids,
+			F:         opts.f,
+			QueueLen:  opts.queueLen,
+			PVSS:      scheme,
+			Transport: net.NewTransport(id, transportBuffer),
+		})
+		if err != nil {
+			return err
+		}
+		node.Start(runCtx)
+		node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
+		nodes = append(nodes, node)
+	}
+
+	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d\n",
+		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS)
+
+	stats := &runStats{}
+	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
+	defer stopReport()
+	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
+
+	start := time.Now()
+	for epoch := 1; epoch <= opts.epochs; epoch++ {
+		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
+		results := make(chan result, len(nodes))
+		for _, node := range nodes {
+			go func(node *tyche.Node, epoch uint64) {
+				b, err := node.RunEpochAt(epochCtx, epoch)
+				results <- result{beacon: b, err: err}
+			}(node, uint64(epoch))
+		}
+
+		var sample tyche.Beacon
+		for i := 0; i < len(nodes); i++ {
+			res := <-results
+			if res.err != nil {
+				cancelEpoch()
+				return fmt.Errorf("epoch %d: %w", epoch, res.err)
+			}
+			if i == 0 {
+				sample = res.beacon
+			}
+		}
+		cancelEpoch()
+		stats.beacons.Add(1)
+		fmt.Printf("epoch=%d source=%s seq=%d random=%x\n", sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
+	}
+
+	printMetrics("final", nodes, time.Since(start), stats.beacons.Load())
+	return nil
+}
+
+func runTCP(opts runOptions) error {
+	if opts.nodeID == "" {
+		return fmt.Errorf("tcp mode requires -node")
+	}
+	peers, err := parsePeers(opts.peersRaw)
+	if err != nil {
+		return err
+	}
+	if len(peers) != opts.n {
+		return fmt.Errorf("-peers count must match -n: peers=%d n=%d", len(peers), opts.n)
+	}
+	if _, ok := peers[opts.nodeID]; !ok {
+		return fmt.Errorf("-peers does not contain -node %s", opts.nodeID)
+	}
+	ids, pp, keys, err := setupRuntime(opts.n, opts.f)
+	if err != nil {
+		return err
+	}
+	if !containsID(ids, opts.nodeID) {
+		return fmt.Errorf("node id %s is outside generated node0..node%d set", opts.nodeID, opts.n-1)
+	}
+	listen := opts.listenAddr
+	if listen == "" {
+		_, port, err := net.SplitHostPort(peers[opts.nodeID])
+		if err != nil {
+			return fmt.Errorf("invalid self peer address %q: %w", peers[opts.nodeID], err)
+		}
+		listen = net.JoinHostPort(opts.listenIP, port)
+	}
+
+	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
+	defer cancel()
+	scheme, err := crypto.NewScheme(opts.nodeID, keys[opts.nodeID].Private, pp)
+	if err != nil {
+		return err
+	}
+	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, transportBuffer)
+	node, err := tyche.NewNode(tyche.Config{
+		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, Transport: transport,
+	})
+	if err != nil {
+		return err
+	}
+	if err := transport.Start(runCtx); err != nil {
+		return err
+	}
+	node.Start(runCtx)
+	if err := waitForTCPPeers(runCtx, opts.nodeID, peers, time.Duration(opts.epochTimeoutMS)*time.Millisecond); err != nil {
+		return err
+	}
+	node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
+
+	nodes := []*tyche.Node{node}
+	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, peers)
+	stats := &runStats{}
+	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
+	defer stopReport()
+	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
+
+	start := time.Now()
+	for epoch := 1; epoch <= opts.epochs; epoch++ {
+		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
+		beacon, err := node.RunEpochAt(epochCtx, uint64(epoch))
+		cancelEpoch()
+		if err != nil {
+			return fmt.Errorf("epoch %d: %w", epoch, err)
+		}
+		stats.beacons.Add(1)
+		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
+	}
+	printMetrics("final", nodes, time.Since(start), stats.beacons.Load())
+	return nil
+}
+
+func setupRuntime(n int, f int) ([]p2p.NodeID, crypto.PublicParams, map[p2p.NodeID]crypto.KeyPair, error) {
+	ids := make([]p2p.NodeID, n)
+	for i := range ids {
+		ids[i] = p2p.NodeID(fmt.Sprintf("node%d", i))
+	}
+	pp, keys, err := crypto.Setup(fmt.Sprintf("tyche-runner-n%d-f%d", n, f), f+1, ids)
+	return ids, pp, keys, err
+}
+
+func parsePeers(raw string) (map[p2p.NodeID]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("tcp mode requires -peers")
+	}
+	out := make(map[p2p.NodeID]string)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		id, addr, ok := strings.Cut(item, "=")
+		if !ok || strings.TrimSpace(id) == "" || strings.TrimSpace(addr) == "" {
+			return nil, fmt.Errorf("invalid peer %q, want node0=host:port", item)
+		}
+		addr = strings.TrimSpace(addr)
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf("invalid peer address %q: %w", addr, err)
+		}
+		out[p2p.NodeID(strings.TrimSpace(id))] = addr
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("tcp mode requires at least one peer")
+	}
+	return out, nil
+}
+
+func containsID(ids []p2p.NodeID, id p2p.NodeID) bool {
+	for _, candidate := range ids {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForTCPPeers(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if allPeersReachable(ctx, self, peers) {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for tcp peers")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func allPeersReachable(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string) bool {
+	for id, addr := range peers {
+		if id == self {
+			continue
+		}
+		dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+		cancel()
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+	}
+	return true
+}
+
+type result struct {
+	beacon tyche.Beacon
+	err    error
+}
+
+func startReporter(ctx context.Context, nodes []*tyche.Node, stats *runStats, interval time.Duration) func() {
+	done := make(chan struct{})
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		last := collectMetrics(nodes)
+		lastBeacon := stats.beacons.Load()
+		lastAt := time.Now()
+		for {
+			select {
+			case <-ticker.C:
+				now := time.Now()
+				current := collectMetrics(nodes)
+				currentBeacon := stats.beacons.Load()
+				printMetricDelta("periodic", current.sub(last), now.Sub(lastAt), currentBeacon-lastBeacon)
+				last, lastAt = current, now
+				lastBeacon = currentBeacon
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+func collectMetrics(nodes []*tyche.Node) metricSnapshot {
+	var out metricSnapshot
+	for _, node := range nodes {
+		m := node.Transport.Metrics()
+		out.sentMessages += m.SentMessages
+		out.sentBytes += m.SentBytes
+		out.recvMessages += m.RecvMessages
+		out.recvBytes += m.RecvBytes
+	}
+	return out
+}
+
+func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
+	return metricSnapshot{
+		sentMessages: m.sentMessages - prev.sentMessages,
+		sentBytes:    m.sentBytes - prev.sentBytes,
+		recvMessages: m.recvMessages - prev.recvMessages,
+		recvBytes:    m.recvBytes - prev.recvBytes,
+	}
+}
+
+func printMetrics(label string, nodes []*tyche.Node, elapsed time.Duration, beacons uint64) {
+	printMetricDelta(label, collectMetrics(nodes), elapsed, beacons)
+}
+
+func printMetricDelta(label string, delta metricSnapshot, elapsed time.Duration, beacons uint64) {
+	seconds := elapsed.Seconds()
+	if seconds <= 0 {
+		seconds = 1
+	}
+	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s\n",
+		label,
+		beacons,
+		float64(beacons)*60/seconds,
+		delta.sentMessages,
+		delta.recvMessages,
+		float64(delta.sentBytes)/1024,
+		float64(delta.recvBytes)/1024,
+		float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
+	)
+}

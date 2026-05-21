@@ -11,12 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	config "github.com/scottocs/asyrand/grandline/internal"
-	asig "github.com/scottocs/asyrand/grandline/internal/crypto"
-	"github.com/scottocs/asyrand/grandline/internal/dkg"
-	"github.com/scottocs/asyrand/grandline/internal/grandline"
-	"github.com/scottocs/asyrand/grandline/internal/p2p"
-	"github.com/scottocs/asyrand/grandline/internal/pvss"
+	config "github.com/scottocs/Tyche/grandline/config"
+	asig "github.com/scottocs/Tyche/grandline/crypto"
+	grandline "github.com/scottocs/Tyche/grandline/protocol"
+	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 
@@ -24,10 +22,10 @@ type runtimeKeys struct {
 	ids      []p2p.NodeID
 	keys     map[p2p.NodeID]asig.KeyPair
 	pubs     map[string]ed25519.PublicKey
-	pvssKeys map[p2p.NodeID]pvss.KeyPair
+	pvssKeys map[p2p.NodeID]asig.PVSSKeyPair
 	pvssPub  map[p2p.NodeID]kyber.Point
 	seed     []byte
-	dkg      dkg.Result
+	grand    asig.GRandResult
 }
 
 type runStats struct {
@@ -200,35 +198,43 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	if err != nil {
 		return runtimeKeys{}, err
 	}
-	dkgResult, err := dkg.SetupFromSeed(ids, seed, cfg.F+1)
-	if err != nil {
-		return runtimeKeys{}, err
-	}
 	nodeSeeds, err := cfg.NodeSeedBytes()
 	if err != nil {
 		return runtimeKeys{}, err
 	}
-	pvssKeys := make(map[p2p.NodeID]pvss.KeyPair, len(ids))
+	pvssKeys := make(map[p2p.NodeID]asig.PVSSKeyPair, len(ids))
 	pvssPub := make(map[p2p.NodeID]kyber.Point, len(ids))
 	for _, id := range ids {
-		pk := pvss.KeyPairFromSeed(nodeSeeds[id])
+		pk := asig.PVSSKeyPairFromSeed(nodeSeeds[id])
 		pvssKeys[id] = pk
 		pvssPub[id] = pk.Public
 	}
+	pvssSchemes := make(map[p2p.NodeID]*asig.PVSSPairingFreeScheme, len(ids))
+	for _, id := range ids {
+		scheme, err := asig.NewPVSSScheme(id, cfg.F+1, pvssKeys[id].Private, pvssPub)
+		if err != nil {
+			return runtimeKeys{}, err
+		}
+		pvssSchemes[id] = scheme
+	}
+	grandResult, err := asig.SetupGRandFromAPVSS(ids, pvssSchemes, cfg.F+1)
+	if err != nil {
+		return runtimeKeys{}, err
+	}
 	return runtimeKeys{
-		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys, pvssPub: pvssPub, seed: seed, dkg: dkgResult,
+		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys, pvssPub: pvssPub, seed: seed, grand: grandResult,
 	}, nil
 }
 
 func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Transport) (*grandline.Node, error) {
-	pvssScheme, err := pvss.NewScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPub)
+	pvssScheme, err := asig.NewPVSSScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPub)
 	if err != nil {
 		return nil, err
 	}
 	return grandline.NewNode(grandline.NodeConfig{
 		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
 		Public: rt.pubs, Transport: transport, PVSS: pvssScheme,
-		CoinShare: rt.dkg.Shares[id], CoinPublic: rt.dkg.Public,
+		GRand: rt.grand.ShareFor(id),
 	})
 }
 

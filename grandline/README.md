@@ -1,6 +1,6 @@
 # GRandline (Go Implementation)
 
-This module contains the Go implementation that follows the `grandline` beacon design and reuses the AsyRand/SPurt code structure for transport, PVSS, DKG and test scaffolding.
+This module contains the Go implementation that follows the `grandline` beacon design and reuses the Tyche/SPurt code structure for transport, PVSS, DKG and test scaffolding.
 
 ## Run
 

@@ -1,4 +1,4 @@
-module github.com/scottocs/asyrand/spurt
+module github.com/scottocs/Tyche/spurt
 
 go 1.24.0
 
@@ -10,3 +10,7 @@ require (
 	golang.org/x/crypto v0.43.0 // indirect
 	golang.org/x/sys v0.37.0 // indirect
 )
+
+require github.com/scottocs/Tyche/utils v0.0.0
+
+replace github.com/scottocs/Tyche/utils => ../utils

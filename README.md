@@ -1,67 +1,128 @@
-# AsyRand
+# Tyche
 
-This repository contains the AsyRand paper and prototype implementations.
+This repository contains prototype Go implementations for Tyche and comparison protocols.
 
-- `paper/AsyRand.tex`: current paper source.
-- `paper/AsyRand.pdf`: compiled paper.
-- `asyrand/`: Go implementation of AsyRand v1.
-- Root-level Python files such as `peer.py`, `node.py`, and `pvss.py`: earlier experimental prototype code for the v0 design.
-- `octopus/`: reference code used during the Go refactor for networking, ABA, and signature-related structure.
+## Layout
 
-The active implementation is the Go code in `asyrand/`.
+- `Tyche/`: Tyche implementation.
+- `asyrand/`: AsyRand implementation.
+- `spurt/`: SPURT implementation.
+- `grandline/`: Grandline implementation.
+- `utils/`: shared transport and utility code.
 
-## Go Implementation
+## Test
 
-The Go implementation follows the v1 protocol structure:
+```sh
+cd Tyche
+GOSUMDB=off go test ./...
+```
 
-- PVSS producer broadcasts commitments through Bracha RBC.
-- `ComQ[i][seq]` stores the PVSS commitments produced by party `i`, indexed by sequence number.
-- Each epoch selects a passive `source` from the source candidate list.
-- ABA decides whether the source should be consumed or removed.
-- ABA has an optimistic path when at least `2f+1` parties input `true`, and a threshold-coin path otherwise.
-- The consumer runs `RECON -> ECHO -> READY` and outputs a beacon with a BLS aggregate signature.
-- The implementation includes local and TCP transports, DKG setup for ABA coin material, and performance metrics.
+## Comparative Benchmark
 
-## Quick Start
+Use the same machine, Go version, `n`, `epochs`, fault threshold, producer interval, epoch timeout, and transport for every protocol. The local comparison uses in-memory transport and one beacon output as one completed epoch.
+
+Set CPU parallelism explicitly before running:
+
+```sh
+# macOS
+export GOMAXPROCS=$(sysctl -n hw.logicalcpu)
+
+# Linux
+export GOMAXPROCS=$(getconf _NPROCESSORS_ONLN)
+```
+
+### Runner Commands
+
+Tyche uses flags for `n` and `epochs`:
+
+```sh
+cd Tyche
+go run ./cmd/tyche -n 8 -epochs 1000 -transport memory
+```
+
+AsyRand, SPURT, and Grandline use JSON configs. Adjust `round` for `epochs`, and adjust the member list for `n`:
 
 ```sh
 cd asyrand
-GOSUMDB=off go test ./...
-go run ./cmd/asyrand -config configs/local_8.json
+go run ./cmd/asyrand -config configs/local_8_rounds_1000.json -transport memory
+
+cd ../spurt
+go run ./cmd/spurt -config configs/local_8_rounds_1000.json -transport memory
+
+cd ../grandline
+go run ./cmd/grandline -config configs/local_8_rounds_1000.json -transport memory
 ```
 
-The local config starts an in-memory 8-node cluster.
-
-Typical output includes epoch results and periodic metrics:
+Each runner prints a final line like:
 
 ```text
-config protocol=asyrand-v1 transport=memory nodes=8 f=2 rounds=3 queue_len=8 producer_ms=250 epoch_ms=15000 report_ms=5000
-epoch=0 source=node5 fast=8/8 commit=... random=...
-periodic metrics beacons=... throughput=... bandwidth=... queue_total=... rbc_avg=... aba_avg=...
+final metrics beacons=1000 throughput=...beacon/min sent_msgs=... recv_msgs=... sent=...KB recv=...KB bandwidth=...KB/s
 ```
 
-## TCP Deployment
+### CPU
 
-Use `asyrand/configs/aws_8.json` as the TCP template. Set:
-
-- `transport`: `tcp`
-- `listen_ip`: usually `0.0.0.0`
-- `cluster_ips`: public or private IPs reachable by the other nodes
-- `peers_p2p_port`: listening ports
-- `node_key_seed`: deterministic node key seeds used by the demo setup
-
-Run one process per node:
+Measure CPU with the same wrapper for each command:
 
 ```sh
-cd asyrand
-go run ./cmd/asyrand -config configs/aws_8.json -node node0
-go run ./cmd/asyrand -config configs/aws_8.json -node node1
+/usr/bin/time -l go run ./cmd/tyche -n 8 -epochs 1000 -transport memory
 ```
 
-Repeat for all configured nodes.
+Use `user CPU seconds + system CPU seconds` and the runner elapsed time:
 
-## Important Notes
+```text
+cpu_percent = (user_cpu_seconds + system_cpu_seconds) / elapsed_seconds * 100
+cpu_percent_per_core = cpu_percent / logical_cpu_count
+```
 
-The Go implementation is a research prototype, not a hardened production deployment. The current DKG setup path derives threshold material from configuration seed material for reproducible experiments; the `internal/dkg` package also contains a Pedersen DKG implementation and tests.
+### Result Table
 
-The Python implementation is kept as historical v0 prototype code. New experiments should use `asyrand/`.
+Run each protocol at least three times and report the median.
+
+| Protocol | n | epochs | throughput (beacon/s) | bandwidth (KB/s) | CPU % | CPU % / core |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Tyche |  |  |  |  |  |  |
+| AsyRand |  |  |  |  |  |  |
+| SPURT |  |  |  |  |  |  |
+| Grandline |  |  |  |  |  |  |
+
+Convert throughput with:
+
+```text
+beacon/s = beacon/min / 60
+```
+
+## Public TCP Deployment
+
+Open the chosen TCP port on every machine's firewall/security group. Use public addresses for peer dialing and `0.0.0.0` for local listening.
+
+Tyche starts one node per machine with flags:
+
+```sh
+cd Tyche
+PEERS='node0=PUBLIC_IP_0:9000,node1=PUBLIC_IP_1:9000,node2=PUBLIC_IP_2:9000,node3=PUBLIC_IP_3:9000'
+
+go run ./cmd/tyche -transport tcp -node node0 -n 4 -epochs 100 -peers "$PEERS" -listen 0.0.0.0:9000
+```
+
+Run the same command on every machine, changing only `-node` and `-listen` when ports differ.
+
+AsyRand, SPURT, and Grandline use TCP configs:
+
+```json
+{
+  "transport": "tcp",
+  "listen_ip": "0.0.0.0",
+  "peers": [
+    {"id": "node0", "addr": "PUBLIC_IP_0:9000"},
+    {"id": "node1", "addr": "PUBLIC_IP_1:9000"}
+  ]
+}
+```
+
+Start one process per machine:
+
+```sh
+go run ./cmd/asyrand -config configs/aws_8.json -node node0 -transport tcp
+go run ./cmd/spurt -config configs/aws_8.json -node node0 -transport tcp
+go run ./cmd/grandline -config configs/aws_8.json -node node0 -transport tcp
+```

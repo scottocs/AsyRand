@@ -11,11 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/scottocs/asyrand/spurt/internal/config"
-	asig "github.com/scottocs/asyrand/spurt/internal/crypto"
-	"github.com/scottocs/asyrand/spurt/internal/p2p"
-	"github.com/scottocs/asyrand/spurt/internal/pvss"
-	"github.com/scottocs/asyrand/spurt/internal/spurt"
+	"github.com/scottocs/Tyche/spurt/config"
+	asig "github.com/scottocs/Tyche/spurt/crypto"
+	spurt "github.com/scottocs/Tyche/spurt/protocol"
+	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 
@@ -23,7 +22,7 @@ type runtimeKeys struct {
 	ids        []p2p.NodeID
 	keys       map[p2p.NodeID]asig.KeyPair
 	pubs       map[string]ed25519.PublicKey
-	pvssKeys   map[p2p.NodeID]pvss.KeyPair
+	pvssKeys   map[p2p.NodeID]asig.PVSSKeyPair
 	pvssPublic map[p2p.NodeID]kyber.Point
 	blsKeys    map[p2p.NodeID]asig.BLSKeyPair
 	blsPublic  map[string]kyber.Point
@@ -197,12 +196,12 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	if err != nil {
 		return runtimeKeys{}, err
 	}
-	pvssKeys := make(map[p2p.NodeID]pvss.KeyPair, len(ids))
+	pvssKeys := make(map[p2p.NodeID]asig.PVSSKeyPair, len(ids))
 	pvssPublic := make(map[p2p.NodeID]kyber.Point, len(ids))
 	blsKeys := make(map[p2p.NodeID]asig.BLSKeyPair, len(ids))
 	blsPublic := make(map[string]kyber.Point, len(ids))
 	for _, id := range ids {
-		pk := pvss.KeyPairFromSeed(pvssSeeds[id])
+		pk := asig.PVSSKeyPairFromSeed(pvssSeeds[id])
 		pvssKeys[id] = pk
 		pvssPublic[id] = pk.Public
 		bk := asig.NewBLSKeyPairFromSeed(pvssSeeds[id])
@@ -216,7 +215,7 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 }
 
 func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Transport) (*spurt.Node, error) {
-	pvssScheme, err := pvss.NewScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPublic)
+	pvssScheme, err := asig.NewPVSSScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPublic)
 	if err != nil {
 		return nil, err
 	}
