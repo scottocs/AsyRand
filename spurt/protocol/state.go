@@ -198,7 +198,7 @@ func (s *State) PopHead(id p2p.NodeID, seq uint64) (asig.PVSSCommitment, bool) {
 		return asig.PVSSCommitment{}, false
 	}
 	delete(s.ComQ[idx], s.HeadSeq[idx])
-	s.HeadSeq[idx]++
+	s.advanceHeadLocked(idx)
 	return c, true
 }
 
@@ -276,6 +276,20 @@ func (s *State) ValidateHeadSet(refs []CommitmentRef) ([]asig.PVSSCommitment, er
 func (s *State) indexLocked(id p2p.NodeID) (int, bool) {
 	idx, ok := s.MemberIndex[id]
 	return idx, ok
+}
+
+func (s *State) advanceHeadLocked(idx int) {
+	next := uint64(0)
+	for seq := range s.ComQ[idx] {
+		if next == 0 || seq < next {
+			next = seq
+		}
+	}
+	if next == 0 {
+		s.HeadSeq[idx]++
+		return
+	}
+	s.HeadSeq[idx] = next
 }
 
 func (s *State) hasCommitmentLocked(c asig.PVSSCommitment) bool {

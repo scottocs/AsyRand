@@ -35,8 +35,8 @@ type Node struct {
 	seqMu sync.Mutex
 	seq   uint64
 
-	producerMu      sync.Mutex
-	producerPending int
+	producerMu       sync.Mutex
+	producerInFlight []uint64
 
 	reconMu      sync.Mutex
 	recon        map[string]*reconState
@@ -119,8 +119,12 @@ func (n *Node) Start(ctx context.Context) error {
 	if err := n.Transport.Start(ctx); err != nil {
 		return err
 	}
-	go n.dispatch(ctx)
+	n.StartProtocol(ctx)
 	return nil
+}
+
+func (n *Node) StartProtocol(ctx context.Context) {
+	go n.dispatch(ctx)
 }
 
 func (n *Node) Produce(ctx context.Context) (asig.Commitment, error) {
@@ -151,19 +155,41 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 100 * time.Millisecond
 	}
+	queueLen := n.State.QueueLen
+	if queueLen <= 0 {
+		queueLen = 8
+	}
+	high := 4
+	if high > queueLen {
+		high = queueLen
+	}
+	low := 2
+	if low > high {
+		low = high
+	}
+	if low <= 0 {
+		low = 1
+	}
 	go func() {
 		timer := time.NewTimer(0)
 		defer timer.Stop()
+		producing := true
 		for {
 			select {
 			case <-timer.C:
-				pending := n.producerPendingCount()
-				if n.State.QueueHasSpace(n.ID, pending) {
-					n.producerMu.Lock()
-					n.producerPending++
-					n.producerMu.Unlock()
-					if _, err := n.Produce(ctx); err != nil {
-						n.markProducedDelivered()
+				n.refreshProducerInFlight()
+				depth := n.State.QueueLength(n.ID)
+				inFlight := n.producerInFlightCount()
+				level := depth + inFlight
+				if level >= high {
+					producing = false
+				} else if level <= low {
+					producing = true
+				}
+				if producing && level < high && depth < queueLen && inFlight < high {
+					commit, err := n.Produce(ctx)
+					if err == nil {
+						n.trackProducerInFlight(commit.Seq)
 					}
 				}
 				timer.Reset(interval)
@@ -218,7 +244,7 @@ func (n *Node) AcceptCommitment(commit asig.Commitment) bool {
 	}
 	queued := n.State.Enqueue(commit)
 	if commit.Dealer == n.ID {
-		n.markProducedDelivered()
+		n.markProducedDelivered(commit.Seq)
 	}
 	return queued
 }
@@ -508,18 +534,44 @@ func voteBytes(typ string, epoch uint64, source p2p.NodeID, commitID, randomHash
 	return []byte(fmt.Sprintf("AsyRand-v1/%s/%d/%s/%s/%s", typ, epoch, source, commitID, randomHash))
 }
 
-func (n *Node) producerPendingCount() int {
+func (n *Node) producerInFlightCount() int {
 	n.producerMu.Lock()
 	defer n.producerMu.Unlock()
-	return n.producerPending
+	return len(n.producerInFlight)
 }
 
-func (n *Node) markProducedDelivered() {
+func (n *Node) trackProducerInFlight(seq uint64) {
 	n.producerMu.Lock()
 	defer n.producerMu.Unlock()
-	if n.producerPending > 0 {
-		n.producerPending--
+	n.producerInFlight = append(n.producerInFlight, seq)
+}
+
+func (n *Node) markProducedDelivered(seq uint64) {
+	n.producerMu.Lock()
+	defer n.producerMu.Unlock()
+	out := n.producerInFlight[:0]
+	for _, pending := range n.producerInFlight {
+		if pending != seq {
+			out = append(out, pending)
+		}
 	}
+	n.producerInFlight = out
+}
+
+func (n *Node) refreshProducerInFlight() {
+	n.producerMu.Lock()
+	inFlight := append([]uint64(nil), n.producerInFlight...)
+	n.producerMu.Unlock()
+	kept := inFlight[:0]
+	for _, seq := range inFlight {
+		if n.State.HasCommitmentSeq(n.ID, seq) || n.State.ConsumedSeq(n.ID) >= seq {
+			continue
+		}
+		kept = append(kept, seq)
+	}
+	n.producerMu.Lock()
+	n.producerInFlight = kept
+	n.producerMu.Unlock()
 }
 
 func (n *Node) bufferRecon(msg ReconMessage) {

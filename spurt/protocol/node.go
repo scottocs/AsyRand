@@ -19,6 +19,8 @@ const Protocol = "spurt"
 
 var errEpochTimeout = errors.New("epoch timeout")
 
+const sendTimeout = 20 * time.Second
+
 type Node struct {
 	ID        p2p.NodeID
 	Keys      asig.KeyPair
@@ -175,8 +177,12 @@ func (n *Node) Start(ctx context.Context) error {
 	if err := n.Transport.Start(ctx); err != nil {
 		return err
 	}
-	go n.dispatch(ctx)
+	n.StartProtocol(ctx)
 	return nil
+}
+
+func (n *Node) StartProtocol(ctx context.Context) {
+	go n.dispatch(ctx)
 }
 
 func (n *Node) Produce(ctx context.Context) (asig.PVSSCommitment, error) {
@@ -414,7 +420,7 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 	// Broadcast the public proposal after private sends are queued. Correctness
 	// does not depend on ordering: receivers buffer private columns if they
 	// arrive before this proposal.
-	_ = n.broadcast(Protocol, "PROPOSAL", es.epoch, msg)
+	n.broadcastAsync(Protocol, "PROPOSAL", es.epoch, msg)
 }
 
 func (n *Node) maybeSendPrepare(es *epochState) {
@@ -723,23 +729,31 @@ func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
 	pending := es.pendingRecon
 	if len(pending) > 0 {
 		es.pendingRecon = nil
-		for _, extra := range pending {
-			if extra.Digest != msg.Digest || extra.Epoch != msg.Epoch {
-				continue
-			}
-			if n.PVSS.VerifyShare(aggregate, extra.Share) {
-				es.reconShares[extra.Share.Holder] = extra.Share
-			}
-		}
 	}
 	n.mu.Unlock()
+	for _, extra := range pending {
+		if extra.Digest != msg.Digest || extra.Epoch != msg.Epoch {
+			continue
+		}
+		if !n.PVSS.VerifyShare(aggregate, extra.Share) {
+			continue
+		}
+		n.mu.Lock()
+		if es.aggregate != nil && es.digest == msg.Digest {
+			es.reconShares[extra.Share.Holder] = extra.Share
+		}
+		n.mu.Unlock()
+	}
 }
 
 func (n *Node) tryReconstruct(es *epochState) {
+	n.mu.Lock()
 	if !es.decided {
+		n.mu.Unlock()
 		return
 	}
 	if len(es.selected) == 0 || es.aggregate == nil {
+		n.mu.Unlock()
 		return
 	}
 	t := n.State.Threshold()
@@ -751,31 +765,54 @@ func (n *Node) tryReconstruct(es *epochState) {
 	}
 
 	if es.random != nil {
+		n.mu.Unlock()
 		return
 	}
 
-	parts := [][]byte{n.State.RPrevBytes(), encodeEpoch(es.epoch)}
 	if es.secret == nil {
 		if len(es.reconShares) < t {
+			n.mu.Unlock()
 			return
 		}
 		decrypted := make([]asig.PVSSDecryptedShare, 0, len(es.reconShares))
 		for _, share := range es.reconShares {
 			decrypted = append(decrypted, share)
 		}
+		aggregate := *es.aggregate
+		n.mu.Unlock()
 		start := time.Now()
-		recovered, err := n.PVSS.ReconTrusted(*es.aggregate, decrypted, t)
+		recovered, err := n.PVSS.ReconTrusted(aggregate, decrypted, t)
 		if n.Perf != nil {
 			n.Perf.addRecon(time.Since(start))
 		}
 		if err != nil {
 			return
 		}
-		es.secret = recovered
+		n.mu.Lock()
+		if es.secret == nil {
+			es.secret = recovered
+		}
+		if es.random != nil {
+			n.mu.Unlock()
+			return
+		}
 	}
-	parts = append(parts, []byte(es.digest), es.secret)
-	es.random = asig.HashBytes(parts...)
-	es.randomHash = randomHash(es.random)
+	secret := append([]byte(nil), es.secret...)
+	digest := es.digest
+	epoch := es.epoch
+	n.mu.Unlock()
+
+	parts := [][]byte{n.State.RPrevBytes(), encodeEpoch(epoch)}
+	parts = append(parts, []byte(digest), secret)
+	random := asig.HashBytes(parts...)
+	hash := randomHash(random)
+
+	n.mu.Lock()
+	if es.random == nil {
+		es.random = random
+		es.randomHash = hash
+	}
+	n.mu.Unlock()
 }
 
 func (n *Node) broadcastRecon(es *epochState, c asig.PVSSCommitment) {
@@ -985,8 +1022,26 @@ func (n *Node) sendPrivateData(epoch uint64, leader p2p.NodeID, digest string, s
 		if err != nil {
 			continue
 		}
-		_ = n.Transport.Send(context.Background(), member, msg)
+		n.sendAsync(member, msg)
 	}
+}
+
+func (n *Node) broadcastAsync(protocol, typ string, epoch uint64, payload any) {
+	for _, member := range n.State.MembersSnapshot() {
+		msg, err := p2p.NewMessage(protocol, typ, epochInstance(epoch), n.ID, member, payload)
+		if err != nil {
+			continue
+		}
+		n.sendAsync(member, msg)
+	}
+}
+
+func (n *Node) sendAsync(to p2p.NodeID, msg p2p.Message) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+		defer cancel()
+		_ = n.Transport.Send(ctx, to, msg)
+	}()
 }
 
 func privateDataForMember(epoch uint64, leader p2p.NodeID, digest string, selected []CommitmentRef, commitments []asig.PVSSCommitment, member p2p.NodeID) (PrivateDataMessage, bool) {

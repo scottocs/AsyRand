@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/scottocs/Tyche/Tyche/crypto"
 	"github.com/scottocs/Tyche/utils/p2p"
@@ -79,19 +80,21 @@ type instanceState struct {
 	finish     map[p2p.NodeID]bool
 	finishSent bool
 
-	bval     map[uint64]map[bool]map[p2p.NodeID]bool
-	bvalSent map[uint64]map[bool]bool
-	bin      map[uint64]map[bool]bool
-	aux      map[uint64]map[p2p.NodeID]bool
-	auxVal   map[uint64]map[bool]bool
-	auxSent  map[uint64]bool
-	conf     map[uint64]map[p2p.NodeID]bool
-	confVal  map[uint64]map[bool]bool
-	confSent map[uint64]bool
-	coinReq  map[uint64]bool
-	coinWait map[uint64]bool
-	coins    map[uint64]bool
-	coinSeen map[uint64]bool
+	bval        map[uint64]map[bool]map[p2p.NodeID]bool
+	bvalSent    map[uint64]map[bool]bool
+	bin         map[uint64]map[bool]bool
+	auxPending  map[uint64]map[p2p.NodeID]bool
+	aux         map[uint64]map[p2p.NodeID]bool
+	auxVal      map[uint64]map[bool]bool
+	auxSent     map[uint64]bool
+	confPending map[uint64]map[p2p.NodeID][]bool
+	conf        map[uint64]map[p2p.NodeID]bool
+	confVal     map[uint64]map[bool]bool
+	confSent    map[uint64]bool
+	coinReq     map[uint64]bool
+	coinWait    map[uint64]bool
+	coins       map[uint64]bool
+	coinSeen    map[uint64]bool
 }
 
 func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Agreement {
@@ -106,15 +109,21 @@ func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Agreement {
 func (a *Agreement) Propose(ctx context.Context, instance string, value bool) error {
 	a.mu.Lock()
 	st := a.get(instance)
+	first := !st.proposed
 	if !st.proposed {
 		st.proposed = true
 		st.est = value
 	}
 	a.mu.Unlock()
-	if err := a.broadcast(ctx, "INPUT", instance, InputMessage{Value: value}); err != nil {
+	if first {
+		go a.rebroadcastUntilReady(ctx, instance)
+	}
+	a.handleInput(ctx, instance, a.ID, value)
+	a.handleBVal(ctx, instance, a.ID, 0, value)
+	if err := a.broadcastBVal(ctx, instance, 0, value); err != nil {
 		return err
 	}
-	return a.broadcastBVal(ctx, instance, 0, value)
+	return a.broadcast(ctx, "INPUT", instance, InputMessage{Value: value})
 }
 
 func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
@@ -186,9 +195,11 @@ func (a *Agreement) get(instance string) *instanceState {
 	st = &instanceState{
 		inputs: make(map[p2p.NodeID]bool), inputCount: make(map[bool]int), finish: make(map[p2p.NodeID]bool),
 		bval: make(map[uint64]map[bool]map[p2p.NodeID]bool), bvalSent: make(map[uint64]map[bool]bool),
-		bin: make(map[uint64]map[bool]bool), aux: make(map[uint64]map[p2p.NodeID]bool),
+		bin: make(map[uint64]map[bool]bool), auxPending: make(map[uint64]map[p2p.NodeID]bool),
+		aux:    make(map[uint64]map[p2p.NodeID]bool),
 		auxVal: make(map[uint64]map[bool]bool), auxSent: make(map[uint64]bool),
-		conf: make(map[uint64]map[p2p.NodeID]bool), confVal: make(map[uint64]map[bool]bool),
+		confPending: make(map[uint64]map[p2p.NodeID][]bool),
+		conf:        make(map[uint64]map[p2p.NodeID]bool), confVal: make(map[uint64]map[bool]bool),
 		confSent: make(map[uint64]bool), coinReq: make(map[uint64]bool), coinWait: make(map[uint64]bool),
 		coins: make(map[uint64]bool), coinSeen: make(map[uint64]bool),
 	}
@@ -206,6 +217,9 @@ func (a *Agreement) ensureRound(st *instanceState, r uint64) {
 	if st.bin[r] == nil {
 		st.bin[r] = make(map[bool]bool)
 	}
+	if st.auxPending[r] == nil {
+		st.auxPending[r] = make(map[p2p.NodeID]bool)
+	}
 	if st.aux[r] == nil {
 		st.aux[r] = make(map[p2p.NodeID]bool)
 	}
@@ -214,6 +228,9 @@ func (a *Agreement) ensureRound(st *instanceState, r uint64) {
 	}
 	if st.conf[r] == nil {
 		st.conf[r] = make(map[p2p.NodeID]bool)
+	}
+	if st.confPending[r] == nil {
+		st.confPending[r] = make(map[p2p.NodeID][]bool)
 	}
 	if st.confVal[r] == nil {
 		st.confVal[r] = make(map[bool]bool)
@@ -279,7 +296,7 @@ func (a *Agreement) handleBVal(ctx context.Context, instance string, from p2p.No
 	if count >= a.quorum() {
 		st.bin[round][value] = true
 	}
-	sendAux := len(st.bin[round]) > 0 && !st.auxSent[round]
+	sendAux := len(st.bin[round]) > 0
 	auxValue := value
 	if sendAux {
 		if st.bin[round][st.est] {
@@ -292,12 +309,23 @@ func (a *Agreement) handleBVal(ctx context.Context, instance string, from p2p.No
 		}
 		st.auxSent[round] = true
 	}
+	sendConf, confValues := a.processPendingAuxLocked(st, round)
+	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if amplify {
 		_ = a.broadcastBVal(ctx, instance, round, value)
 	}
 	if sendAux {
 		_ = a.broadcast(ctx, "AUX", instance, AuxMessage{Round: round, Value: auxValue})
+	}
+	if sendConf {
+		_ = a.broadcast(ctx, "CONF", instance, ConfMessage{Round: round, Values: confValues})
+	}
+	if needCoin {
+		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
+	}
+	if hasCoin {
+		a.tryAdvanceWithCoin(ctx, instance, round)
 	}
 }
 
@@ -309,23 +337,22 @@ func (a *Agreement) handleAux(ctx context.Context, instance string, from p2p.Nod
 		return
 	}
 	a.ensureRound(st, round)
-	if !st.bin[round][value] || st.aux[round][from] {
+	if st.aux[round][from] {
 		a.mu.Unlock()
 		return
 	}
-	st.aux[round][from] = true
-	st.auxVal[round][value] = true
-	sendConf := len(st.aux[round]) >= a.quorum() && !st.confSent[round]
-	values := make([]bool, 0, len(st.auxVal[round]))
-	if sendConf {
-		for v := range st.auxVal[round] {
-			values = append(values, v)
-		}
-		st.confSent[round] = true
-	}
+	st.auxPending[round][from] = value
+	sendConf, values := a.processPendingAuxLocked(st, round)
+	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if sendConf {
 		_ = a.broadcast(ctx, "CONF", instance, ConfMessage{Round: round, Values: values})
+	}
+	if needCoin {
+		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
+	}
+	if hasCoin {
+		a.tryAdvanceWithCoin(ctx, instance, round)
 	}
 }
 
@@ -341,23 +368,8 @@ func (a *Agreement) handleConf(ctx context.Context, instance string, from p2p.No
 		a.mu.Unlock()
 		return
 	}
-	for _, v := range values {
-		if !st.bin[round][v] {
-			a.mu.Unlock()
-			return
-		}
-	}
-	st.conf[round][from] = true
-	for _, v := range values {
-		st.confVal[round][v] = true
-	}
-	needCoin := len(st.conf[round]) >= a.quorum() && !st.coinReq[round]
-	if needCoin {
-		st.coinReq[round] = true
-		st.coinWait[round] = true
-		st.round = round
-	}
-	hasCoin := st.coinSeen[round]
+	st.confPending[round][from] = append([]bool(nil), values...)
+	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if needCoin {
 		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
@@ -365,6 +377,61 @@ func (a *Agreement) handleConf(ctx context.Context, instance string, from p2p.No
 	if hasCoin {
 		a.tryAdvanceWithCoin(ctx, instance, round)
 	}
+}
+
+func (a *Agreement) processPendingAuxLocked(st *instanceState, round uint64) (bool, []bool) {
+	for from, value := range st.auxPending[round] {
+		if st.aux[round][from] {
+			delete(st.auxPending[round], from)
+			continue
+		}
+		if !st.bin[round][value] {
+			continue
+		}
+		st.aux[round][from] = true
+		st.auxVal[round][value] = true
+		delete(st.auxPending[round], from)
+	}
+	if len(st.aux[round]) < a.quorum() {
+		return false, nil
+	}
+	values := make([]bool, 0, len(st.auxVal[round]))
+	for v := range st.auxVal[round] {
+		values = append(values, v)
+	}
+	st.confSent[round] = true
+	return true, values
+}
+
+func (a *Agreement) processPendingConfLocked(st *instanceState, round uint64) (bool, bool) {
+	for from, values := range st.confPending[round] {
+		if st.conf[round][from] {
+			delete(st.confPending[round], from)
+			continue
+		}
+		ready := true
+		for _, v := range values {
+			if !st.bin[round][v] {
+				ready = false
+				break
+			}
+		}
+		if !ready {
+			continue
+		}
+		st.conf[round][from] = true
+		for _, v := range values {
+			st.confVal[round][v] = true
+		}
+		delete(st.confPending[round], from)
+	}
+	needCoin := len(st.conf[round]) >= a.quorum() && !st.coinReq[round]
+	if needCoin {
+		st.coinReq[round] = true
+		st.coinWait[round] = true
+		st.round = round
+	}
+	return needCoin, st.coinSeen[round]
 }
 
 func (a *Agreement) tryAdvanceWithCoin(ctx context.Context, instance string, round uint64) {
@@ -409,13 +476,31 @@ func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round ui
 	a.mu.Lock()
 	st := a.get(instance)
 	a.ensureRound(st, round)
-	if st.bvalSent[round][value] {
-		a.mu.Unlock()
-		return nil
-	}
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()
 	return a.broadcast(ctx, "BVAL", instance, BValMessage{Round: round, Value: value})
+}
+
+func (a *Agreement) rebroadcastUntilReady(ctx context.Context, instance string) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		a.mu.Lock()
+		st := a.get(instance)
+		if st.decided || st.coinWait[st.round] {
+			a.mu.Unlock()
+			return
+		}
+		round := st.round
+		est := st.est
+		a.mu.Unlock()
+		_ = a.broadcastBVal(ctx, instance, round, est)
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (a *Agreement) broadcast(ctx context.Context, typ, instance string, payload any) error {

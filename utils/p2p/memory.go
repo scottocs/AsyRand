@@ -31,6 +31,8 @@ type MemoryTransport struct {
 	inbox        chan Message
 	closed       bool
 	mu           sync.RWMutex
+	statsMu      sync.Mutex
+	typeStats    map[string]MessageTypeMetrics
 	sentMessages atomic.Uint64
 	sentBytes    atomic.Uint64
 	recvMessages atomic.Uint64
@@ -60,6 +62,7 @@ func (t *MemoryTransport) Send(ctx context.Context, to NodeID, msg Message) erro
 	case peer.inbox <- msg:
 		t.sentMessages.Add(1)
 		t.sentBytes.Add(uint64(size))
+		t.recordTypeStats(msg, size)
 		peer.recvMessages.Add(1)
 		peer.recvBytes.Add(uint64(size))
 		return nil
@@ -97,6 +100,29 @@ func (t *MemoryTransport) Metrics() Metrics {
 		RecvMessages: t.recvMessages.Load(),
 		RecvBytes:    t.recvBytes.Load(),
 	}
+}
+
+func (t *MemoryTransport) MessageTypeMetrics() map[string]MessageTypeMetrics {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	out := make(map[string]MessageTypeMetrics, len(t.typeStats))
+	for k, v := range t.typeStats {
+		out[k] = v
+	}
+	return out
+}
+
+func (t *MemoryTransport) recordTypeStats(msg Message, size int) {
+	key := msg.Protocol + "/" + msg.Type
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	if t.typeStats == nil {
+		t.typeStats = make(map[string]MessageTypeMetrics)
+	}
+	stats := t.typeStats[key]
+	stats.SentMessages++
+	stats.SentBytes += uint64(size)
+	t.typeStats[key] = stats
 }
 
 func (t *MemoryTransport) Close() error {

@@ -98,8 +98,12 @@ func (n *Node) Start(ctx context.Context) error {
 	if err := n.Transport.Start(ctx); err != nil {
 		return err
 	}
-	go n.dispatch(ctx)
+	n.StartProtocol(ctx)
 	return nil
+}
+
+func (n *Node) StartProtocol(ctx context.Context) {
+	go n.dispatch(ctx)
 }
 
 func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {

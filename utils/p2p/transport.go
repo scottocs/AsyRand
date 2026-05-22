@@ -9,6 +9,11 @@ type Metrics struct {
 	RecvBytes    uint64
 }
 
+type MessageTypeMetrics struct {
+	SentMessages uint64
+	SentBytes    uint64
+}
+
 type Transport interface {
 	ID() NodeID
 	Inbox() <-chan Message

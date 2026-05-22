@@ -69,7 +69,7 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 				t.Fatalf("invalid ready aggregate certificate: %v", err)
 			}
 		case <-ctx.Done():
-			t.Fatal("timed out waiting for certified beacon")
+			t.Fatalf("timed out waiting for certified beacon\n%s", dumpNodes(nodes))
 		}
 	}
 	if first.Epoch != 1 || first.Source != source || first.Seq != 1 {
@@ -382,6 +382,10 @@ func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitStored(t, ctx, nodes, source, seq)
+		if _, err := producer.Produce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		waitStored(t, ctx, nodes, source, seq+1)
 		results := make(chan beaconTestResult, len(nodes))
 		for _, n := range nodes {
 			go func(n *Node) {
@@ -396,7 +400,7 @@ func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
 					t.Fatalf("RunEpochAt(%d): %v", epoch, res.err)
 				}
 			case <-ctx.Done():
-				t.Fatal("timed out before future activation")
+				t.Fatalf("timed out before future activation\n%s", dumpNodes(nodes))
 			}
 		}
 	}
@@ -552,7 +556,7 @@ func newTestNodes(t *testing.T, ctx context.Context) []*Node {
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, PVSS: s, Transport: net.NewTransport(id, 1024)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, RemovalExpiration: 50 * time.Millisecond, PVSS: s, Transport: net.NewTransport(id, 1024)})
 		if err != nil {
 			t.Fatal(err)
 		}

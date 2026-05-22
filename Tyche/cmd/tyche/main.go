@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,8 @@ type metricSnapshot struct {
 	sentBytes    uint64
 	recvMessages uint64
 	recvBytes    uint64
+	abaMessages  uint64
+	abaBytes     uint64
 }
 
 const transportBuffer = 262144
@@ -38,7 +41,7 @@ func main() {
 	listenAddr := flag.String("listen", "", "tcp listen address, for example 0.0.0.0:9000; defaults to listen_ip plus this node's peer port")
 	listenIP := flag.String("listen-ip", "0.0.0.0", "tcp listen ip used when -listen is empty")
 	queueLen := flag.Int("queue-len", 8, "per-source commitment queue length")
-	producerMS := flag.Int("producer-ms", 20, "producer interval in milliseconds")
+	producerMS := flag.Int("producer-ms", 250, "producer interval in milliseconds")
 	prefillMS := flag.Int("prefill-ms", 3000, "producer prefill time in milliseconds")
 	epochTimeoutMS := flag.Int("epoch-timeout-ms", 10000, "timeout per epoch in milliseconds")
 	reportMS := flag.Int("report-ms", 5000, "periodic metrics interval in milliseconds")
@@ -91,7 +94,7 @@ func run(opts runOptions) error {
 		opts.queueLen = 8
 	}
 	if opts.producerMS <= 0 {
-		opts.producerMS = 20
+		opts.producerMS = 250
 	}
 	if opts.prefillMS < 0 {
 		opts.prefillMS = 0
@@ -108,6 +111,7 @@ func run(opts runOptions) error {
 func runMemory(opts runOptions) error {
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
+	started := time.Now()
 
 	ids, pp, keys, err := setupRuntime(opts.n, opts.f)
 	if err != nil {
@@ -145,7 +149,6 @@ func runMemory(opts runOptions) error {
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
 
-	start := time.Now()
 	for epoch := 1; epoch <= opts.epochs; epoch++ {
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 		results := make(chan result, len(nodes))
@@ -172,7 +175,7 @@ func runMemory(opts runOptions) error {
 		fmt.Printf("epoch=%d source=%s seq=%d random=%x\n", sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
 	}
 
-	printMetrics("final", nodes, time.Since(start), stats.beacons.Load())
+	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
 	return nil
 }
 
@@ -208,6 +211,7 @@ func runTCP(opts runOptions) error {
 
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
+	started := time.Now()
 	scheme, err := crypto.NewScheme(opts.nodeID, keys[opts.nodeID].Private, pp)
 	if err != nil {
 		return err
@@ -222,10 +226,11 @@ func runTCP(opts runOptions) error {
 	if err := transport.Start(runCtx); err != nil {
 		return err
 	}
-	node.Start(runCtx)
-	if err := waitForTCPPeers(runCtx, opts.nodeID, peers, time.Duration(opts.epochTimeoutMS)*time.Millisecond); err != nil {
+	if err := waitForTCPPeers(runCtx, opts.nodeID, peers, 30*time.Second); err != nil {
 		return err
 	}
+	fmt.Printf("node=%s tcp_peers_ready peers=%d\n", opts.nodeID, len(peers)-1)
+	node.Start(runCtx)
 	node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 
 	nodes := []*tyche.Node{node}
@@ -236,7 +241,6 @@ func runTCP(opts runOptions) error {
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
 
-	start := time.Now()
 	for epoch := 1; epoch <= opts.epochs; epoch++ {
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 		beacon, err := node.RunEpochAt(epochCtx, uint64(epoch))
@@ -247,7 +251,7 @@ func runTCP(opts runOptions) error {
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
 	}
-	printMetrics("final", nodes, time.Since(start), stats.beacons.Load())
+	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
 	return nil
 }
 
@@ -318,17 +322,40 @@ func waitForTCPPeers(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]
 }
 
 func allPeersReachable(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string) bool {
+	total := 0
+	for id := range peers {
+		if id == self {
+			continue
+		}
+		total++
+	}
+	if total == 0 {
+		return true
+	}
+	results := make(chan bool, total)
 	for id, addr := range peers {
 		if id == self {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
-		cancel()
-		if err != nil {
+		go func(addr string) {
+			dialCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+			if err == nil {
+				_ = conn.Close()
+			}
+			results <- (err == nil)
+		}(addr)
+	}
+	for i := 0; i < total; i++ {
+		select {
+		case ok := <-results:
+			if !ok {
+				return false
+			}
+		case <-ctx.Done():
 			return false
 		}
-		_ = conn.Close()
 	}
 	return true
 }
@@ -355,7 +382,8 @@ func startReporter(ctx context.Context, nodes []*tyche.Node, stats *runStats, in
 				now := time.Now()
 				current := collectMetrics(nodes)
 				currentBeacon := stats.beacons.Load()
-				printMetricDelta("periodic", current.sub(last), now.Sub(lastAt), currentBeacon-lastBeacon)
+				queueTotal, queueMax := collectQueue(nodes)
+				printMetricDelta("periodic", current.sub(last), queueTotal, queueMax, now.Sub(lastAt), currentBeacon-lastBeacon)
 				last, lastAt = current, now
 				lastBeacon = currentBeacon
 			case <-done:
@@ -376,8 +404,48 @@ func collectMetrics(nodes []*tyche.Node) metricSnapshot {
 		out.sentBytes += m.SentBytes
 		out.recvMessages += m.RecvMessages
 		out.recvBytes += m.RecvBytes
+		if typed, ok := node.Transport.(interface {
+			MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
+		}); ok {
+			for key, stats := range typed.MessageTypeMetrics() {
+				if strings.HasPrefix(key, "aba/") {
+					out.abaMessages += stats.SentMessages
+					out.abaBytes += stats.SentBytes
+				}
+			}
+		}
 	}
 	return out
+}
+
+func collectMessageTypeMetrics(nodes []*tyche.Node) map[string]p2p.MessageTypeMetrics {
+	out := make(map[string]p2p.MessageTypeMetrics)
+	for _, node := range nodes {
+		typed, ok := node.Transport.(interface {
+			MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
+		})
+		if !ok {
+			continue
+		}
+		for key, stats := range typed.MessageTypeMetrics() {
+			current := out[key]
+			current.SentMessages += stats.SentMessages
+			current.SentBytes += stats.SentBytes
+			out[key] = current
+		}
+	}
+	return out
+}
+
+func collectQueue(nodes []*tyche.Node) (total int, max int) {
+	for _, node := range nodes {
+		t, m := node.QueueBacklog()
+		total += t
+		if m > max {
+			max = m
+		}
+	}
+	return total, max
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
@@ -386,19 +454,29 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 		sentBytes:    m.sentBytes - prev.sentBytes,
 		recvMessages: m.recvMessages - prev.recvMessages,
 		recvBytes:    m.recvBytes - prev.recvBytes,
+		abaMessages:  m.abaMessages - prev.abaMessages,
+		abaBytes:     m.abaBytes - prev.abaBytes,
 	}
 }
 
 func printMetrics(label string, nodes []*tyche.Node, elapsed time.Duration, beacons uint64) {
-	printMetricDelta(label, collectMetrics(nodes), elapsed, beacons)
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta(label, collectMetrics(nodes), queueTotal, queueMax, elapsed, beacons)
+	if label == "final" {
+		printMessageTypeMetrics(nodes)
+	}
 }
 
-func printMetricDelta(label string, delta metricSnapshot, elapsed time.Duration, beacons uint64) {
+func printMetricDelta(label string, delta metricSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s\n",
+	abaPct := 0.0
+	if delta.sentMessages > 0 {
+		abaPct = float64(delta.abaMessages) * 100 / float64(delta.sentMessages)
+	}
+	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB\n",
 		label,
 		beacons,
 		float64(beacons)*60/seconds,
@@ -407,5 +485,26 @@ func printMetricDelta(label string, delta metricSnapshot, elapsed time.Duration,
 		float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024,
 		float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
+		queueTotal,
+		queueMax,
+		delta.abaMessages,
+		abaPct,
+		float64(delta.abaBytes)/1024,
 	)
+}
+
+func printMessageTypeMetrics(nodes []*tyche.Node) {
+	types := collectMessageTypeMetrics(nodes)
+	if len(types) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(types))
+	for key := range types {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		stats := types[key]
+		fmt.Printf("message_type type=%s sent_msgs=%d sent=%.2fKB\n", key, stats.SentMessages, float64(stats.SentBytes)/1024)
+	}
 }

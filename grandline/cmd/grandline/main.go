@@ -149,12 +149,14 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if err := node.Start(runCtx); err != nil {
+	if err := transport.Start(runCtx); err != nil {
 		return err
 	}
-	if err := waitForTCPPeers(runCtx, cfg.NodeID, cfg.PeerMap(), time.Duration(cfg.EpochMS)*time.Millisecond); err != nil {
+	if err := waitForTCPPeers(runCtx, cfg.NodeID, cfg.PeerMap(), 30*time.Second); err != nil {
 		return err
 	}
+	fmt.Printf("node=%s tcp_peers_ready peers=%d\n", cfg.NodeID, len(cfg.PeerMap())-1)
+	node.StartProtocol(runCtx)
 	node.StartProducer(runCtx, time.Duration(cfg.ProducerMS)*time.Millisecond)
 
 	printConfig(cfg, 1, "tcp")
@@ -260,8 +262,8 @@ func parseDuration(raw string) time.Duration {
 }
 
 func printConfig(cfg config.Config, nodes int, transport string) {
-	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=%d epoch_ms=%d report_ms=%d\n",
-		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.ProducerMS, cfg.EpochMS, cfg.ReportMS)
+	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=unused epoch_ms=%d report_ms=%d\n",
+		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.EpochMS, cfg.ReportMS)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}
@@ -401,17 +403,40 @@ func waitForTCPPeers(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]
 }
 
 func allPeersReachable(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string) bool {
+	total := 0
+	for id := range peers {
+		if id == self {
+			continue
+		}
+		total++
+	}
+	if total == 0 {
+		return true
+	}
+	results := make(chan bool, total)
 	for id, addr := range peers {
 		if id == self {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
-		cancel()
-		if err != nil {
+		go func(addr string) {
+			dialCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+			if err == nil {
+				_ = conn.Close()
+			}
+			results <- (err == nil)
+		}(addr)
+	}
+	for i := 0; i < total; i++ {
+		select {
+		case ok := <-results:
+			if !ok {
+				return false
+			}
+		case <-ctx.Done():
 			return false
 		}
-		_ = conn.Close()
 	}
 	return true
 }

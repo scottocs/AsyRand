@@ -116,8 +116,13 @@ func (s *PVSSPairingFreeScheme) Share(dealer p2p.NodeID, seq uint64, members []p
 	group := suite()
 	// GRandLine Figure 1 Dist: sample f, publish commitments C_i=g^{f(i)}
 	// in G1 and encrypted shares E_i=pk_i^{f(i)} in G2.
-	secret := group.G1().Scalar().Pick(group.RandomStream())
-	poly := share.NewPriPoly(group.G1(), s.threshold, secret, group.RandomStream())
+	secret := deterministicG1Scalar(group, "GRandLine-v1/APVSS/share-secret", s.private, dealer, seq, members, 0)
+	coeffs := make([]kyber.Scalar, s.threshold)
+	coeffs[0] = secret
+	for i := 1; i < s.threshold; i++ {
+		coeffs[i] = deterministicG1Scalar(group, "GRandLine-v1/APVSS/share-coeff", s.private, dealer, seq, members, i)
+	}
+	poly := share.CoefficientsToPriPoly(group.G1(), coeffs)
 	shares := poly.Shares(len(members))
 	commit := make(map[p2p.NodeID]string, len(members))
 	cipher := make(map[p2p.NodeID]string, len(members))
@@ -357,7 +362,7 @@ func hPoint(group *bn256.Suite) kyber.Point {
 func schnorrProve(group *bn256.Suite, dealer p2p.NodeID, seq uint64, secret, signingKey kyber.Scalar) PVSSProof {
 	// Figure 1 writes pi=<zeta,theta>_L: zeta=g^alpha, theta is the
 	// Fiat-Shamir Schnorr proof of alpha, and Signature binds the proof to L.
-	nonce := group.G1().Scalar().Pick(group.RandomStream())
+	nonce := deterministicSchnorrNonce(group, dealer, seq, secret, signingKey)
 	zeta := group.G1().Point().Mul(secret, gPoint(group))
 	a := group.G1().Point().Mul(nonce, gPoint(group))
 	challenge := schnorrChallenge(group, dealer, seq, zeta, a)
@@ -365,6 +370,52 @@ func schnorrProve(group *bn256.Suite, dealer p2p.NodeID, seq uint64, secret, sig
 	proof := PVSSProof{Zeta: mustPointHex(zeta), A: mustPointHex(a), Challenge: mustScalarHex(challenge), Response: mustScalarHex(response)}
 	proof.Signature = mustPointHex(group.G1().Point().Mul(signingKey, proofSignatureBase(group, dealer, seq, proof)))
 	return proof
+}
+
+func deterministicG1Scalar(group *bn256.Suite, label string, private kyber.Scalar, dealer p2p.NodeID, seq uint64, members []p2p.NodeID, index int) kyber.Scalar {
+	buf := bytes.Buffer{}
+	buf.WriteString(label)
+	buf.WriteByte('/')
+	buf.WriteString(string(dealer))
+	buf.WriteByte('/')
+	buf.WriteString(fmt.Sprintf("%d/%d", seq, index))
+	if private != nil {
+		if raw, err := private.MarshalBinary(); err == nil {
+			buf.Write(raw)
+		}
+	}
+	for _, member := range normalizeMembers(members) {
+		buf.WriteByte('/')
+		buf.WriteString(string(member))
+	}
+	scalar := group.G1().Scalar().SetBytes(HashBytes(buf.Bytes()))
+	if scalar.Equal(group.G1().Scalar().Zero()) {
+		scalar = group.G1().Scalar().One()
+	}
+	return scalar
+}
+
+func deterministicSchnorrNonce(group *bn256.Suite, dealer p2p.NodeID, seq uint64, secret, signingKey kyber.Scalar) kyber.Scalar {
+	buf := bytes.Buffer{}
+	buf.WriteString("GRandLine-v1/APVSS/schnorr-nonce/")
+	buf.WriteString(string(dealer))
+	buf.WriteByte('/')
+	buf.WriteString(fmt.Sprintf("%d", seq))
+	if secret != nil {
+		if raw, err := secret.MarshalBinary(); err == nil {
+			buf.Write(raw)
+		}
+	}
+	if signingKey != nil {
+		if raw, err := signingKey.MarshalBinary(); err == nil {
+			buf.Write(raw)
+		}
+	}
+	scalar := group.G1().Scalar().SetBytes(HashBytes(buf.Bytes()))
+	if scalar.Equal(group.G1().Scalar().Zero()) {
+		scalar = group.G1().Scalar().One()
+	}
+	return scalar
 }
 
 func schnorrVerify(group *bn256.Suite, dealer p2p.NodeID, seq uint64, proof PVSSProof, publicKey kyber.Point) bool {

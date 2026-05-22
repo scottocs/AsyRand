@@ -181,6 +181,30 @@ func (s *State) QueueLength(id p2p.NodeID) int {
 	return len(s.ComQ[idx])
 }
 
+func (s *State) HasCommitmentSeq(id p2p.NodeID, seq uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.indexLocked(id)
+	if !ok || s.Removed[id] {
+		return false
+	}
+	_, ok = s.ComQ[idx][seq]
+	return ok
+}
+
+func (s *State) ConsumedSeq(id p2p.NodeID) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.indexLocked(id)
+	if !ok {
+		return 0
+	}
+	if s.HeadSeq[idx] == 0 {
+		return 0
+	}
+	return s.HeadSeq[idx] - 1
+}
+
 func (s *State) QueueHasSpace(id p2p.NodeID, pending int) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

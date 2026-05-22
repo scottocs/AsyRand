@@ -146,12 +146,14 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if err := node.Start(runCtx); err != nil {
+	if err := transport.Start(runCtx); err != nil {
 		return err
 	}
-	if err := waitForTCPPeers(runCtx, cfg.NodeID, cfg.PeerMap(), time.Duration(cfg.EpochMS)*time.Millisecond); err != nil {
+	if err := waitForTCPPeers(runCtx, cfg.NodeID, cfg.PeerMap(), 30*time.Second); err != nil {
 		return err
 	}
+	fmt.Printf("node=%s tcp_peers_ready peers=%d\n", cfg.NodeID, len(cfg.PeerMap())-1)
+	node.StartProtocol(runCtx)
 	node.StartProducer(runCtx, time.Duration(cfg.ProducerMS)*time.Millisecond)
 	nodes := []*asyrand.Node{node}
 	printConfig(cfg, len(rt.ids), "tcp")
@@ -369,17 +371,40 @@ func waitForTCPPeers(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]
 }
 
 func allPeersReachable(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string) bool {
+	total := 0
+	for id := range peers {
+		if id == self {
+			continue
+		}
+		total++
+	}
+	if total == 0 {
+		return true
+	}
+	results := make(chan bool, total)
 	for id, addr := range peers {
 		if id == self {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
-		cancel()
-		if err != nil {
+		go func(addr string) {
+			dialCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+			if err == nil {
+				_ = conn.Close()
+			}
+			results <- (err == nil)
+		}(addr)
+	}
+	for i := 0; i < total; i++ {
+		select {
+		case ok := <-results:
+			if !ok {
+				return false
+			}
+		case <-ctx.Done():
 			return false
 		}
-		_ = conn.Close()
 	}
 	return true
 }
