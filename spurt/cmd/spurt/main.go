@@ -83,7 +83,6 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 		if err := node.Start(runCtx); err != nil {
 			return err
 		}
-		node.StartProducer(runCtx, time.Duration(cfg.ProducerMS)*time.Millisecond)
 		nodes = append(nodes, node)
 	}
 
@@ -116,6 +115,10 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 			}
 			if sample == nil {
 				sample = b
+				continue
+			}
+			if b == nil || b.Epoch != sample.Epoch || b.Digest != sample.Digest || fmt.Sprintf("%x", b.Random) != fmt.Sprintf("%x", sample.Random) {
+				return fmt.Errorf("epoch %d inconsistent beacon: sample_digest=%s got_digest=%v", epoch, sample.Digest, b)
 			}
 		}
 		if sample == nil {
@@ -153,7 +156,6 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	}
 	fmt.Printf("node=%s tcp_peers_ready peers=%d\n", cfg.NodeID, len(cfg.PeerMap())-1)
 	node.StartProtocol(runCtx)
-	node.StartProducer(runCtx, time.Duration(cfg.ProducerMS)*time.Millisecond)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, cfg, []*spurt.Node{node}, stats)
 	defer stopReport()
@@ -224,9 +226,9 @@ func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Tra
 		return nil, err
 	}
 	return spurt.NewNode(spurt.NodeConfig{
-		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
+		ID: id, Members: rt.ids, F: cfg.F, Seed: rt.seed, Keys: rt.keys[id],
 		Public: rt.pubs, BLS: rt.blsKeys[id], BLSPublic: rt.blsPublic,
-		Transport: transport, PVSS: pvssScheme,
+		Transport: transport, PVSS: pvssScheme, CryptoWorkers: cfg.MaxPool, Lookahead: cfg.Lookahead,
 	})
 }
 
@@ -252,8 +254,8 @@ func parseDuration(raw string) time.Duration {
 }
 
 func printConfig(cfg config.Config, nodes int, transport string) {
-	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=%d epoch_ms=%d report_ms=%d\n",
-		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.ProducerMS, cfg.EpochMS, cfg.ReportMS)
+	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d lookahead=%d epoch_ms=%d report_ms=%d crypto_workers=%d\n",
+		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.Lookahead, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}
@@ -279,7 +281,7 @@ func startReporter(ctx context.Context, cfg config.Config, nodes []*spurt.Node, 
 				current := collectMetrics(nodes)
 				currentPerf := collectPerf(nodes)
 				currentBeacon := stats.beacons.Load()
-				totalPending, maxPending := collectQueue(nodes)
+				totalPending, maxPending := collectCachedCommitments(nodes)
 				printMetricDelta("periodic", current.sub(last), currentPerf.Sub(lastPerf), totalPending, maxPending, now.Sub(lastAt), currentBeacon-lastBeacon)
 				last, lastAt = current, now
 				lastPerf = currentPerf
@@ -321,12 +323,12 @@ func collectPerf(nodes []*spurt.Node) spurt.PerfSnapshot {
 	return out
 }
 
-func collectQueue(nodes []*spurt.Node) (total int, max int) {
+func collectCachedCommitments(nodes []*spurt.Node) (total int, max int) {
 	for _, node := range nodes {
-		if node == nil || node.State == nil {
+		if node == nil {
 			continue
 		}
-		totalNode, maxNode := node.State.QueueBacklog()
+		totalNode, maxNode := node.CachedCommitments()
 		total += totalNode
 		if maxNode > max {
 			max = maxNode
@@ -345,23 +347,24 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 }
 
 func printMetrics(label string, nodes []*spurt.Node, elapsed time.Duration, beacons uint64) {
-	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), queueTotal, queueMax, elapsed, beacons)
+	cacheTotal, cacheMax := collectCachedCommitments(nodes)
+	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), cacheTotal, cacheMax, elapsed, beacons)
 }
 
-func printMetricDelta(label string, delta metricSnapshot, perf spurt.PerfSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {
+func printMetricDelta(label string, delta metricSnapshot, perf spurt.PerfSnapshot, cacheTotal int, cacheMax int, elapsed time.Duration, beacons uint64) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s spurt_vote_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s cached_total=%d cached_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s spurt_vote_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label, beacons, float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
-		queueTotal, queueMax,
+		cacheTotal, cacheMax,
 		spurt.AvgDuration(perf.PVSSShareTotal, perf.PVSSShareCount), spurt.AvgDuration(perf.PVSSVerifyTotal, perf.PVSSVerifyCount),
 		spurt.AvgDuration(perf.PVSSPreReconTotal, perf.PVSSPreReconCount), spurt.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
 		spurt.AvgDuration(perf.AgreementTotal, perf.AgreementCount),
+		spurt.AvgDuration(perf.BLSSignTotal, perf.BLSSignCount),
 		spurt.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount), spurt.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount),
 	)
 }

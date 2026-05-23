@@ -24,13 +24,12 @@ type Config struct {
 	Transport    string                `json:"transport"`
 	F            int                   `json:"f"`
 	Round        int                   `json:"round"`
-	QueueLen     int                   `json:"queue_len"`
 	ListenIP     string                `json:"listen_ip"`
-	ProducerMS   int                   `json:"producer_interval_ms"`
 	PrefillMS    int                   `json:"prefill_ms"`
 	EpochMS      int                   `json:"epoch_timeout_ms"`
 	ReportMS     int                   `json:"report_interval_ms"`
 	LingerMS     int                   `json:"linger_ms"`
+	Lookahead    int                   `json:"aggregation_lookahead"`
 	Seed         string                `json:"seed"`
 	BatchSize    int                   `json:"batch_size"`
 	MaxPool      int                   `json:"max_pool"`
@@ -53,9 +52,6 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
-	if cfg.QueueLen == 0 {
-		cfg.QueueLen = 8
-	}
 	if cfg.Round == 0 {
 		cfg.Round = 1
 	}
@@ -68,9 +64,6 @@ func Load(path string) (Config, error) {
 	if cfg.ListenIP == "" {
 		cfg.ListenIP = "0.0.0.0"
 	}
-	if cfg.ProducerMS == 0 {
-		cfg.ProducerMS = 250
-	}
 	if cfg.PrefillMS == 0 {
 		cfg.PrefillMS = 1000
 	}
@@ -80,8 +73,14 @@ func Load(path string) (Config, error) {
 	if cfg.ReportMS == 0 {
 		cfg.ReportMS = 5000
 	}
+	if cfg.MaxPool == 0 {
+		cfg.MaxPool = 4
+	}
 	if cfg.LingerMS == 0 {
 		cfg.LingerMS = 15000
+	}
+	if cfg.Lookahead == 0 {
+		cfg.Lookahead = 8
 	}
 	if cfg.F < 0 {
 		cfg.F = (len(cfg.ClusterIndex) - 1) / 3

@@ -223,7 +223,7 @@ func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Tra
 	return asyrand.NewNode(asyrand.NodeConfig{
 		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
 		Public: rt.pubs, BLS: rt.blsKeys[id], BLSPublic: rt.blsPublic,
-		Transport: transport, PVSS: pvssScheme,
+		Transport: transport, PVSS: pvssScheme, CryptoWorkers: cfg.MaxPool,
 	})
 }
 
@@ -235,8 +235,8 @@ func runtimeContext(cfg config.Config, duration time.Duration) (context.Context,
 }
 
 func printConfig(cfg config.Config, nodes int, transport string) {
-	fmt.Printf("config protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=%d epoch_ms=%d report_ms=%d\n",
-		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.ProducerMS, cfg.EpochMS, cfg.ReportMS)
+	fmt.Printf("config protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=%d epoch_ms=%d report_ms=%d crypto_workers=%d\n",
+		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.ProducerMS, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}
@@ -337,7 +337,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label, beacons, float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
@@ -345,6 +345,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 		asyrand.AvgDuration(perf.PVSSShareTotal, perf.PVSSShareCount), asyrand.AvgDuration(perf.PVSSVerifyTotal, perf.PVSSVerifyCount),
 		asyrand.AvgDuration(perf.PVSSPreReconTotal, perf.PVSSPreReconCount), asyrand.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
 		asyrand.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount),
+		asyrand.AvgDuration(perf.BLSSignTotal, perf.BLSSignCount),
 		asyrand.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount), asyrand.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount))
 }
 

@@ -9,7 +9,7 @@ The implementation reuses the same transport/crypto/pvss/rbc foundations as the 
 - `crypto`: Ed25519 and BLS primitives.
 - `crypto`: pairing-free PVSS commitment generation/verification/reconstruction.
 - `protocol/rbc`: Bracha-style reliable broadcast.
-- `protocol`: Spurt state machine, producer/consumer flow, source selection, beacon collection, and metrics.
+- `protocol`: Spurt state machine, epoch-local PVSS aggregation, beacon collection, and metrics.
 
 ## Directory Layout
 
@@ -20,14 +20,13 @@ The implementation reuses the same transport/crypto/pvss/rbc foundations as the 
 
 ## Protocol Flow
 
-1. Each node continuously runs a producer and continuously issues PVSS commitments.
-2. A commitment from dealer `i` is stored in `ComQ[i][seq]`.
-3. At each epoch, nodes select a deterministic **source** from the source-candidate ordering.
-4. The source candidate’s commitment set is proposed for the epoch.
-5. Nodes exchange Spurt phases (`PROPOSAL`, `PREPARE`, `PRECOMMIT`, `COMMIT`, `FINALIZE`) and, once committed, recover shares from the selected commitments.
-6. Nodes derive beacon randomness and threshold aggregate BLS shares into a certificate.
+1. At each epoch, every node sends one PVSS commitment to that epoch's leader.
+2. The leader caches at most one commitment per dealer for that epoch.
+3. Once the leader has collected `t=f+1` valid commitments, it deterministically selects `t` of them and aggregates them into one aggregate PVSS commitment.
+4. Nodes exchange Spurt phases (`PROPOSAL`, `PREPARE`, `PRECOMMIT`, `COMMIT`, `FINALIZE`) and, once committed, recover shares from the selected aggregate.
+5. Nodes derive beacon randomness and threshold aggregate BLS shares into a certificate.
 
-The implementation keeps the source/passive-consumer structure used in Spurt: a selected source is the object of each epoch’s consumption.
+SPURT does not maintain a producer-consumer queue. Each leader/epoch caches only the current epoch-local PVSS inputs needed to form one aggregate; different epoch leaders may collect their inputs independently.
 
 ## Run a Local 8-Node Memory Cluster
 
@@ -40,8 +39,6 @@ Useful config fields:
 
 - `round`: number of epochs to run (default rounds in config).
 - `f`: tolerated Byzantine faults.
-- `queue_len`: max pending commitments per `ComQ[i]`.
-- `producer_interval_ms`: per-node producer interval.
 - `prefill_ms`: warmup period before epoch start.
 - `epoch_timeout_ms`: per-epoch timeout.
 - `report_interval_ms`: metrics print interval.

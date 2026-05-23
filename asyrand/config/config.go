@@ -80,6 +80,9 @@ func Load(path string) (Config, error) {
 	if cfg.ReportMS == 0 {
 		cfg.ReportMS = 5000
 	}
+	if cfg.MaxPool == 0 {
+		cfg.MaxPool = 4
+	}
 	if cfg.LingerMS == 0 {
 		cfg.LingerMS = 15000
 	}

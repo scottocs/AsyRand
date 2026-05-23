@@ -236,7 +236,7 @@ func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Tra
 	return grandline.NewNode(grandline.NodeConfig{
 		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
 		Public: rt.pubs, Transport: transport, PVSS: pvssScheme,
-		GRand: rt.grand.ShareFor(id),
+		GRand: rt.grand.ShareFor(id), CryptoWorkers: cfg.MaxPool,
 	})
 }
 
@@ -262,8 +262,8 @@ func parseDuration(raw string) time.Duration {
 }
 
 func printConfig(cfg config.Config, nodes int, transport string) {
-	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=unused epoch_ms=%d report_ms=%d\n",
-		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.EpochMS, cfg.ReportMS)
+	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=unused epoch_ms=%d report_ms=%d crypto_workers=%d\n",
+		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}

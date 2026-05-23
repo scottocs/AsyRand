@@ -279,6 +279,7 @@ func TestJoinCertificateActivatesMember(t *testing.T) {
 		ContextEpoch:    0,
 		Joiner:          "theta",
 		PublicKey:       "theta-pk",
+		BLSPublicKey:    defaultBLSPublicHex("theta"),
 		CandidateParams: candidate,
 		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
 		FirstCoinEpoch:  0,
@@ -301,6 +302,9 @@ func TestJoinCertificateActivatesMember(t *testing.T) {
 		}
 		if n.State.Seqs["theta"] != 0 || n.State.RmMark["theta"] != -1 {
 			t.Fatalf("joiner state not initialized on %s: seq=%d rm=%d", n.ID, n.State.Seqs["theta"], n.State.RmMark["theta"])
+		}
+		if n.BLSPublic["theta"] == nil {
+			t.Fatalf("joiner bls public key not installed on %s", n.ID)
 		}
 		if n.RBC.N != len(targetMembers) || n.ABA.N != len(targetMembers) || n.RBC.F != n.State.F || n.ABA.F != n.State.F {
 			t.Fatalf("protocol thresholds not updated on %s: stateF=%d rbc=(%d,%d) aba=(%d,%d)",
@@ -347,6 +351,7 @@ func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
 		ContextEpoch:    0,
 		Joiner:          "theta",
 		PublicKey:       "theta-pk",
+		BLSPublicKey:    defaultBLSPublicHex("theta"),
 		CandidateParams: candidate,
 		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
 		FirstCoinEpoch:  1,
@@ -418,6 +423,126 @@ func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
 		if !contains(n.State.Members, "theta") || n.State.ConfigVersion != 1 {
 			t.Fatalf("join did not activate at E2 on %s: members=%v version=%d", n.ID, n.State.Members, n.State.ConfigVersion)
 		}
+	}
+}
+
+func TestJoinCertificateStaleWhenRemovalHasPriority(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	oldMembers := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	targetMembers := append(append([]p2p.NodeID(nil), oldMembers...), "theta")
+	candidate, targetKeys, err := crypto.Setup("join-removal-priority", 2, targetMembers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinerScheme, err := crypto.NewScheme("theta", targetKeys["theta"].Private, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := joinerScheme.Share("theta", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := JoinRequest{
+		ConfigVersion:   0,
+		ContextEpoch:    0,
+		Joiner:          "theta",
+		PublicKey:       "theta-pk",
+		BLSPublicKey:    defaultBLSPublicHex("theta"),
+		CandidateParams: candidate,
+		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
+		FirstCoinEpoch:  1,
+		ActivationEpoch: 3,
+	}
+	rho := JoinDigest(req)
+	tau := TransitionIndex{ConfigVersion: 0, Seq: 1}
+	cert := JoinCertificate{Request: req}
+	for _, n := range nodes[:3] {
+		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, n, tau, rho))
+		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, n, tau, rho, 3))
+	}
+
+	for _, n := range nodes {
+		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
+		n.mu.Lock()
+		n.State.RmMark["n0"] = 3
+		n.mu.Unlock()
+		if err := n.InstallJoinCertificate(cert); err != nil {
+			t.Fatal(err)
+		}
+		n.mu.Lock()
+		joined := contains(n.State.Members, "theta")
+		version := n.State.ConfigVersion
+		lockedFrom := n.lockedFrom
+		n.mu.Unlock()
+		if joined || version != 0 || lockedFrom != 0 {
+			t.Fatalf("stale join installed on %s: joined=%t version=%d lockedFrom=%d", n.ID, joined, version, lockedFrom)
+		}
+	}
+}
+
+func TestPendingJoinClearsLockWhenConfigurationChanges(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	oldMembers := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	targetMembers := append(append([]p2p.NodeID(nil), oldMembers...), "theta")
+	candidate, targetKeys, err := crypto.Setup("join-stale-config-change", 2, targetMembers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinerScheme, err := crypto.NewScheme("theta", targetKeys["theta"].Private, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := joinerScheme.Share("theta", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := JoinRequest{
+		ConfigVersion:   0,
+		ContextEpoch:    0,
+		Joiner:          "theta",
+		PublicKey:       "theta-pk",
+		BLSPublicKey:    defaultBLSPublicHex("theta"),
+		CandidateParams: candidate,
+		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
+		FirstCoinEpoch:  1,
+		ActivationEpoch: 3,
+	}
+	rho := JoinDigest(req)
+	tau := TransitionIndex{ConfigVersion: 0, Seq: 1}
+	cert := JoinCertificate{Request: req}
+	for _, n := range nodes[:3] {
+		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, n, tau, rho))
+		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, n, tau, rho, 3))
+	}
+
+	node := nodes[0]
+	node.RegisterPVSSKey(candidate.Epoch, targetKeys[node.ID].Private)
+	if err := node.InstallJoinCertificate(cert); err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	if node.lockedFrom != 3 {
+		t.Fatalf("future join did not lock activation: lockedFrom=%d", node.lockedFrom)
+	}
+	node.removeMemberLocked("n3")
+	node.mu.Unlock()
+
+	if err := node.activatePendingJoins(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	joined := contains(node.State.Members, "theta")
+	version := node.State.ConfigVersion
+	lockedFrom := node.lockedFrom
+	node.mu.Unlock()
+	if joined || version != 1 || lockedFrom != 0 {
+		t.Fatalf("stale pending join not cleared: joined=%t version=%d lockedFrom=%d", joined, version, lockedFrom)
 	}
 }
 

@@ -12,7 +12,7 @@
   "report_interval_ms": 5000,
   "linger_ms": 15000,
   "batch_size": 1,
-  "max_pool": 16,
+  "max_pool": 4,
   "log_level": 1,
   "seed": "41737952616e642d76312d6c6f63616c2d382d67656e65736973210000",
   "cluster_index": {

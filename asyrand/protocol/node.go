@@ -9,6 +9,7 @@ import (
 	"fmt"
 	asig "github.com/scottocs/Tyche/asyrand/crypto"
 	"github.com/scottocs/Tyche/asyrand/protocol/rbc"
+	"github.com/scottocs/Tyche/utils/cryptoexec"
 	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 	"sync"
@@ -28,9 +29,10 @@ type Node struct {
 	Transport p2p.Transport
 	Perf      *PerfMetrics
 
-	State *State
-	PVSS  asig.Scheme
-	RBC   *rbc.Broadcaster
+	State  *State
+	PVSS   asig.Scheme
+	RBC    *rbc.Broadcaster
+	Crypto *cryptoexec.Executor
 
 	seqMu sync.Mutex
 	seq   uint64
@@ -47,17 +49,18 @@ type Node struct {
 }
 
 type NodeConfig struct {
-	ID        p2p.NodeID
-	Members   []p2p.NodeID
-	F         int
-	QueueLen  int
-	Seed      []byte
-	Keys      asig.KeyPair
-	Public    map[string]ed25519.PublicKey
-	BLS       asig.BLSKeyPair
-	BLSPublic map[string]kyber.Point
-	Transport p2p.Transport
-	PVSS      asig.Scheme
+	ID            p2p.NodeID
+	Members       []p2p.NodeID
+	F             int
+	QueueLen      int
+	Seed          []byte
+	Keys          asig.KeyPair
+	Public        map[string]ed25519.PublicKey
+	BLS           asig.BLSKeyPair
+	BLSPublic     map[string]kyber.Point
+	Transport     p2p.Transport
+	PVSS          asig.Scheme
+	CryptoWorkers int
 }
 
 type ReconMessage struct {
@@ -108,8 +111,9 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	return &Node{
 		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public, BLS: cfg.BLS, BLSPublic: cfg.BLSPublic,
 		Transport: cfg.Transport, Perf: &PerfMetrics{}, State: state, PVSS: cfg.PVSS,
-		RBC:   rbc.New(cfg.ID, state.N, state.F, cfg.Transport),
-		recon: make(map[string]*reconState), pendingRecon: make(map[string][]ReconMessage),
+		Crypto: cryptoexec.New(cfg.CryptoWorkers),
+		RBC:    rbc.New(cfg.ID, state.N, state.F, cfg.Transport),
+		recon:  make(map[string]*reconState), pendingRecon: make(map[string][]ReconMessage),
 		pendingEcho: make(map[string][]BeaconVoteMessage), pendingReady: make(map[string][]BeaconVoteMessage),
 		beacons: make(chan *Beacon, state.N*4),
 	}, nil
@@ -205,22 +209,43 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, bo
 	if err != nil {
 		return nil, false, err
 	}
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
 	epoch := n.State.CurrentEpoch()
 	instance := fmt.Sprintf("epoch/%d/source/%s", epoch, source)
-	if !n.State.HasCommitment(source) {
-		n.State.RemoveSource(source)
-		return nil, false, nil
-	}
-	commitID, err := n.startConsumer(ctx, epoch, source, instance)
-	if errors.Is(err, errCommitmentNotReady) {
-		n.State.RemoveSource(source)
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
+	var commitID string
+	for {
+		if n.State.HasCommitment(source) {
+			commitID, err = n.startConsumer(ctx, epoch, source, instance)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, errCommitmentNotReady) {
+				return nil, false, err
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, false, n.epochTimeoutError(epoch, source)
+		}
+		wait := 10 * time.Millisecond
+		if remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
 	}
 
-	timer := time.NewTimer(timeout)
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, false, n.epochTimeoutError(epoch, source)
+	}
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 	for {
 		select {
@@ -231,7 +256,7 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, bo
 			n.State.AdvanceForSource(beacon.Random, source)
 			return beacon, true, nil
 		case <-timer.C:
-			return nil, false, errors.New("epoch timed out")
+			return nil, false, n.epochTimeoutError(epoch, source)
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 		}
@@ -323,7 +348,7 @@ func (n *Node) handleAsyRand(ctx context.Context, msg p2p.Message) error {
 			n.bufferRecon(body)
 			return nil
 		}
-		n.handleRecon(ctx, body)
+		n.Crypto.Go(ctx, func() { n.handleRecon(ctx, body) })
 	case "ECHO":
 		body, err := p2p.DecodePayload[BeaconVoteMessage](msg)
 		if err != nil {
@@ -333,7 +358,7 @@ func (n *Node) handleAsyRand(ctx context.Context, msg p2p.Message) error {
 			n.bufferEcho(body)
 			return nil
 		}
-		n.handleEcho(ctx, body)
+		n.Crypto.Go(ctx, func() { n.handleEcho(ctx, body) })
 	case "READY":
 		body, err := p2p.DecodePayload[BeaconVoteMessage](msg)
 		if err != nil {
@@ -343,7 +368,7 @@ func (n *Node) handleAsyRand(ctx context.Context, msg p2p.Message) error {
 			n.bufferReady(body)
 			return nil
 		}
-		n.handleReady(ctx, body)
+		n.Crypto.Go(ctx, func() { n.handleReady(ctx, body) })
 	}
 	return nil
 }
@@ -416,7 +441,9 @@ func (n *Node) handleReady(ctx context.Context, msg BeaconVoteMessage) {
 	n.reconMu.Lock()
 	n.recordVote(st.ready, msg)
 	st.randomByHash[msg.RandomHash] = append([]byte(nil), msg.Random...)
-	if len(st.ready[msg.RandomHash]) >= 2*n.State.F+1 && !st.delivered {
+	readyCount := len(st.ready[msg.RandomHash])
+	shouldReady = readyCount >= n.State.F+1 && !st.readySent[msg.RandomHash]
+	if readyCount >= 2*n.State.F+1 && !st.delivered {
 		votes := make([]asig.BLSSignatureShare, 0, len(st.ready[msg.RandomHash]))
 		for _, vote := range st.ready[msg.RandomHash] {
 			votes = append(votes, vote)
@@ -448,7 +475,11 @@ func (n *Node) handleReady(ctx context.Context, msg BeaconVoteMessage) {
 func (n *Node) broadcastVote(ctx context.Context, typ string, st *reconState, random []byte) error {
 	hash := randomHash(random)
 	msgBytes := voteBytes(typ, st.epoch, st.source, st.commit.SecretID, hash)
+	start := time.Now()
 	sig, err := asig.SignBLS(string(n.ID), n.BLS.Private, msgBytes)
+	if n.Perf != nil {
+		n.Perf.addBLSSign(time.Since(start))
+	}
 	if err != nil {
 		return err
 	}
@@ -494,6 +525,12 @@ func (n *Node) recordVote(bucket map[string]map[p2p.NodeID]asig.BLSSignatureShar
 		bucket[msg.RandomHash] = make(map[p2p.NodeID]asig.BLSSignatureShare)
 	}
 	bucket[msg.RandomHash][p2p.NodeID(msg.Signature.Signer)] = msg.Signature
+}
+
+func (n *Node) epochTimeoutError(epoch uint64, source p2p.NodeID) error {
+	total, max := n.State.QueueBacklog()
+	return fmt.Errorf("epoch timed out node=%s epoch=%d source=%s has_source_commit=%t source_queue=%d queue_total=%d queue_max=%d",
+		n.ID, epoch, source, n.State.HasCommitment(source), n.State.QueueLength(source), total, max)
 }
 
 func (n *Node) reconStateForMessage(epoch uint64, source p2p.NodeID, commitID string) *reconState {

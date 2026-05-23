@@ -60,7 +60,7 @@ func TestBeaconRandomChurn1000Epochs(t *testing.T) {
 	}
 	epochs := envInt("TYCHE_CHURN_EPOCHS", 1000)
 	reportEvery := envInt("TYCHE_CHURN_REPORT_EVERY", 100)
-	eventEvery := envInt("TYCHE_CHURN_EVENT_EVERY", 25)
+	eventEvery := envInt("TYCHE_CHURN_EVENT_EVERY", 10)
 	epochTimeout := time.Duration(envInt("TYCHE_CHURN_EPOCH_TIMEOUT_MS", 10000)) * time.Millisecond
 	minN := envInt("TYCHE_CHURN_MIN_N", 4)
 	maxN := envInt("TYCHE_CHURN_MAX_N", 13)
@@ -88,6 +88,34 @@ func TestBeaconRandomChurn1000Epochs(t *testing.T) {
 	}
 }
 
+func TestBeaconReconfigurationBenchmark200Epochs(t *testing.T) {
+	if os.Getenv("TYCHE_RECONFIG_BENCH_TEST") != "1" {
+		t.Skip("set TYCHE_RECONFIG_BENCH_TEST=1 to run the reconfiguration benchmark")
+	}
+	epochs := envInt("TYCHE_CHURN_EPOCHS", 200)
+	reconfigTarget := envInt("TYCHE_CHURN_RECONFIG_EVENTS", max(1, epochs/20))
+	epochTimeout := time.Duration(envInt("TYCHE_CHURN_EPOCH_TIMEOUT_MS", 10000)) * time.Millisecond
+	minN := envInt("TYCHE_CHURN_MIN_N", 4)
+	maxN := envInt("TYCHE_CHURN_MAX_N", 13)
+	seed := int64(envInt("TYCHE_CHURN_SEED", 20260521))
+
+	baseline := runChurnBenchmarkCase(t, "baseline", epochs, 0, epochTimeout, minN, maxN, seed)
+	reconfig := runChurnBenchmarkCase(t, "reconfig", epochs, reconfigTarget, epochTimeout, minN, maxN, seed)
+	t.Logf("compare epochs=%d baseline_throughput=%.4f/s reconfig_throughput=%.4f/s throughput_ratio=%.4f baseline_bandwidth=%.2fKB/s reconfig_bandwidth=%.2fKB/s bandwidth_ratio=%.4f baseline_sent_msgs=%d reconfig_sent_msgs=%d baseline_final_n=%d reconfig_final_n=%d",
+		epochs,
+		baseline.throughputPerSec,
+		reconfig.throughputPerSec,
+		ratio(reconfig.throughputPerSec, baseline.throughputPerSec),
+		baseline.bandwidthKBPerSec,
+		reconfig.bandwidthKBPerSec,
+		ratio(reconfig.bandwidthKBPerSec, baseline.bandwidthKBPerSec),
+		baseline.sentMessages,
+		reconfig.sentMessages,
+		baseline.finalN,
+		reconfig.finalN,
+	)
+}
+
 type churnCluster struct {
 	net       *p2p.MemoryNetwork
 	nodes     map[p2p.NodeID]*Node
@@ -100,6 +128,113 @@ type churnCluster struct {
 type churnResult struct {
 	beacon Beacon
 	err    error
+}
+
+type churnBenchmarkResult struct {
+	label              string
+	elapsed            time.Duration
+	throughputPerSec   float64
+	bandwidthKBPerSec  float64
+	sentMessages       uint64
+	recvMessages       uint64
+	sentBytes          uint64
+	recvBytes          uint64
+	finalN             int
+	finalF             int
+	reconfigurationOps int
+}
+
+func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarget int, epochTimeout time.Duration, minN int, maxN int, seed int64) churnBenchmarkResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(epochs)*2*time.Second)
+	defer cancel()
+	cluster := newChurnCluster(t, ctx, 8, 2)
+	rng := rand.New(rand.NewSource(seed))
+	nextJoin := 8
+	before := aggregateMetrics(cluster.transports())
+	start := time.Now()
+	reconfigs := 0
+	for epoch := 1; epoch <= epochs; epoch++ {
+		if shouldRunReconfiguration(rng, epoch, epochs, reconfigs, reconfigTarget) {
+			if cluster.randomChurn(t, ctx, rng, uint64(epoch), minN, maxN, &nextJoin) {
+				reconfigs++
+				cluster.assertMembershipBounds(t, minN, maxN)
+			}
+		}
+		cluster.assertMembershipBounds(t, minN, maxN)
+		cluster.runEpoch(t, ctx, uint64(epoch), epochTimeout)
+		cluster.reconcileProtocolRemovals(t, uint64(epoch))
+	}
+	elapsed := time.Since(start)
+	after := aggregateMetrics(cluster.transports())
+	sentMessages := after.SentMessages - before.SentMessages
+	recvMessages := after.RecvMessages - before.RecvMessages
+	sentBytes := after.SentBytes - before.SentBytes
+	recvBytes := after.RecvBytes - before.RecvBytes
+	seconds := elapsed.Seconds()
+	if seconds <= 0 {
+		seconds = 1
+	}
+	result := churnBenchmarkResult{
+		label:              label,
+		elapsed:            elapsed,
+		throughputPerSec:   float64(epochs) / seconds,
+		bandwidthKBPerSec:  float64(sentBytes+recvBytes) / 1024 / seconds,
+		sentMessages:       sentMessages,
+		recvMessages:       recvMessages,
+		sentBytes:          sentBytes,
+		recvBytes:          recvBytes,
+		finalN:             len(cluster.members()),
+		finalF:             cluster.currentF(t),
+		reconfigurationOps: reconfigs,
+	}
+	t.Logf("bench_result label=%s epochs=%d elapsed=%s throughput=%.4f/s bandwidth=%.2fKB/s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB final_n=%d final_f=%d reconfig_ops=%d",
+		result.label,
+		epochs,
+		result.elapsed,
+		result.throughputPerSec,
+		result.bandwidthKBPerSec,
+		result.sentMessages,
+		result.recvMessages,
+		float64(result.sentBytes)/1024,
+		float64(result.recvBytes)/1024,
+		result.finalN,
+		result.finalF,
+		result.reconfigurationOps,
+	)
+	t.Logf("final metrics label=%s beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s final_n=%d final_f=%d reconfig_ops=%d",
+		result.label,
+		epochs,
+		result.throughputPerSec*60,
+		result.sentMessages,
+		result.recvMessages,
+		float64(result.sentBytes)/1024,
+		float64(result.recvBytes)/1024,
+		result.bandwidthKBPerSec,
+		result.finalN,
+		result.finalF,
+		result.reconfigurationOps,
+	)
+	return result
+}
+
+func shouldRunReconfiguration(rng *rand.Rand, epoch int, epochs int, completed int, target int) bool {
+	if target <= 0 || completed >= target || epochs <= 0 {
+		return false
+	}
+	remainingEpochs := epochs - epoch + 1
+	remainingEvents := target - completed
+	if remainingEvents >= remainingEpochs {
+		return true
+	}
+	return rng.Float64() < float64(remainingEvents)/float64(remainingEpochs)
+}
+
+func ratio(num float64, den float64) float64 {
+	if den == 0 {
+		return 0
+	}
+	return num / den
 }
 
 func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnCluster {
@@ -125,7 +260,7 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 4, PVSS: scheme, BLSPublic: blsPublic, Transport: c.net.NewTransport(id, 32768)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 64, PVSS: scheme, BLSPublic: blsPublic, Transport: c.net.NewTransport(id, 32768)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -182,7 +317,7 @@ func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *ra
 	n := len(c.members())
 	pendingStop := len(c.stoppedActiveIDs()) > 0
 	canDelete := n > minN && !pendingStop
-	canJoin := n < maxN && !pendingStop
+	canJoin := n < maxN
 	if !canDelete && !canJoin {
 		return false
 	}
@@ -203,8 +338,12 @@ func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *ra
 	beforeMembers := c.members()
 	beforeF := c.currentF(t)
 	t.Logf("epoch=%d event=join node=%s n_before=%d f_before=%d active_before=%v members_before=%v", epoch, joiner, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers)
-	c.join(t, parent, joiner)
+	joined := c.join(t, parent, joiner)
 	afterMembers := c.members()
+	if !joined {
+		t.Logf("epoch=%d event=join_stale node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
+		return true
+	}
 	t.Logf("epoch=%d event=joined node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
 	return true
 }
@@ -285,7 +424,7 @@ func sameNodeIDs(a []p2p.NodeID, b []p2p.NodeID) bool {
 	return true
 }
 
-func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.NodeID) {
+func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.NodeID) bool {
 	t.Helper()
 	ref := c.reference(t)
 	currentMembers := c.members()
@@ -316,6 +455,7 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 		ContextEpoch:    activation - 1,
 		Joiner:          joiner,
 		PublicKey:       string(joiner) + "-pk",
+		BLSPublicKey:    defaultBLSPublicHex(joiner),
 		CandidateParams: pp,
 		Object:          Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
 		FirstCoinEpoch:  activation - 1,
@@ -339,7 +479,12 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 			t.Fatal(err)
 		}
 	}
+	if !contains(c.members(), joiner) {
+		return false
+	}
+	c.installPVSS(t, pp, keys, targetMembers)
 	c.addJoinerNode(t, parent, joiner, targetMembers, pp, keys)
+	return true
 }
 
 func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PublicParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
@@ -367,7 +512,7 @@ func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2
 	ref.mu.Lock()
 	f := ref.State.F
 	ref.mu.Unlock()
-	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 4, PVSS: scheme, BLSPublic: defaultBLSPublic(members), Transport: c.net.NewTransport(id, 32768)})
+	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 64, PVSS: scheme, BLSPublic: defaultBLSPublic(members), Transport: c.net.NewTransport(id, 32768)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,6 +530,7 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	source, seq := nextSourceSeq(c.reference(t))
 	for c.stopped[source] {
 		c.applyABAFalse(t, parent, epoch, source, seq)
+		c.protocolRemoveStopped(t, epoch, source)
 		c.refillCandidateLists()
 		source, seq = nextSourceSeq(c.reference(t))
 	}
@@ -392,16 +538,11 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	if sourceNode == nil || !c.active[source] {
 		t.Fatalf("selected inactive source %s at epoch %d active=%v members=%v", source, epoch, c.activeIDs(), c.members())
 	}
-	if !c.stopped[source] && !c.allActiveStored(source, seq) {
-		sourceNode.mu.Lock()
-		sourceNode.State.ProducerSeq = sourceNode.State.Seqs[source]
-		sourceNode.mu.Unlock()
-		if _, err := sourceNode.Produce(parent); err != nil {
-			t.Fatalf("produce source=%s seq=%d epoch=%d: %v", source, seq, epoch, err)
-		}
-	}
 	if !c.stopped[source] {
+		c.ensureStored(t, parent, sourceNode, source, seq, epoch)
 		c.waitStoredCurrent(t, parent, source, seq)
+		c.ensureStored(t, parent, sourceNode, source, seq+1, epoch)
+		c.waitStoredCurrent(t, parent, source, seq+1)
 	}
 
 	epochCtx, cancel := context.WithTimeout(parent, timeout)
@@ -434,6 +575,37 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	}
 }
 
+func (c *churnCluster) protocolRemoveStopped(t *testing.T, epoch uint64, id p2p.NodeID) {
+	t.Helper()
+	if !c.active[id] {
+		return
+	}
+	beforeActive := c.activeIDs()
+	for _, node := range c.activeNodes() {
+		if node.ID == id {
+			continue
+		}
+		node.mu.Lock()
+		if contains(node.State.Members, id) {
+			node.removeMemberLocked(id)
+		}
+		node.mu.Unlock()
+	}
+	members := c.members()
+	t.Logf("epoch=%d event=aba_deleted node=%s n_after=%d f_after=%d stopped=%v active_before=%v members_after=%v", epoch, id, len(members), c.currentF(t), c.stoppedActiveIDs(), beforeActive, members)
+	c.active[id] = false
+	delete(c.stopped, id)
+	if cancel := c.cancels[id]; cancel != nil {
+		cancel()
+	}
+	if node := c.nodes[id]; node != nil {
+		if err := node.Transport.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("epoch=%d event=aba_delete_closed node=%s active_after=%v members_after=%v", epoch, id, c.activeIDs(), members)
+}
+
 func (c *churnCluster) refillCandidateLists() {
 	for _, node := range c.activeNodes() {
 		node.mu.Lock()
@@ -457,6 +629,67 @@ func (c *churnCluster) applyABAFalse(t *testing.T, ctx context.Context, epoch ui
 		_ = node.ABA.Propose(ctx, instance, false)
 		node.handleABADecision(ctx, aba.Decision{Instance: instance, Value: false})
 	}
+}
+
+func (c *churnCluster) ensureStored(t *testing.T, ctx context.Context, producer *Node, source p2p.NodeID, seq uint64, epoch uint64) {
+	t.Helper()
+	if c.allActiveStored(source, seq) {
+		return
+	}
+	if c.copyStoredObjectToMissing(source, seq) && c.allActiveStored(source, seq) {
+		return
+	}
+	producer.mu.Lock()
+	version := producer.State.ConfigVersion
+	if producer.State.ProducerSeq < seq {
+		producer.State.ProducerSeq = seq
+	}
+	producer.mu.Unlock()
+	if _, err := producer.produceSeq(ctx, seq, version); err != nil {
+		t.Fatalf("produce source=%s seq=%d epoch=%d: %v", source, seq, epoch, err)
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if c.copyStoredObjectToMissing(source, seq) && c.allActiveStored(source, seq) {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("object source=%s seq=%d epoch=%d was not stored on all active nodes", source, seq, epoch)
+		}
+	}
+}
+
+func (c *churnCluster) copyStoredObjectToMissing(source p2p.NodeID, seq uint64) bool {
+	var obj Object
+	found := false
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		candidate, ok := node.State.ComQ[source][seq]
+		version := node.State.ConfigVersion
+		node.mu.Unlock()
+		if ok && candidate.ConfigVersion == version {
+			obj = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		if node.State.ComQ[source] == nil {
+			node.State.ComQ[source] = make(map[uint64]Object)
+		}
+		if _, ok := node.State.ComQ[source][seq]; !ok && obj.ConfigVersion == node.State.ConfigVersion {
+			node.State.ComQ[source][seq] = obj
+		}
+		node.mu.Unlock()
+	}
+	return true
 }
 
 func (c *churnCluster) allActiveStored(source p2p.NodeID, seq uint64) bool {
@@ -495,6 +728,21 @@ func (c *churnCluster) activeNodes() []*Node {
 		nodes = append(nodes, c.nodes[id])
 	}
 	return nodes
+}
+
+func (c *churnCluster) transports() []p2p.Transport {
+	ids := make([]p2p.NodeID, 0, len(c.nodes))
+	for id := range c.nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	transports := make([]p2p.Transport, 0, len(ids))
+	for _, id := range ids {
+		if node := c.nodes[id]; node != nil && node.Transport != nil {
+			transports = append(transports, node.Transport)
+		}
+	}
+	return transports
 }
 
 func (c *churnCluster) activeIDs() []p2p.NodeID {
@@ -608,6 +856,11 @@ func defaultBLSPublic(ids []p2p.NodeID) map[string]kyber.Point {
 		out[string(id)] = kp.Public
 	}
 	return out
+}
+
+func defaultBLSPublicHex(id p2p.NodeID) string {
+	kp := crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(id)))
+	return crypto.EncodeBLSPublicKey(kp.Public)
 }
 
 func signedJoinAck(t *testing.T, node *Node, tau TransitionIndex, rho string) JoinAck {

@@ -16,6 +16,7 @@ import (
 	"github.com/scottocs/Tyche/Tyche/crypto"
 	"github.com/scottocs/Tyche/Tyche/protocol/aba"
 	"github.com/scottocs/Tyche/Tyche/protocol/rbc"
+	"github.com/scottocs/Tyche/utils/cryptoexec"
 	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
@@ -72,6 +73,7 @@ type Config struct {
 	InitialRandom     []byte
 	PVSS              *crypto.SilentSetupScheme
 	PVSSKeys          map[string]kyber.Scalar
+	CryptoWorkers     int
 	// BLS and BLSPublic are only for READY certificate compression. They are
 	// independent per-node BLS keys, not the PVSS key material and not a
 	// threshold-BLS shared key.
@@ -146,6 +148,7 @@ type Node struct {
 	ID        p2p.NodeID
 	Transport p2p.Transport
 	PVSS      *crypto.SilentSetupScheme
+	Perf      *PerfMetrics
 	// BLS state supports the READY aggregate certificate attached to each
 	// certified beacon. It is deliberately separate from the PVSS scheme so the
 	// randomness protocol remains the same.
@@ -153,6 +156,7 @@ type Node struct {
 	BLSPublic map[string]kyber.Point
 	RBC       *rbc.Broadcaster
 	ABA       *aba.Agreement
+	Crypto    *cryptoexec.Executor
 
 	mu          sync.Mutex
 	State       *State
@@ -188,6 +192,7 @@ type Node struct {
 	waiters      map[string][]chan Beacon
 	certBeacons  map[string]Beacon
 	pendingCerts map[string]Beacon
+	certifying   map[string]bool
 
 	Beacons chan Beacon
 	Joins   chan JoinCertificate
@@ -277,11 +282,12 @@ func NewNode(cfg Config) (*Node, error) {
 		st.RmMark[id] = -1
 	}
 	n := &Node{
-		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, BLS: blsKey, BLSPublic: blsPublic,
-		RBC:   rbc.New(cfg.ID, len(members), f, cfg.Transport),
-		ABA:   aba.New(cfg.ID, len(members), f, cfg.Transport),
-		State: st,
-		recon: make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
+		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{}, BLS: blsKey, BLSPublic: blsPublic,
+		RBC:    rbc.New(cfg.ID, len(members), f, cfg.Transport),
+		ABA:    aba.New(cfg.ID, len(members), f, cfg.Transport),
+		Crypto: cryptoexec.New(cfg.CryptoWorkers),
+		State:  st,
+		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
 		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.BLSSignatureShare),
 		readySent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
@@ -301,6 +307,7 @@ func NewNode(cfg Config) (*Node, error) {
 		waiters:      make(map[string][]chan Beacon),
 		certBeacons:  make(map[string]Beacon),
 		pendingCerts: make(map[string]Beacon),
+		certifying:   make(map[string]bool),
 		Beacons:      make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
 	}
 	for epoch, key := range cfg.PVSSKeys {
@@ -355,9 +362,19 @@ func (n *Node) Start(ctx context.Context) {
 func (n *Node) Handle(ctx context.Context, msg p2p.Message) error {
 	switch msg.Protocol {
 	case rbc.Protocol:
-		return n.RBC.Handle(ctx, msg)
+		start := time.Now()
+		err := n.RBC.Handle(ctx, msg)
+		if n.Perf != nil {
+			n.Perf.addRBCHandle(time.Since(start))
+		}
+		return err
 	case aba.Protocol:
-		return n.ABA.Handle(ctx, msg)
+		start := time.Now()
+		err := n.ABA.Handle(ctx, msg)
+		if n.Perf != nil {
+			n.Perf.addABAHandle(time.Since(start))
+		}
+		return err
 	case Protocol:
 		return n.handleTyche(ctx, msg)
 	default:
@@ -395,7 +412,11 @@ func (n *Node) SetProducing(enabled bool) {
 
 func (n *Node) produceSeq(ctx context.Context, seq uint64, version uint64) (Object, error) {
 	pvssOpMu.Lock()
+	start := time.Now()
 	c, _, err := n.PVSS.Share(n.ID, seq, nil)
+	if n.Perf != nil {
+		n.Perf.addPVSSShare(time.Since(start))
+	}
 	pvssOpMu.Unlock()
 	if err != nil {
 		return Object{}, err
@@ -548,7 +569,11 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 		if needRecon {
 			// The object was already verified locally before entering comq; this path only skips
 			// the duplicate commitment proof check, not the required RBC-delivery validation.
+			start := time.Now()
 			sh, err := n.PVSS.PreReconVerified(obj.Commitment, n.ID)
+			if n.Perf != nil {
+				n.Perf.addPVSSPreRecon(time.Since(start))
+			}
 			if err != nil {
 				n.mu.Lock()
 				delete(n.reconSent, key)
@@ -921,7 +946,9 @@ func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
 		if env.Object == nil {
 			return nil
 		}
-		return n.storeObject(*env.Object)
+		obj := *env.Object
+		n.Crypto.Go(ctx, func() { _ = n.storeObject(obj) })
+		return nil
 	case "join":
 		if env.Join == nil {
 			return nil
@@ -977,7 +1004,11 @@ func (n *Node) ensureVerified(obj Object) error {
 		}
 		return errors.New("invalid pvss object")
 	}
+	start := time.Now()
 	valid := n.PVSS.Verify(obj.Commitment)
+	if n.Perf != nil {
+		n.Perf.addPVSSVerify(time.Since(start))
+	}
 	n.mu.Lock()
 	n.verified[key] = verifiedObject{version: obj.ConfigVersion, object: obj, valid: valid}
 	n.mu.Unlock()
@@ -994,19 +1025,26 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		if err != nil {
 			return err
 		}
-		return n.handleRecon(ctx, msg.From, body)
+		from := msg.From
+		n.Crypto.Go(ctx, func() { _ = n.handleRecon(ctx, from, body) })
 	case "RECON_ECHO":
 		body, err := p2p.DecodePayload[ReconEchoMessage](msg)
 		if err != nil {
 			return err
 		}
-		n.observeEchoReady(ctx, "echo", msg.From, body.Epoch, body.Source, body.Seq, body.Random, crypto.BLSSignatureShare{})
+		from := msg.From
+		n.Crypto.Go(ctx, func() {
+			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, crypto.BLSSignatureShare{})
+		})
 	case "RECON_READY":
 		body, err := p2p.DecodePayload[signedReconReadyMessage](msg)
 		if err != nil {
 			return err
 		}
-		n.observeEchoReady(ctx, "ready", msg.From, body.Epoch, body.Source, body.Seq, body.Random, body.Signature)
+		from := msg.From
+		n.Crypto.Go(ctx, func() {
+			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.Signature)
+		})
 	case "JOIN_ACK":
 		body, err := p2p.DecodePayload[JoinAck](msg)
 		if err != nil {
@@ -1060,7 +1098,11 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 		}
 	}
 	n.mu.Unlock()
+	start := time.Now()
 	validShare := n.PVSS.VerifyShare(obj.Commitment, body.Share)
+	if n.Perf != nil {
+		n.Perf.addPVSSVerify(time.Since(start))
+	}
 	if body.Share.Holder != from || !validShare {
 		debugf("node=%s drop recon from=%s epoch=%d source=%s seq=%d holder=%s valid=%v", n.ID, from, body.Epoch, body.Source, body.Seq, body.Share.Holder, validShare)
 		return nil
@@ -1089,7 +1131,11 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	}
 	// ReconVerified still verifies each decryption proof; it only reuses the local
 	// commitment verification performed before the object was accepted into comq.
+	start = time.Now()
 	secret, err := n.PVSS.ReconVerified(obj.Commitment, shares)
+	if n.Perf != nil {
+		n.Perf.addPVSSRecon(time.Since(start))
+	}
 	if err != nil {
 		return err
 	}
@@ -1132,7 +1178,12 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// A READY is counted only if it carries a valid signature over the exact
 		// READY transcript. This preserves the original threshold rule while
 		// preventing a bare sender id from becoming part of the certificate.
-		if sig.Signer != string(from) || !crypto.VerifyBLSShare(sig, n.BLSPublic, readyVoteBytes(epoch, source, seq, rh)) {
+		start := time.Now()
+		valid := sig.Signer == string(from) && crypto.VerifyBLSShare(sig, n.BLSPublic, readyVoteBytes(epoch, source, seq, rh))
+		if n.Perf != nil {
+			n.Perf.addBLSVerify(time.Since(start))
+		}
+		if !valid {
 			return
 		}
 	}
@@ -1175,7 +1226,11 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// READY amplification is unchanged: once enough ECHO/READY evidence is
 		// observed, this node broadcasts READY. The added BLS share signs the
 		// same canonical statement that will later be aggregated.
+		start := time.Now()
 		sig, err := crypto.SignBLS(string(n.ID), n.BLS.Private, readyVoteBytes(epoch, source, seq, rh))
+		if n.Perf != nil {
+			n.Perf.addBLSSign(time.Since(start))
+		}
 		if err == nil {
 			msg, err := p2p.NewMessage(Protocol, "RECON_READY", key, n.ID, "", signedReconReadyMessage{Epoch: epoch, Source: source, Seq: seq, Random: random, Signature: sig})
 			if err == nil {
@@ -1188,7 +1243,11 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// 2f+1 READY quorum. The quorum threshold and random reconstruction are
 		// unchanged; only the representation of the READY certificate is smaller
 		// and externally verifiable.
+		start := time.Now()
 		cert, err := crypto.AggregateBLSTrusted(votes, n.BLSPublic, readyVoteBytes(epoch, source, seq, rh), 2*n.State.F+1)
+		if n.Perf != nil {
+			n.Perf.addBLSAggregate(time.Since(start))
+		}
 		if err != nil {
 			return
 		}
@@ -1204,8 +1263,26 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 }
 
 func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
+	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
+		n.mu.Unlock()
+		return
+	}
+	if n.certifying[key] {
+		n.mu.Unlock()
+		return
+	}
+	n.certifying[key] = true
+	n.mu.Unlock()
+	go n.finishCertifyBeacon(epoch, source, seq, random, senders, cert)
+}
+
+func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
+	key := epochKey(epoch, source, seq)
+	n.mu.Lock()
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
+		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
 	}
@@ -1215,20 +1292,20 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 	n.mu.Unlock()
 	for _, feed := range feeds {
 		n.ABA.FeedSeed(context.Background(), feed.instance, feed.round, random)
+		n.waitPendingABAAfterSeed(context.Background(), feed)
 	}
-	n.refreshPendingABAs("")
 	for _, feed := range joinFeeds {
 		n.ABA.FeedSeed(context.Background(), feed.instance, feed.round, random)
 	}
 
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
+		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
 	}
 	obj := n.State.ComQ[source][seq]
 	prev := append([]byte(nil), n.State.RPrev...)
-	key := epochKey(epoch, source, seq)
 	secret := append([]byte(nil), n.reconSecret[key]...)
 	n.rotateSourcesLocked(epoch, source, seq)
 	n.State.Epoch = epoch
@@ -1240,6 +1317,7 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 		ConfigVersion: n.State.ConfigVersion, State: n.stateDigestLocked(),
 	}
 	n.certBeacons[key] = b
+	delete(n.certifying, key)
 	waiters := append([]chan Beacon(nil), n.waiters[key]...)
 	delete(n.waiters, key)
 	select {
@@ -1312,6 +1390,44 @@ func (n *Node) processPendingABAsLocked(certEpoch uint64) []coinFeed {
 		}
 	}
 	return feeds
+}
+
+func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		st := n.ABA.Status(feed.instance)
+		n.mu.Lock()
+		p := n.State.PendingABAs[feed.instance]
+		if p == nil {
+			n.mu.Unlock()
+			return
+		}
+		if st.Decided {
+			p.Decided = true
+			p.Decision = st.Value
+			if !st.Value && n.State.RmMark[p.Source] == -1 {
+				n.State.RmMark[p.Source] = int64(p.Epoch + uint64(n.State.F))
+			}
+			delete(n.State.PendingABAs, feed.instance)
+			delete(n.abaInputSent, feed.instance)
+			delete(n.abaInputs, feed.instance)
+			n.mu.Unlock()
+			return
+		}
+		p.Round = st.Round
+		p.CoinWait = st.CoinWait
+		if st.CoinWait && st.Round > feed.round {
+			n.mu.Unlock()
+			return
+		}
+		n.mu.Unlock()
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (n *Node) rotateSourcesLocked(epoch uint64, source p2p.NodeID, seq uint64) {
@@ -1586,6 +1702,20 @@ func contains(ids []p2p.NodeID, id p2p.NodeID) bool {
 		}
 	}
 	return false
+}
+
+func sameMembers(a []p2p.NodeID, b []p2p.NodeID) bool {
+	aa := normalizeMembers(a)
+	bb := normalizeMembers(b)
+	if len(aa) != len(bb) {
+		return false
+	}
+	for i := range aa {
+		if aa[i] != bb[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func removeID(ids []p2p.NodeID, id p2p.NodeID) []p2p.NodeID {

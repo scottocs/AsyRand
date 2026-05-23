@@ -46,6 +46,26 @@ func NewBLSKeyPairFromSeed(seed []byte) BLSKeyPair {
 	return BLSKeyPair{Private: sk, Public: suite.G2().Point().Mul(sk, nil)}
 }
 
+func EncodeBLSPublicKey(pub kyber.Point) string {
+	if pub == nil {
+		return ""
+	}
+	b, err := pub.MarshalBinary()
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+func DecodeBLSPublicKey(raw string) (kyber.Point, error) {
+	b, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	pub := pairingSuite().G2().Point()
+	return pub, pub.UnmarshalBinary(b)
+}
+
 // SignBLS signs a canonical READY statement with this node's independent BLS
 // key. The caller is responsible for choosing a transcript that binds the epoch,
 // source, sequence number, and random hash.

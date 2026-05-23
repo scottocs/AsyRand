@@ -10,6 +10,7 @@ import (
 	"time"
 
 	asig "github.com/scottocs/Tyche/grandline/crypto"
+	"github.com/scottocs/Tyche/utils/cryptoexec"
 	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
@@ -30,6 +31,7 @@ type Node struct {
 	Perf      *PerfMetrics
 	State     *State
 	PVSS      asig.PVSSScheme
+	Crypto    *cryptoexec.Executor
 
 	GRand asig.GRandShare
 
@@ -44,16 +46,17 @@ type Node struct {
 }
 
 type NodeConfig struct {
-	ID        p2p.NodeID
-	Members   []p2p.NodeID
-	F         int
-	QueueLen  int
-	Seed      []byte
-	Keys      asig.KeyPair
-	Public    map[string]ed25519.PublicKey
-	Transport p2p.Transport
-	PVSS      asig.PVSSScheme
-	GRand     asig.GRandShare
+	ID            p2p.NodeID
+	Members       []p2p.NodeID
+	F             int
+	QueueLen      int
+	Seed          []byte
+	Keys          asig.KeyPair
+	Public        map[string]ed25519.PublicKey
+	Transport     p2p.Transport
+	PVSS          asig.PVSSScheme
+	GRand         asig.GRandShare
+	CryptoWorkers int
 }
 
 type shareMessage struct {
@@ -62,10 +65,11 @@ type shareMessage struct {
 }
 
 type roundState struct {
-	epoch     uint64
-	msg       []byte
-	shares    map[p2p.NodeID]asig.BeaconShare
-	delivered bool
+	epoch      uint64
+	msg        []byte
+	shares     map[p2p.NodeID]asig.BeaconShare
+	delivered  bool
+	recovering bool
 }
 
 func NewNode(cfg NodeConfig) (*Node, error) {
@@ -87,7 +91,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	state := NewState(cfg.Members, cfg.F, cfg.QueueLen, cfg.Seed)
 	return &Node{
 		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public, Transport: cfg.Transport, Perf: &PerfMetrics{},
-		State: state, PVSS: cfg.PVSS, GRand: cfg.GRand,
+		State: state, PVSS: cfg.PVSS, Crypto: cryptoexec.New(cfg.CryptoWorkers), GRand: cfg.GRand,
 		rounds: make(map[string]*roundState), pendingShares: make(map[string][]shareMessage),
 		commitments: make(map[p2p.NodeID]asig.BeaconCommitment),
 		beacons:     make(chan *Beacon, state.N*4),
@@ -270,8 +274,15 @@ func (n *Node) recordShare(st *roundState, payload shareMessage) {
 	if publicShare == "" {
 		return
 	}
+	msg := append([]byte(nil), st.msg...)
+	n.Crypto.Go(context.Background(), func() {
+		n.verifyAndRecordShare(st, payload, publicShare, commitment, msg)
+	})
+}
+
+func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, publicShare string, commitment asig.BeaconCommitment, msg []byte) {
 	acceptStart := time.Now()
-	if !asig.VerifyBeaconShare(st.msg, publicShare, commitment, payload.Share) {
+	if !asig.VerifyBeaconShare(msg, publicShare, commitment, payload.Share) {
 		return
 	}
 	if n.Perf != nil {
@@ -294,35 +305,47 @@ func (n *Node) recordShare(st *roundState, payload shareMessage) {
 	for _, share := range st.shares {
 		parts = append(parts, share)
 	}
+	threshold := n.State.Threshold()
+	if len(parts) >= threshold {
+		if st.recovering {
+			n.roundMu.Unlock()
+			return
+		}
+		st.recovering = true
+	}
 	n.roundMu.Unlock()
 
-	threshold := n.State.Threshold()
 	if len(parts) < threshold {
 		return
 	}
 	recoverStart := time.Now()
-	random, signature, err := asig.RecoverBeacon(st.msg, parts, threshold, n.State.MembersSnapshot())
+	random, signature, err := asig.RecoverBeacon(msg, parts, threshold, n.State.MembersSnapshot())
 	if n.Perf != nil {
 		n.Perf.addRecover(time.Since(recoverStart))
 	}
 	if err != nil {
+		n.roundMu.Lock()
+		st.recovering = false
+		n.roundMu.Unlock()
 		return
-	}
-	beacon := &Beacon{
-		Epoch:  st.epoch,
-		Random: random,
-		Commit: hex.EncodeToString(st.msg),
-		SigHex: signature,
-		Shares: len(st.shares),
 	}
 	n.roundMu.Lock()
 	if st.delivered {
 		n.roundMu.Unlock()
 		return
 	}
+	epoch := st.epoch
+	sharesCount := len(st.shares)
 	st.delivered = true
-	delete(n.rounds, roundKey(st.epoch))
+	delete(n.rounds, roundKey(epoch))
 	n.roundMu.Unlock()
+	beacon := &Beacon{
+		Epoch:  epoch,
+		Random: random,
+		Commit: hex.EncodeToString(msg),
+		SigHex: signature,
+		Shares: sharesCount,
+	}
 	select {
 	case n.beacons <- beacon:
 	default:

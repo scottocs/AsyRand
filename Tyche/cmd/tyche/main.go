@@ -45,13 +45,14 @@ func main() {
 	prefillMS := flag.Int("prefill-ms", 3000, "producer prefill time in milliseconds")
 	epochTimeoutMS := flag.Int("epoch-timeout-ms", 10000, "timeout per epoch in milliseconds")
 	reportMS := flag.Int("report-ms", 5000, "periodic metrics interval in milliseconds")
+	maxPool := flag.Int("max-pool", 4, "maximum concurrent cryptographic worker tasks per node")
 	flag.Parse()
 
 	opts := runOptions{
 		n: *n, epochs: *epochs, f: *f, transport: strings.ToLower(*transport),
 		nodeID: p2p.NodeID(*nodeID), peersRaw: *peersRaw, listenAddr: *listenAddr, listenIP: *listenIP,
 		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
-		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS,
+		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS, maxPool: *maxPool,
 	}
 	if err := run(opts); err != nil {
 		log.Fatal(err)
@@ -72,6 +73,7 @@ type runOptions struct {
 	prefillMS      int
 	epochTimeoutMS int
 	reportMS       int
+	maxPool        int
 }
 
 func run(opts runOptions) error {
@@ -126,12 +128,13 @@ func runMemory(opts runOptions) error {
 			return err
 		}
 		node, err := tyche.NewNode(tyche.Config{
-			ID:        id,
-			Members:   ids,
-			F:         opts.f,
-			QueueLen:  opts.queueLen,
-			PVSS:      scheme,
-			Transport: net.NewTransport(id, transportBuffer),
+			ID:            id,
+			Members:       ids,
+			F:             opts.f,
+			QueueLen:      opts.queueLen,
+			PVSS:          scheme,
+			CryptoWorkers: opts.maxPool,
+			Transport:     net.NewTransport(id, transportBuffer),
 		})
 		if err != nil {
 			return err
@@ -141,8 +144,8 @@ func runMemory(opts runOptions) error {
 		nodes = append(nodes, node)
 	}
 
-	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d\n",
-		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS)
+	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d\n",
+		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool)
 
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
@@ -218,7 +221,7 @@ func runTCP(opts runOptions) error {
 	}
 	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, transportBuffer)
 	node, err := tyche.NewNode(tyche.Config{
-		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, Transport: transport,
+		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, CryptoWorkers: opts.maxPool, Transport: transport,
 	})
 	if err != nil {
 		return err
@@ -234,8 +237,8 @@ func runTCP(opts runOptions) error {
 	node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 
 	nodes := []*tyche.Node{node}
-	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d peers=%v\n",
-		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, peers)
+	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool, peers)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
@@ -374,6 +377,7 @@ func startReporter(ctx context.Context, nodes []*tyche.Node, stats *runStats, in
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		last := collectMetrics(nodes)
+		lastPerf := collectPerf(nodes)
 		lastBeacon := stats.beacons.Load()
 		lastAt := time.Now()
 		for {
@@ -381,10 +385,12 @@ func startReporter(ctx context.Context, nodes []*tyche.Node, stats *runStats, in
 			case <-ticker.C:
 				now := time.Now()
 				current := collectMetrics(nodes)
+				currentPerf := collectPerf(nodes)
 				currentBeacon := stats.beacons.Load()
 				queueTotal, queueMax := collectQueue(nodes)
-				printMetricDelta("periodic", current.sub(last), queueTotal, queueMax, now.Sub(lastAt), currentBeacon-lastBeacon)
+				printMetricDelta("periodic", current.sub(last), currentPerf.Sub(lastPerf), queueTotal, queueMax, now.Sub(lastAt), currentBeacon-lastBeacon)
 				last, lastAt = current, now
+				lastPerf = currentPerf
 				lastBeacon = currentBeacon
 			case <-done:
 				return
@@ -448,6 +454,16 @@ func collectQueue(nodes []*tyche.Node) (total int, max int) {
 	return total, max
 }
 
+func collectPerf(nodes []*tyche.Node) tyche.PerfSnapshot {
+	var out tyche.PerfSnapshot
+	for _, node := range nodes {
+		if node.Perf != nil {
+			out = out.Add(node.Perf.Snapshot())
+		}
+	}
+	return out
+}
+
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 	return metricSnapshot{
 		sentMessages: m.sentMessages - prev.sentMessages,
@@ -461,13 +477,13 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 
 func printMetrics(label string, nodes []*tyche.Node, elapsed time.Duration, beacons uint64) {
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta(label, collectMetrics(nodes), queueTotal, queueMax, elapsed, beacons)
+	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), queueTotal, queueMax, elapsed, beacons)
 	if label == "final" {
 		printMessageTypeMetrics(nodes)
 	}
 }
 
-func printMetricDelta(label string, delta metricSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {
+func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 1
@@ -476,7 +492,7 @@ func printMetricDelta(label string, delta metricSnapshot, queueTotal int, queueM
 	if delta.sentMessages > 0 {
 		abaPct = float64(delta.abaMessages) * 100 / float64(delta.sentMessages)
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB\n",
+	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label,
 		beacons,
 		float64(beacons)*60/seconds,
@@ -490,6 +506,15 @@ func printMetricDelta(label string, delta metricSnapshot, queueTotal int, queueM
 		delta.abaMessages,
 		abaPct,
 		float64(delta.abaBytes)/1024,
+		tyche.AvgDuration(perf.PVSSShareTotal, perf.PVSSShareCount),
+		tyche.AvgDuration(perf.PVSSVerifyTotal, perf.PVSSVerifyCount),
+		tyche.AvgDuration(perf.PVSSPreReconTotal, perf.PVSSPreReconCount),
+		tyche.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
+		tyche.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount),
+		tyche.AvgDuration(perf.ABAHandleTotal, perf.ABAHandleCount),
+		tyche.AvgDuration(perf.BLSSignTotal, perf.BLSSignCount),
+		tyche.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount),
+		tyche.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount),
 	)
 }
 

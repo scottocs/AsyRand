@@ -18,6 +18,7 @@ type JoinRequest struct {
 	ContextEpoch    uint64              `json:"context_epoch"`
 	Joiner          p2p.NodeID          `json:"joiner"`
 	PublicKey       string              `json:"public_key"`
+	BLSPublicKey    string              `json:"bls_public_key"`
 	CandidateParams crypto.PublicParams `json:"candidate_params,omitempty"`
 	Object          Object              `json:"object"`
 	FirstCoinEpoch  uint64              `json:"first_coin_epoch"`
@@ -88,6 +89,10 @@ func (n *Node) HandleJoinRequest(ctx context.Context, req JoinRequest) error {
 	}
 	rho := JoinDigest(req)
 	n.mu.Lock()
+	if req.ConfigVersion != n.State.ConfigVersion || !n.noRemovalBeforeLocked(req.ActivationEpoch) {
+		n.mu.Unlock()
+		return nil
+	}
 	tau := TransitionIndex{ConfigVersion: n.State.ConfigVersion, Seq: n.State.TransitionSeq + 1}
 	key := tau.String()
 	if existing := n.State.PendingReconf[key]; existing != "" && existing != rho {
@@ -195,6 +200,11 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 		n.mu.Unlock()
 		return nil
 	}
+	if cert.Request.ConfigVersion != n.State.ConfigVersion {
+		n.discardStaleJoinLocked(cert)
+		n.mu.Unlock()
+		return nil
+	}
 	n.mu.Unlock()
 	if err := n.verifyJoinRequest(cert.Request); err != nil {
 		return err
@@ -208,6 +218,10 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if cert.Request.ConfigVersion != n.State.ConfigVersion || !n.noRemovalBeforeLocked(cert.Request.ActivationEpoch) {
+		n.discardStaleJoinLocked(cert)
+		return nil
+	}
 	if n.State.Epoch+1 < cert.Request.ActivationEpoch {
 		key := transitionCertKey(cert)
 		n.pendingJoins[key] = cert
@@ -217,7 +231,8 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 		return nil
 	}
 	if n.State.Epoch+1 > cert.Request.ActivationEpoch {
-		return errors.New("late join certificate past activation epoch")
+		n.discardStaleJoinLocked(cert)
+		return nil
 	}
 	if contains(n.State.Members, cert.Request.Joiner) {
 		return nil
@@ -226,6 +241,10 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 }
 
 func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme *crypto.SilentSetupScheme) error {
+	blsPub, err := crypto.DecodeBLSPublicKey(cert.Request.BLSPublicKey)
+	if err != nil {
+		return err
+	}
 	n.State.Members = append(n.State.Members, cert.Request.Joiner)
 	sort.Slice(n.State.Members, func(i, j int) bool { return n.State.Members[i] < n.State.Members[j] })
 	if !contains(n.State.SCL, cert.Request.Joiner) {
@@ -239,6 +258,7 @@ func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme *crypto
 		n.State.TransitionSeq = cert.Cert2[0].Transition.Seq
 	}
 	n.PVSS = scheme
+	n.BLSPublic[string(cert.Request.Joiner)] = blsPub
 	n.verified = make(map[string]verifiedObject)
 	n.State.F = (len(n.State.Members) - 1) / 3
 	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
@@ -252,6 +272,22 @@ func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme *crypto
 	default:
 	}
 	return nil
+}
+
+func (n *Node) noRemovalBeforeLocked(activation uint64) bool {
+	for _, marker := range n.State.RmMark {
+		if marker != -1 && uint64(marker) <= activation {
+			return false
+		}
+	}
+	return true
+}
+
+func (n *Node) discardStaleJoinLocked(cert JoinCertificate) {
+	delete(n.pendingJoins, transitionCertKey(cert))
+	if n.lockedFrom == cert.Request.ActivationEpoch {
+		n.lockedFrom = 0
+	}
 }
 
 func (n *Node) activatePendingJoins(ctx context.Context, epoch uint64) error {
@@ -308,7 +344,7 @@ func transitionCertKey(cert JoinCertificate) string {
 func (n *Node) broadcastJoinCommit(ctx context.Context, req JoinRequest) error {
 	rho := JoinDigest(req)
 	n.mu.Lock()
-	if req.ActivationEpoch <= n.State.Epoch || (n.lockedFrom != 0 && req.ActivationEpoch >= n.lockedFrom) {
+	if req.ConfigVersion != n.State.ConfigVersion || req.ActivationEpoch <= n.State.Epoch || !n.noRemovalBeforeLocked(req.ActivationEpoch) || (n.lockedFrom != 0 && req.ActivationEpoch >= n.lockedFrom) {
 		n.mu.Unlock()
 		return nil
 	}
@@ -344,24 +380,37 @@ func (n *Node) broadcastJoinCommit(ctx context.Context, req JoinRequest) error {
 func (n *Node) verifyJoinRequest(req JoinRequest) error {
 	n.mu.Lock()
 	version := n.State.ConfigVersion
+	currentMembers := append([]p2p.NodeID(nil), n.State.Members...)
 	n.mu.Unlock()
-	if req.ConfigVersion != version || req.Joiner == "" || req.FirstCoinEpoch >= req.ActivationEpoch {
+	if req.ConfigVersion != version || req.Joiner == "" || req.PublicKey == "" || req.BLSPublicKey == "" || req.FirstCoinEpoch >= req.ActivationEpoch {
 		return errors.New("invalid join request metadata")
 	}
-	if req.Object.Producer != req.Joiner || req.Object.Commitment.Dealer != req.Joiner || req.Object.Seq == 0 {
+	if contains(currentMembers, req.Joiner) {
+		return errors.New("joiner already belongs to current configuration")
+	}
+	if _, err := crypto.DecodeBLSPublicKey(req.BLSPublicKey); err != nil {
+		return errors.New("invalid joiner bls public key")
+	}
+	targetMembers := normalizeMembers(append(currentMembers, req.Joiner))
+	targetF := (len(targetMembers) - 1) / 3
+	if req.CandidateParams.Epoch == "" || !crypto.SetupVrf(req.CandidateParams) {
+		return errors.New("invalid candidate pvss parameters")
+	}
+	if !sameMembers(req.CandidateParams.Members, targetMembers) || req.CandidateParams.Threshold != targetF+1 {
+		return errors.New("candidate pvss parameters do not match target configuration")
+	}
+	if req.Object.ConfigVersion != version+1 || req.Object.Producer != req.Joiner || req.Object.Commitment.Dealer != req.Joiner || req.Object.Seq == 0 {
 		return errors.New("invalid join object")
 	}
-	verifier := n.PVSS
-	if req.CandidateParams.Epoch != "" {
-		if !crypto.SetupVrf(req.CandidateParams) || !contains(req.CandidateParams.Members, req.Joiner) {
-			return errors.New("invalid candidate pvss parameters")
-		}
-		kp := crypto.KeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/join/verifier"), []byte(n.ID)))
-		s, err := crypto.NewScheme(n.ID, kp.Private, req.CandidateParams)
-		if err != nil {
-			return err
-		}
-		verifier = s
+	if req.Object.Commitment.Epoch != req.CandidateParams.Epoch ||
+		req.Object.Commitment.Threshold != req.CandidateParams.Threshold ||
+		!sameMembers(req.Object.Commitment.Members, req.CandidateParams.Members) {
+		return errors.New("join pvss object is not bound to candidate parameters")
+	}
+	kp := crypto.KeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/join/verifier"), []byte(n.ID)))
+	verifier, err := crypto.NewScheme(n.ID, kp.Private, req.CandidateParams)
+	if err != nil {
+		return err
 	}
 	if !verifier.Verify(req.Object.Commitment) {
 		return errors.New("invalid join pvss object")
