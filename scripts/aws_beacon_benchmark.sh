@@ -42,12 +42,13 @@ BASTION_IP="${BASTION_IP:-}"
 BASTION_REGION="${BASTION_REGION:-}"
 SSH_USER="${SSH_USER:-}"
 KEY_NAME_PREFIX="${KEY_NAME_PREFIX:-tyche-beacon}"
-KNOWN_HOSTS="${KNOWN_HOSTS:-/private/tmp/tyche_aws_known_hosts}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-30}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PEM_DIR="${PEM_DIR:-$REPO_ROOT/pems}"
-OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/benchmarks/aws_m${M}n${N}_$(date +%Y%m%d_%H%M%S)}"
-GEN_DIR="$REPO_ROOT/benchmarks/generated_aws_m${M}n${N}"
+OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/benchmark/runs/aws_m${M}n${N}_$(date +%Y%m%d_%H%M%S)}"
+GEN_DIR="$REPO_ROOT/benchmark/generated/aws_m${M}n${N}"
+BENCH_TMP="${BENCH_TMP:-${TMPDIR:-/tmp}}"
+KNOWN_HOSTS="${KNOWN_HOSTS:-$BENCH_TMP/tyche_aws_known_hosts}"
 
 DEFAULT_REGIONS="us-east-1,us-east-2,us-west-1,us-west-2,ca-central-1,eu-west-1,eu-west-2,eu-central-1,eu-north-1,ap-northeast-1,ap-northeast-2,ap-southeast-1,ap-southeast-2,ap-south-1,sa-east-1,me-central-1"
 REGIONS_CSV="${REGIONS:-$DEFAULT_REGIONS}"
@@ -223,7 +224,7 @@ find_local_key_for_instance() {
     printf '%s' "$key"
     return 0
   fi
-  for key in "$PEM_DIR/${key_name}.pem" "$PEM_DIR/${key_name}-${region}.pem" "$PEM_DIR/${region}-${key_name}.pem" "/private/tmp/${key_name}.pem" "/private/tmp/${key_name}-${region}.pem"; do
+  for key in "$PEM_DIR/${key_name}.pem" "$PEM_DIR/${key_name}-${region}.pem" "$PEM_DIR/${region}-${key_name}.pem" "$BENCH_TMP/${key_name}.pem" "$BENCH_TMP/${key_name}-${region}.pem"; do
     if [[ -s "$key" ]]; then
       copy_key_to_region_ip_name "$region" "$ip" "$key"
       return 0
@@ -234,7 +235,7 @@ find_local_key_for_instance() {
 
 find_local_key_by_key_name() {
   local region="$1" key_name="$2" key
-  for key in "$PEM_DIR/${key_name}.pem" "$PEM_DIR/${key_name}-${region}.pem" "$PEM_DIR/${region}-${key_name}.pem" "/private/tmp/${key_name}.pem" "/private/tmp/${key_name}-${region}.pem"; do
+  for key in "$PEM_DIR/${key_name}.pem" "$PEM_DIR/${key_name}-${region}.pem" "$PEM_DIR/${region}-${key_name}.pem" "$BENCH_TMP/${key_name}.pem" "$BENCH_TMP/${key_name}-${region}.pem"; do
     if [[ -s "$key" ]]; then
       chmod 600 "$key"
       printf '%s' "$key"
@@ -771,7 +772,7 @@ upload_source_to_bastion() {
 	rsync -az --delete \
 		--exclude '.git' \
 		--exclude 'pems' \
-    --exclude 'benchmarks/aws_*' \
+    --exclude 'benchmark/runs/aws_*' \
     -e "ssh $(ssh_opts_direct "$(bastion_key)")" \
     "$REPO_ROOT/" "$(bastion_user)@${SERVER_IPS[$BASTION_INDEX]}:~/$REMOTE_DIR/"
 }
@@ -786,14 +787,14 @@ distribute_runtime_from_bastion() {
   log "distributing binaries/configs from bastion to workers"
   for i in $(seq 0 $((M - 1))); do
     [[ "$i" -eq "$BASTION_INDEX" ]] && continue
-    bastion_run "$(remote_ssh_prefix_for_index "$i") 'mkdir -p ~/$REMOTE_DIR/bin ~/$REMOTE_DIR/benchmarks/generated_aws_m${M}n${N}'" &
+    bastion_run "$(remote_ssh_prefix_for_index "$i") 'mkdir -p ~/$REMOTE_DIR/bin ~/$REMOTE_DIR/benchmark/generated/aws_m${M}n${N}'" &
     pids+=("$!")
   done
   wait_all "${pids[@]}" || die "failed to prepare worker runtime directories"
   pids=()
   for i in $(seq 0 $((M - 1))); do
     [[ "$i" -eq "$BASTION_INDEX" ]] && continue
-    bastion_run "rsync -az --delete -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/tyche_known_hosts -o ConnectTimeout=$SSH_CONNECT_TIMEOUT -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -i ~/$REMOTE_PEM_DIR/$(remote_key_name_for_index "$i")' ~/$REMOTE_DIR/bin/ ${SERVER_USERS[$i]}@${SERVER_IPS[$i]}:~/$REMOTE_DIR/bin/ && rsync -az --delete -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/tyche_known_hosts -o ConnectTimeout=$SSH_CONNECT_TIMEOUT -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -i ~/$REMOTE_PEM_DIR/$(remote_key_name_for_index "$i")' ~/$REMOTE_DIR/benchmarks/generated_aws_m${M}n${N}/ ${SERVER_USERS[$i]}@${SERVER_IPS[$i]}:~/$REMOTE_DIR/benchmarks/generated_aws_m${M}n${N}/" &
+    bastion_run "rsync -az --delete -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/tyche_known_hosts -o ConnectTimeout=$SSH_CONNECT_TIMEOUT -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -i ~/$REMOTE_PEM_DIR/$(remote_key_name_for_index "$i")' ~/$REMOTE_DIR/bin/ ${SERVER_USERS[$i]}@${SERVER_IPS[$i]}:~/$REMOTE_DIR/bin/ && rsync -az --delete -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/tyche_known_hosts -o ConnectTimeout=$SSH_CONNECT_TIMEOUT -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -i ~/$REMOTE_PEM_DIR/$(remote_key_name_for_index "$i")' ~/$REMOTE_DIR/benchmark/generated/aws_m${M}n${N}/ ${SERVER_USERS[$i]}@${SERVER_IPS[$i]}:~/$REMOTE_DIR/benchmark/generated/aws_m${M}n${N}/" &
     pids+=("$!")
   done
   wait_all "${pids[@]}" || die "failed to distribute runtime"
@@ -826,7 +827,7 @@ remote_command_for_node() {
         "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$node" "$N" "$BFT_F" "$EPOCHS" "$peers" "$port" "$PRODUCER_MS" "$PREFILL_MS" "$EPOCH_TIMEOUT_MS" "$REPORT_MS" "$log_file"
       ;;
     asyrand|grandline|spurt)
-      printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/%s -config benchmarks/generated_aws_m%dn%d/%s.json -transport tcp -node node%d > %q 2>&1' \
+      printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/%s -config benchmark/generated/aws_m%dn%d/%s.json -transport tcp -node node%d > %q 2>&1' \
         "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$proto" "$M" "$N" "$proto" "$node" "$log_file"
       ;;
     *)

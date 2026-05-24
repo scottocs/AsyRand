@@ -33,6 +33,18 @@ export GOMAXPROCS=$(getconf _NPROCESSORS_ONLN)
 
 ### Runner Commands
 
+The preferred experiment entrypoint is the Fabric workspace under `benchmark/`:
+
+```powershell
+cd benchmark
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\fab local --nodes=8 --epochs=1000
+.\.venv\Scripts\fab logs
+```
+
+Generated configs and run outputs are stored under `benchmark/generated/` and `benchmark/runs/` by default. The local Fabric runner starts Go directly from Python and does not call `scripts/*.sh`.
+
 Tyche uses flags for `n` and `epochs`:
 
 ```sh

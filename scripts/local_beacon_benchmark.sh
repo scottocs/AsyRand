@@ -14,8 +14,9 @@ AGGREGATION_LOOKAHEAD="${AGGREGATION_LOOKAHEAD:-8}"
 GOMAXPROCS_LOCAL="${GOMAXPROCS_LOCAL:-4}"
 PROTOCOLS="${PROTOCOLS:-tyche,tyche-reconfig,asyrand,grandline,spurt}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/benchmarks/local_m1n${N}_$(date +%Y%m%d_%H%M%S)}"
+OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/benchmark/runs/local_m1n${N}_$(date +%Y%m%d_%H%M%S)}"
 GEN_DIR="$OUT_ROOT/generated"
+BENCH_TMP="${BENCH_TMP:-${TMPDIR:-/tmp}}"
 
 split_csv() {
   local raw="$1" out_name="$2" old_ifs="$IFS"
@@ -62,22 +63,22 @@ run_protocol() {
   mkdir -p "$run_dir"
   case "$proto" in
     tyche)
-      (cd "$REPO_ROOT/Tyche" && GOCACHE="/private/tmp/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/tyche -n "$N" -f "$F" -epochs "$EPOCHS" -transport memory -queue-len "$QUEUE_LEN" -producer-ms "$PRODUCER_MS" -prefill-ms "$PREFILL_MS" -epoch-timeout-ms "$EPOCH_TIMEOUT_MS" -report-ms "$REPORT_MS" -max-pool "$MAX_POOL") > "$logf" 2>&1
+      (cd "$REPO_ROOT/Tyche" && GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/tyche -n "$N" -f "$F" -epochs "$EPOCHS" -transport memory -queue-len "$QUEUE_LEN" -producer-ms "$PRODUCER_MS" -prefill-ms "$PREFILL_MS" -epoch-timeout-ms "$EPOCH_TIMEOUT_MS" -report-ms "$REPORT_MS" -max-pool "$MAX_POOL") > "$logf" 2>&1
       ;;
     tyche-reconfig)
-      (cd "$REPO_ROOT/Tyche" && TYCHE_RECONFIG_BENCH_TEST=1 TYCHE_CHURN_EPOCHS="$EPOCHS" TYCHE_CHURN_RECONFIG_EVENTS="${TYCHE_RECONFIG_EVENTS:-$((EPOCHS / 20))}" TYCHE_CHURN_MIN_N="${TYCHE_RECONFIG_MIN_N:-4}" TYCHE_CHURN_MAX_N="${TYCHE_RECONFIG_MAX_N:-13}" TYCHE_CHURN_EPOCH_TIMEOUT_MS="$EPOCH_TIMEOUT_MS" TYCHE_CHURN_SEED="${TYCHE_RECONFIG_SEED:-20260521}" GOCACHE="/private/tmp/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go test ./protocol/tyche -run TestBeaconReconfigurationBenchmark200Epochs -count=1 -v) > "$logf" 2>&1
+      (cd "$REPO_ROOT/Tyche" && TYCHE_RECONFIG_BENCH_TEST=1 TYCHE_CHURN_EPOCHS="$EPOCHS" TYCHE_CHURN_RECONFIG_EVENTS="${TYCHE_RECONFIG_EVENTS:-$((EPOCHS / 20))}" TYCHE_CHURN_MIN_N="${TYCHE_RECONFIG_MIN_N:-4}" TYCHE_CHURN_MAX_N="${TYCHE_RECONFIG_MAX_N:-13}" TYCHE_CHURN_EPOCH_TIMEOUT_MS="$EPOCH_TIMEOUT_MS" TYCHE_CHURN_SEED="${TYCHE_RECONFIG_SEED:-20260521}" GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go test ./protocol/tyche -run TestBeaconReconfigurationBenchmark200Epochs -count=1 -v) > "$logf" 2>&1
       ;;
     asyrand)
       cfg="$(ensure_asyrand_config)"
-      (cd "$REPO_ROOT/asyrand" && GOCACHE="/private/tmp/asyrand-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/asyrand -config "$cfg" -transport memory) > "$logf" 2>&1
+      (cd "$REPO_ROOT/asyrand" && GOCACHE="$BENCH_TMP/asyrand-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/asyrand -config "$cfg" -transport memory) > "$logf" 2>&1
       ;;
     grandline)
       cfg="$(config_from_template grandline "$REPO_ROOT/grandline/configs/local_8_rounds_1000.json")"
-      (cd "$REPO_ROOT/grandline" && GOCACHE="/private/tmp/grandline-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/grandline -config "$cfg" -transport memory) > "$logf" 2>&1
+      (cd "$REPO_ROOT/grandline" && GOCACHE="$BENCH_TMP/grandline-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/grandline -config "$cfg" -transport memory) > "$logf" 2>&1
       ;;
     spurt)
       cfg="$(config_from_template spurt "$REPO_ROOT/spurt/configs/local_8_rounds_1000.json")"
-      (cd "$REPO_ROOT/spurt" && GOCACHE="/private/tmp/spurt-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/spurt -config "$cfg" -transport memory) > "$logf" 2>&1
+      (cd "$REPO_ROOT/spurt" && GOCACHE="$BENCH_TMP/spurt-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/spurt -config "$cfg" -transport memory) > "$logf" 2>&1
       ;;
     *)
       printf 'unknown protocol: %s\n' "$proto" >&2

@@ -1,3 +1,11 @@
 .vscode/
 paper/.*
 benchmarks/
+benchmark-ref/
+benchmark/.venv/
+benchmark/generated/*
+benchmark/runs/*
+!benchmark/generated/.gitkeep
+!benchmark/runs/.gitkeep
+pems/
+__pycache__/
