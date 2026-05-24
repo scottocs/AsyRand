@@ -399,7 +399,7 @@ func (n *Node) verifyJoinRequest(req JoinRequest) error {
 	if !sameMembers(req.CandidateParams.Members, targetMembers) || req.CandidateParams.Threshold != targetF+1 {
 		return errors.New("candidate pvss parameters do not match target configuration")
 	}
-	if req.Object.ConfigVersion != version+1 || req.Object.Producer != req.Joiner || req.Object.Commitment.Dealer != req.Joiner || req.Object.Seq == 0 {
+	if req.Object.ConfigVersion != version+1 || req.Object.Producer != req.Joiner || req.Object.Commitment.Dealer != req.Joiner || req.Object.Seq != 1 {
 		return errors.New("invalid join object")
 	}
 	if req.Object.Commitment.Epoch != req.CandidateParams.Epoch ||
