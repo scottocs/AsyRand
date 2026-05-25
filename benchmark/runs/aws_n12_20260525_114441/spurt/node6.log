@@ -1,0 +1,155 @@
+node=node6 tcp_peers_ready peers=11
+protocol=spurt-v1 transport=tcp nodes=1 f=3 rounds=100 lookahead=8 epoch_ms=180000 report_ms=5000 crypto_workers=16
+tcp node=node6 listen=0.0.0.0:9006 peers=map[node0:100.30.171.169:9000 node1:54.221.17.176:9001 node10:18.237.63.9:9010 node11:34.222.166.89:9011 node2:98.82.30.177:9002 node3:3.129.71.29:9003 node4:3.22.79.35:9004 node5:3.146.65.249:9005 node6:18.145.210.7:9006 node7:13.57.194.169:9007 node8:52.53.1.99:9008 node9:34.211.64.6:9009]
+node=node6 epoch=0 leader=node0 digest=9c83d6b249b6fca55d046426d0171d97ec783cda9f25d3b8712c46649bb2b859 random=d14782d33b63fde5
+node=node6 epoch=1 leader=node1 digest=e75bfa193e559748a04a4bab576ee8b475a6ab705f7477b228cae3ee61cb4022 random=488fdabfc21d7403
+node=node6 epoch=2 leader=node10 digest=cde9bef812f7e311ebfb6b83af66823eb46d7824a7eb5e82b1fc930f9afc162a random=e9f30568e0ae24a9
+node=node6 epoch=3 leader=node11 digest=85b663779a658f51c6806a6c3436343bac1ecc9208988bde482ec5f863f59baf random=701a83b482508aab
+node=node6 epoch=4 leader=node2 digest=1f3d00734e54881844d323f239a0a8cf6983edffdef335b34d83558c4f368eb3 random=ead17ffbf1fe290c
+node=node6 epoch=5 leader=node3 digest=16cf0949a7ff70d65d57cb9b382aa228bda854a61a3e613d9bef412c68d02590 random=ad3509f2b3a2d4ec
+node=node6 epoch=6 leader=node4 digest=4237567ac8218a2e1bb28d481c8fd8d4cc5d09cbf673cdb881dabaee86dd9c1c random=fc85bfad885819c6
+node=node6 epoch=7 leader=node5 digest=155ea570c824b874c00959d7d154fdd98d894b2c0ea5e6f2292a5acc90443300 random=1e9a0da68a2e4009
+node=node6 epoch=8 leader=node6 digest=5aba91f31b889e47862ab8ca398c2b5d7db6e8da021aed778ffd99c6d2af7bb6 random=6c1ab3c7834c66ac
+node=node6 epoch=9 leader=node7 digest=37f4ae300a05fa5b0972593c05e70bcd7b4580713f9c6c042bc20fb4a584b632 random=b96ba3c687efe744
+node=node6 epoch=10 leader=node8 digest=5c10c6f428496c8529a1511e96053b0a2767b63fee023c880ca22a4880f64242 random=05740ce4d7af90c4
+node=node6 epoch=11 leader=node9 digest=46b48953d0ac7505faa2968a04c093c2ad2125489ef94f19594807c7a1de286a random=bb927f190e5cf954
+node=node6 epoch=12 leader=node0 digest=dc49c482f732da9681dff27ca3eb0226d94d9f0e88ce8180488f1b48be2b7a31 random=a8cace3213ff9cf8
+node=node6 epoch=13 leader=node1 digest=6f463f3f4afb91c26006929433a5f5c778fff01f21b90b51da81d4c573a221ee random=3897b409b5b9a516
+node=node6 epoch=14 leader=node10 digest=83f1769806dc2adac6deeaef90f4dfb75be38185d5333bbf192b7ff796948443 random=9e15b348a06ee732
+node=node6 epoch=15 leader=node11 digest=39b6a067d57a8c556cdf3cb1dcba039b8caf4032db5d1a2dfb4b0d8b600c9a28 random=f1cf125ca13abce4
+node=node6 epoch=16 leader=node2 digest=b1d777a488666a46070d2dbfc9c82a1063428db42eacdc62e7418b4043d4a130 random=40b425d35f2aef17
+node=node6 epoch=17 leader=node3 digest=909bfd230f74eda938133de9baaaa8aed52447e665020c99b5a2f5d2c001f442 random=c80ed949062e663c
+node=node6 epoch=18 leader=node4 digest=764743b815bd3d4ab82e19424baf021ca4de7cf6113bb95ae6b722245ef9aa13 random=8ecdca7ea505864e
+node=node6 epoch=19 leader=node5 digest=d855b4031477d165298f3637535ccfedbb61a415c9170c7ad678152d8b9c53cd random=4b88f1f69c67ec84
+periodic metrics beacons=20 throughput=239.99beacon/min sent_msgs=1780 recv_msgs=1747 sent=2525.74KB recv=2356.12KB bandwidth=976.32KB/s cached_total=0 cached_max=0 pvss_share_avg=41.359014ms pvss_verify_avg=3.630526ms pvss_prerecon_avg=193.808µs pvss_recon_avg=32.834071ms spurt_vote_avg=623ns bls_sign_avg=276.487µs bls_verify_avg=4.45939ms bls_agg_avg=3.622652ms
+node=node6 epoch=20 leader=node6 digest=8194e6cdb2f65aa8f8c947078cb70cbfe84eec5b9b0f6b403d62dee6794bd167 random=46103a6e3a334172
+node=node6 epoch=21 leader=node7 digest=310e373aa39ec76d2bf36bbc06a0ad95fc6baaf2ca65ed7f3b6676f02b5128f8 random=ff032bbef816f4fa
+node=node6 epoch=22 leader=node8 digest=2c33a8a612a043dfc343a7ff8a49aaa34cbc60c19095c742f4458cf88f781894 random=0a165fdf758e3bf4
+node=node6 epoch=23 leader=node9 digest=4f3aa2c31b789815d8ba37f5ae89c1c5e5c9a839a8c647839272b040caead3cb random=e2706d3ba7d93eca
+node=node6 epoch=24 leader=node0 digest=2c2cca37f5fe032770168b632f49b109094c90fe441dae9fb3de53f88bba0449 random=0722e617c42e9e69
+node=node6 epoch=25 leader=node1 digest=1c1f1cf375cd01b04530d1d581a1a65dc5aaf35f9c6cc7f489610cacab0c1bd5 random=f0c152f1c42d92d8
+node=node6 epoch=26 leader=node10 digest=a7f9762e7e98059725b01a19430764fab0a6d989a34bc646ea5e697fe06ec39f random=255df1f1bc4e6a14
+node=node6 epoch=27 leader=node11 digest=977ad46cca3bf12adc78d6e5a125c391e75323b2fb3cf7699cf490ee73c13f04 random=edd5ed5848445371
+node=node6 epoch=28 leader=node2 digest=46cd11eb2ce41cc983852a110b845050fafab09cc979f2170175f1b93f4e4442 random=e5d09c1bd216d05f
+node=node6 epoch=29 leader=node3 digest=55702e73d31b86962315a6b39132245bb9299fbe0357b8e7dd098c87450b3a1c random=9d6e22415d1c714b
+node=node6 epoch=30 leader=node4 digest=3967f02c549a240755c3b49864598d6534e6e988a3ebdaba149c8a1a870c4c52 random=661c54aa31fa002a
+node=node6 epoch=31 leader=node5 digest=a4da808595c09c94f7d630198ed1d0cb8685e6cb92c136c5ea5433b8ca2108e9 random=10b086e38009df47
+node=node6 epoch=32 leader=node6 digest=35e77c436eb25510a758fbd18196a6d279be3494274923e6cffaee97bdb3f9cd random=a8ee27d5745f0e4b
+node=node6 epoch=33 leader=node7 digest=bbfc15e7b7a1e47fde47cb74709c0394c99cde1351032c1bcafd031f7e5bebf5 random=534c10c0b1ef1d46
+node=node6 epoch=34 leader=node8 digest=e1b534c24ae2510fcb60cbf10ba478bbdcf0dac0f7501092708b9740b7d28f3e random=7afa95466306389d
+node=node6 epoch=35 leader=node9 digest=c5974ff703eea865ec5774a068ee57ff44079cd1f14fce626660423018b0df4f random=0f12ff9b4d44ea18
+node=node6 epoch=36 leader=node0 digest=9f934282cb1a68d50b8e244bea0268a151b49c2a83ba8500da8f5b357853dc7d random=9527c8b43508ec2e
+node=node6 epoch=37 leader=node1 digest=d219cf409e5a854322672f0e87bcc5eee77588d3fdbc41d897104989a967258b random=0a545cfd1c2effd4
+node=node6 epoch=38 leader=node10 digest=4f11d087a15181ba5b61a5618299fa17450c1edf0d44b47d3b512975844f362c random=5b47df013d965891
+node=node6 epoch=39 leader=node11 digest=155f072c95c6482f50bc849410d72a9a7bc2d66b168c85a07b9bdce1ab865c46 random=0c0568db9b9a713b
+node=node6 epoch=40 leader=node2 digest=82a63787e982fdcd68eb91ebf0e44c29cb48df14c80e0a3516076abdcd42d0d7 random=6913d567a0869758
+periodic metrics beacons=21 throughput=251.97beacon/min sent_msgs=1834 recv_msgs=1878 sent=2355.56KB recv=2532.16KB bandwidth=977.41KB/s cached_total=0 cached_max=0 pvss_share_avg=25.565642ms pvss_verify_avg=5.103305ms pvss_prerecon_avg=186.834µs pvss_recon_avg=31.080104ms spurt_vote_avg=655ns bls_sign_avg=277.632µs bls_verify_avg=4.162879ms bls_agg_avg=3.410351ms
+node=node6 epoch=41 leader=node3 digest=994dfbef79cdeda5db8c08e6b0dce6daee885286382ac74bb43f527435365e12 random=6d6d66fb458ebbc1
+node=node6 epoch=42 leader=node4 digest=0a06e026fcbdffbc32485e4cd3d1e1d9a2ca756adf58d9eca30eb5c98a3ec354 random=b6ce290a02bbc72c
+node=node6 epoch=43 leader=node5 digest=1b841ba8b895525dc9de0adea3f5adea8028f5ef7ab59bef0b244707c5abd81e random=67171b46d774d664
+node=node6 epoch=44 leader=node6 digest=e4c96753d69ac0da79dc34ba00993e2510e3fd601552dc86e5b9a91ca390dd79 random=31bafb4408cb0ea9
+node=node6 epoch=45 leader=node7 digest=53482e6e5a57cf21f10ee2de0f9c04866f4666df48e6eae84c38634367050d42 random=dc5ee2653c958298
+node=node6 epoch=46 leader=node8 digest=ba01d464e3cacf7647b260b12b86ef553f41afe9438d919001bad41ac9d19a70 random=030e1d9b64ddf676
+node=node6 epoch=47 leader=node9 digest=f92b354b167023f64ea45626c64cdacca88546e0197efefa13ac289407b86f2c random=ea6c60d8c0ff005d
+node=node6 epoch=48 leader=node0 digest=60256952a59f913c94aefa7585c78e74d95b85a08a67da6fe4f474da50a52484 random=306b19326fb20c91
+node=node6 epoch=49 leader=node1 digest=e7461a48108f9fbe3d9685b5def01b66124310e3bf98d2fbae377b14f828e838 random=f68d1e5928d89891
+node=node6 epoch=50 leader=node10 digest=80963fa06c1c2c428acae6935c3687d6697d1f4a2e6784d7cee209c4da1e6805 random=b845f041811b8d29
+node=node6 epoch=51 leader=node11 digest=99950ed6375cca5c75e77a5f19c6dc2645cb708dfd0c83cfd185b7ad86ddba37 random=1b5c07514f756e4b
+node=node6 epoch=52 leader=node2 digest=57cef23d17610277d9fbc28894c52752305587a53874e475251649a799106ef9 random=23d96d53c7ff8ef3
+node=node6 epoch=53 leader=node3 digest=21302819146ed8f54e2240cbe42d665888d2d283a5f618930399709689399055 random=f1ae7dc1cf80c43c
+node=node6 epoch=54 leader=node4 digest=5c364fb4bd7a10b1ab824747bb5c9320e29e3285ed64cde8807361a4efa0e7b1 random=e60ddd2cbe06c2d3
+node=node6 epoch=55 leader=node5 digest=1e61113c1a4d43f2f3c8b3596d9b13abb36439c56e786313ff488b0da69c8301 random=3ec79ebe8624b071
+node=node6 epoch=56 leader=node6 digest=807ebba1475f314f7d879f46d1711cea5572de8f14aaac384b6212615a793070 random=e8f769dbb4f4ca2d
+node=node6 epoch=57 leader=node7 digest=cef91c3768e1430a81867e173f3cfbe7d51df847242dcf13c6a0dea467dcf291 random=a0ca3fe2926eb228
+node=node6 epoch=58 leader=node8 digest=d1a5ffe403c7e4eb1ac8b3c54077a407f52ea4800193581ab98444c61100fa14 random=6296f60a2393a75e
+node=node6 epoch=59 leader=node9 digest=7bd3112b46c9a118be8fa198cc993f71248f4631f07436bd705f5e1af7487443 random=c20192c20937ffe5
+node=node6 epoch=60 leader=node0 digest=d3f275a108e6f59283b055216e322f5fce1f809e58509c370847389c956331f0 random=a1edd8eef103f0cc
+node=node6 epoch=61 leader=node1 digest=9cdb596fc4b4bdc71551e13d279794591bf5757c35ee5fc442d603c6bcf98dc3 random=81ab49c7c514feb7
+periodic metrics beacons=21 throughput=252.00beacon/min sent_msgs=1857 recv_msgs=1845 sent=2478.52KB recv=2477.27KB bandwidth=991.17KB/s cached_total=0 cached_max=0 pvss_share_avg=25.221724ms pvss_verify_avg=4.411376ms pvss_prerecon_avg=188.421µs pvss_recon_avg=37.354548ms spurt_vote_avg=685ns bls_sign_avg=258.69µs bls_verify_avg=4.193003ms bls_agg_avg=3.353402ms
+node=node6 epoch=62 leader=node10 digest=4b53ec37e699119729a8356e466eaba35c3f7f8c4de6bd4f70aaa044e0047fd3 random=d0bbb96694a38c1b
+node=node6 epoch=63 leader=node11 digest=f32928ef1d98eb9ed35fe7861f78298b7323b25aeb541b6bc03608bdc4a4c10c random=87ef579630d26e05
+node=node6 epoch=64 leader=node2 digest=fca6a49ed4e6086cd979947f4231e3549ae4ad94a743e4e652951558462e3509 random=545d63227aab9f1b
+node=node6 epoch=65 leader=node3 digest=861c84bf35d201ababfd275b83fe5caf6d2f42d667f1262f992102eebe39a749 random=84fe4fe22e3b961f
+node=node6 epoch=66 leader=node4 digest=e1f35d250dce23c9d8d97d5e04f358c2b6f0e7da7754eb594a06e937cd3cc6c7 random=aa76111bf7f56621
+node=node6 epoch=67 leader=node5 digest=e588ac9623b7b454d13e434d1f11decd2096dd016e50f005af64dde25022307a random=0187b00f6c58589b
+node=node6 epoch=68 leader=node6 digest=5106af757166663412f1056299608496b486249761d83c81b0494a4c806a4e0f random=de3c5ace06d58bb9
+node=node6 epoch=69 leader=node7 digest=1e98f18b5df3bbeb572d699e7562c35d0b5a8f784fcd9fd00d787df44c564ba2 random=edffdf65d5e7e038
+node=node6 epoch=70 leader=node8 digest=1dfabc3e9ac2502cea599c05f3b6b696e1579f6fe94ce4c87d9f290743d1cb45 random=c20e3ab5995d4dd7
+node=node6 epoch=71 leader=node9 digest=86d39cd03b1b47e249ad812794c03d794bab1dc5153098a0dec572a754628fb0 random=8aaecd1a81922537
+node=node6 epoch=72 leader=node0 digest=335e0cd71d7f7d68739e7e7fbdfd39054f82d8f57717b52f112a9c62171169c6 random=584b0d2e0f596d43
+node=node6 epoch=73 leader=node1 digest=23876f01050ec58a8c9895ae3196b3cfc9b318eb2daf09d79ae042b962d53778 random=95a7c04ea2415d9c
+node=node6 epoch=74 leader=node10 digest=18b29b43eafc47d97cf6eaa18cdafff30b86824d38ac459c4393b1a20b9a1852 random=f1facf8e4c03fbbc
+node=node6 epoch=75 leader=node11 digest=73dfbd9b35d995217910157743b783ad7c6ae69d561f17ef81f95cbd571ed3aa random=02a2920365c3a1ba
+node=node6 epoch=76 leader=node2 digest=210911f3b772c39d7a7187c8615f15241129bb44953edd17cfe517d0dd0c4c7b random=f7972080c5d625d9
+node=node6 epoch=77 leader=node3 digest=79c260d98a0ef69b011b4dd106a84791f9a221b8d55eed82fe052cd42f20ee8c random=a92dfd2d0c3b2dd5
+node=node6 epoch=78 leader=node4 digest=8288358fbdccf05c1f81c2e658097d1e014606599c2e710816902a9e10051d67 random=e0b6bd1d4c423969
+node=node6 epoch=79 leader=node5 digest=3f5449964966c3e7adbc632650ca60c10fa2479c08775a45a9ce7649e9dd35bb random=01775849686c8c47
+node=node6 epoch=80 leader=node6 digest=dea9653d2736093df1ad1aff297f5a23148a328d83242c83b88addf22cca9f0b random=4d5d238b4537468c
+node=node6 epoch=81 leader=node7 digest=88588a1206b30a4f833879212e28c3686ae8038ad9afcca120eb9a357cef384f random=f04b901bf9ca4ed1
+node=node6 epoch=82 leader=node8 digest=d5b4409248de741d5c3d9c5ee5a90fa28d1fe1688320e19eea53987aa83983cc random=bb9d25903b7270e7
+periodic metrics beacons=21 throughput=252.03beacon/min sent_msgs=1821 recv_msgs=1811 sent=2460.67KB recv=2325.75KB bandwidth=957.41KB/s cached_total=0 cached_max=0 pvss_share_avg=22.766577ms pvss_verify_avg=3.871538ms pvss_prerecon_avg=188.429µs pvss_recon_avg=32.864921ms spurt_vote_avg=748ns bls_sign_avg=285.305µs bls_verify_avg=3.839031ms bls_agg_avg=3.540168ms
+node=node6 epoch=83 leader=node9 digest=bec866f87f317728c6d57d9bb29f8438efc9840d8c9440188f040337c8f3839c random=4a0d2f197be7646d
+node=node6 epoch=84 leader=node0 digest=b088cc107cb99b3480b12aa0143fafcf4d7d47a5e77389aa1e0b702dead79d2f random=a2da126633bdf465
+node=node6 epoch=85 leader=node1 digest=d36b80243fd5caba0b0ab3b2a360d9325846874c393ae28cfa83a26a36e5037a random=f22585bf3d2bd086
+node=node6 epoch=86 leader=node10 digest=a37c3b531eab953b37669e28582dc94eeae8825e357f1827baed4ad99fd64570 random=b9f3e7521e2f1919
+node=node6 epoch=87 leader=node11 digest=8b20b9d15efd8d023427cb96ce92c75ae2b255d3158432be75cfd9fc323d3830 random=8177d2e3a66e4f4c
+node=node6 epoch=88 leader=node2 digest=a69ad50229643e4a8d422a34b718c5c464f61ea834ee52b7d8964609bcfbbe50 random=f4c3456c10e9030c
+node=node6 epoch=89 leader=node3 digest=747eb2fc463248019ace54fee61adffd51cdac49df2d6d6ddd60a666ab49a807 random=8abf6dc2507f5a4b
+node=node6 epoch=90 leader=node4 digest=db069876271a6d2f5c660511ded6f8009142ebc8e528e9ca2f68cfa0ae3a8d7e random=2ff842014c07e195
+node=node6 epoch=91 leader=node5 digest=67312b4fd12930ba08027bf69760d755467dfa1a6f041bdab1a15cab773c32e9 random=02ae7b317a298f0b
+node=node6 epoch=92 leader=node6 digest=551fd2f0e5dad79c15ac02ae18b17d451662cb353f15ad6160a936edd7881cac random=ee3b0f723284f808
+node=node6 epoch=93 leader=node7 digest=3f733aac34b9b55c44ac270b2c66d8fb8c78b13d96fed4252195263203573244 random=aa8c8f8c41b6f43b
+node=node6 epoch=94 leader=node8 digest=e97ee544acbee2d989e7512f4ac0a150be0ccbf4b3f1183f1d82906979e647d8 random=30032190922b4577
+node=node6 epoch=95 leader=node9 digest=65114d43be01bb619cf07558fb96e0e4784a36f9530b04645dea7549ca714df7 random=f6bc79954fbfcb76
+node=node6 epoch=96 leader=node0 digest=537c31e45bc34e46395889a6b7f3d38e4f9d57ad1cf897bdaf21dc1913237063 random=55f5c443b6cb32ac
+node=node6 epoch=97 leader=node1 digest=407cbd4e57408714be26e91074095625c98bc10fc5bfabcd032bd0d0a9f8aba4 random=fdb50e1b20fc8cca
+node=node6 epoch=98 leader=node10 digest=1ee4e30adbb9337692d14d424d0cf8f9bfede4ed1ae4cc1873566a1d1eacdfce random=c24672a4fdf1896b
+node=node6 epoch=99 leader=node11 digest=68a40035c2d3394a384e0e1c5b6196411608c9a18cee802a6ecaca5aa828dd91 random=22fb42f3a200f3bd
+final metrics beacons=100 throughput=241.29beacon/min sent_msgs=8688 recv_msgs=8690 sent=11640.26KB recv=11679.68KB bandwidth=937.80KB/s cached_total=0 cached_max=0 pvss_share_avg=29.048479ms pvss_verify_avg=4.172228ms pvss_prerecon_avg=189.562µs pvss_recon_avg=34.019967ms spurt_vote_avg=721ns bls_sign_avg=271.499µs bls_verify_avg=4.118081ms bls_agg_avg=3.439627ms
+periodic metrics beacons=17 throughput=204.01beacon/min sent_msgs=1396 recv_msgs=1413 sent=1819.76KB recv=1956.51KB bandwidth=755.27KB/s cached_total=0 cached_max=0 pvss_share_avg=25.561559ms pvss_verify_avg=3.689038ms pvss_prerecon_avg=190.888µs pvss_recon_avg=35.862618ms spurt_vote_avg=943ns bls_sign_avg=258.75µs bls_verify_avg=3.868839ms bls_agg_avg=3.242781ms
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s cached_total=0 cached_max=0 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s spurt_vote_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+	Command being timed: "./bin/spurt -config benchmark/generated/aws_n12/spurt.json -transport tcp -node node6"
+	User time (seconds): 31.56
+	System time (seconds): 0.53
+	Percent of CPU this job got: 22%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:24.86
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 18144
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 10837
+	Voluntary context switches: 58321
+	Involuntary context switches: 1984
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 176
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
