@@ -1,0 +1,19 @@
+{
+  "key": {
+    "name": "AWS-Hou",
+    "path": "C:/Users/kanla/.ssh/AWS-Hou.pem"
+  },
+  "port": {
+    "p2p": 9000
+  },
+  "instances": {
+    "type": "c6i.xlarge",
+    "regions": [
+      "us-east-1",
+      "us-east-2",
+      "us-west-1",
+      "us-west-2"
+    ],
+    "volume_gb": 24
+  }
+}

@@ -1571,6 +1571,12 @@ func (n *Node) currentEpoch() uint64 {
 	return n.State.Epoch + 1
 }
 
+func (n *Node) CompletedEpoch() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.State.Epoch
+}
+
 func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 	n.mu.Lock()
 	if p := n.State.PendingABAs[dec.Instance]; p != nil {

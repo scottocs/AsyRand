@@ -4,7 +4,11 @@ benchmarks/
 benchmark-ref/
 benchmark/.venv/
 benchmark/generated/*
-benchmark/runs/*
+/benchmark/runs/**/*
+!/benchmark/runs/**/
+!/benchmark/runs/**/*.csv
+!/benchmark/runs/**/**/*.log
+/benchmark/runs/**/build/*
 !benchmark/generated/.gitkeep
 !benchmark/runs/.gitkeep
 pems/

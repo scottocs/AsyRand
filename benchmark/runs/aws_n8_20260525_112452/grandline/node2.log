@@ -1,0 +1,53 @@
+node=node2 tcp_peers_ready peers=7
+protocol=grandline transport=tcp nodes=1 f=3 rounds=100 queue_len=8 producer_ms=unused epoch_ms=120000 report_ms=5000 crypto_workers=16
+tcp node=node2 listen=0.0.0.0:9002 peers=map[node0:54.221.17.176:9000 node1:98.82.30.177:9001 node2:3.22.79.35:9002 node3:3.146.65.249:9003 node4:13.57.194.169:9004 node5:52.53.1.99:9005 node6:18.237.63.9:9006 node7:34.222.166.89:9007]
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=66 throughput=792.49beacon/min sent_msgs=536 recv_msgs=519 sent=806.48KB recv=780.65KB bandwidth=317.62KB/s queue_total=0 queue_max=0 sign_avg=2.68604ms verify_avg=11.818751ms recover_avg=3.011198ms pvss_share_avg=0s pvss_verify_avg=0s
+final metrics beacons=100 throughput=455.09beacon/min sent_msgs=808 recv_msgs=783 sent=1219.72KB recv=1181.77KB bandwidth=182.15KB/s queue_total=0 queue_max=0 sign_avg=2.841562ms verify_avg=12.053299ms recover_avg=3.166363ms pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=34 throughput=408.00beacon/min sent_msgs=272 recv_msgs=289 sent=413.24KB recv=439.11KB bandwidth=170.47KB/s queue_total=0 queue_max=0 sign_avg=3.143456ms verify_avg=12.507108ms recover_avg=3.467565ms pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=0 queue_max=0 sign_avg=0s verify_avg=0s recover_avg=0s pvss_share_avg=0s pvss_verify_avg=0s
+	Command being timed: "./bin/grandline -config benchmark/generated/aws_n8/grandline.json -transport tcp -node node2"
+	User time (seconds): 10.48
+	System time (seconds): 0.07
+	Percent of CPU this job got: 7%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:13.18
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 10380
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 5713
+	Voluntary context switches: 4877
+	Involuntary context switches: 601
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 128
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -43,7 +43,18 @@ python -m venv .venv
 .\.venv\Scripts\fab logs
 ```
 
-Generated configs and run outputs are stored under `benchmark/generated/` and `benchmark/runs/` by default. The local Fabric runner starts Go directly from Python and does not call `scripts/*.sh`.
+Generated configs and run outputs are stored under `benchmark/generated/` and `benchmark/runs/` by default. The local and AWS Fabric runners start Go directly from Python/Fabric and do not call `scripts/*.sh`.
+
+AWS node lifecycle commands are also exposed through Fabric:
+
+```powershell
+cd benchmark
+.\.venv\Scripts\fab create --nodes=1
+.\.venv\Scripts\fab info
+.\.venv\Scripts\fab stop
+.\.venv\Scripts\fab start --max=10
+.\.venv\Scripts\fab destroy
+```
 
 Tyche uses flags for `n` and `epochs`:
 

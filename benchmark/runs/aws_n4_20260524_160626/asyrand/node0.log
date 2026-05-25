@@ -1,0 +1,154 @@
+node=node0 tcp_peers_ready peers=3
+config protocol=asyrand-v1 transport=tcp nodes=4 f=1 rounds=100 queue_len=8 producer_ms=250 epoch_ms=60000 report_ms=5000 crypto_workers=16
+tcp node=node0 listen=0.0.0.0:9000 peers=map[node0:100.30.197.140:9000 node1:3.145.183.52:9001 node2:13.56.76.205:9002 node3:35.93.91.4:9003]
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=144 recv_msgs=144 sent=79.95KB recv=79.95KB bandwidth=31.98KB/s queue_total=16 queue_max=4 pvss_share_avg=1.414683ms pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=890.048µs bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+node=node0 epoch=0 source=node1 consumed=true commit=37ca39aa0aafbd3303d255891cd891d1ae1831aabf0705734dc0433ae6c01ed2 random=6d62c2cf84718b80
+node=node0 epoch=1 source=node2 consumed=true commit=122dcc18a6268cfe88d9e9cb3b4da6afee3247cf83a7583025f6e9cb9e17b5da random=8020513b20c509e6
+node=node0 epoch=2 source=node0 consumed=true commit=d54bd86798c9f38682a052f59bf33578444e8b83b27eaa2d3ac929a16a7c9fe5 random=c0d2dac6b53b5c5f
+node=node0 epoch=3 source=node1 consumed=true commit=abc4cb04cdaa7ab69982b99e2a5f45a6ec8a5497e2030afbc6a9364b7a084e6f random=77864431d443f491
+node=node0 epoch=4 source=node0 consumed=true commit=d171a36eaaec2f093e3fd7fa419eccf492ffc9631127f75b052d29898c4790aa random=48a8e7167a8720de
+node=node0 epoch=5 source=node3 consumed=true commit=65e4b1da2afa264305f44d0f090912e7fa1dc512499fead26b0d641bffb869c4 random=d5f3edaea6a15a56
+node=node0 epoch=6 source=node2 consumed=true commit=415284ec69c43e669e44be152fce2b1ad523c991e9ec66056bdcb1989aefc180 random=539a4697baec2d14
+node=node0 epoch=7 source=node0 consumed=true commit=59934174291eaf6e0e7c44b1b83e0fb575bbabaeafb4cc566284602ea8b36317 random=b87dce7edb707ae6
+node=node0 epoch=8 source=node2 consumed=true commit=f09417edac3ea80755c93db483ed5d86ff867966045afd61442b14e4dd4fcc51 random=8b70f94b8c3f1c8f
+node=node0 epoch=9 source=node1 consumed=true commit=ff6059f8025dfd8a722d6cb60b3ee91e58cffce764e626e7e9f6f13c3bd2aa54 random=85fb99b8acedf1da
+node=node0 epoch=10 source=node3 consumed=true commit=0b4fa5be97b573b0a4f789ba2aa8974e10c74fb218301b0a0ade77e2418229f1 random=bed775f32d909e41
+node=node0 epoch=11 source=node1 consumed=true commit=8c737f4f468305ff5c10114b3a80dc4de3895379d0f03e7d5f75c3e5fe368645 random=9b7d40790a7c9157
+node=node0 epoch=12 source=node0 consumed=true commit=17ad7a3692d77b5c5c5d83789fcf09dbb0e1e1dfdcf2120a8605efd1267aa55b random=9f9356ff083ba29a
+node=node0 epoch=13 source=node2 consumed=true commit=6182b0d2c03650a10757c49d0c0481958376adf879146d32adf667c6e2007e3b random=ecb349659d658d8c
+node=node0 epoch=14 source=node0 consumed=true commit=4a9cd6c02eac36d0a7ee4e13adb6bb96c64faadff22c5ba23a77192135f02b23 random=054c27169188a5a2
+node=node0 epoch=15 source=node1 consumed=true commit=56e2c6f326c51d1a471bfb9fabfc194ddee719db30ec7218de87ffa03d37c0e8 random=a766f40771770f38
+node=node0 epoch=16 source=node2 consumed=true commit=133ea533a77e4e64f76b567a76059f2a5ca6a8e314c47da564703d92e860d9fb random=37d3bca1e364f3f6
+node=node0 epoch=17 source=node0 consumed=true commit=37210d496d70dc7cf8c1720145314e87111f23546fe4afb12808765d6a8e1c17 random=c4d2f299bf024fa5
+node=node0 epoch=18 source=node3 consumed=true commit=e14451f246c326edef0983677c362a16ebf6378395e45fc0bb3869cec5be23ee random=cdb239c787484b54
+node=node0 epoch=19 source=node0 consumed=true commit=4c8015a70721bcfe0457f244ca79c04bf756b45e8fb425630a1cc461ae41e222 random=137562fe11a34938
+node=node0 epoch=20 source=node3 consumed=true commit=6c9a325053178aa34af91ee67206adda8440c4832401d4bd87766be0a39ddd42 random=3d90cacb50a80dce
+node=node0 epoch=21 source=node0 consumed=true commit=c541428649ce804f39a4440df251f69ef9aafc1e56207c2bb62c4400ff4aeda6 random=790ba881ae3b7a6b
+node=node0 epoch=22 source=node1 consumed=true commit=5fd3f0cac9b1109f2c854f076e039b5ba9e224f93b53964d92795cece84c06b2 random=831d876d9c0a5f64
+node=node0 epoch=23 source=node0 consumed=true commit=47676718800c742a0bd7da99f396c6ac347d761468ca9b5ecfc32742f5d51624 random=4eb17e14a59ecc9a
+node=node0 epoch=24 source=node3 consumed=true commit=6e90e1f40aae565101963436f249254a44d54e4af70035581e11d315eff66f9c random=6f5f346261b79999
+node=node0 epoch=25 source=node0 consumed=true commit=9a5e65d21220a04e16b96bd4e98d4a35fbd219c690fec376fa68587681038b1a random=294aa846fb08c47a
+periodic metrics beacons=26 throughput=311.97beacon/min sent_msgs=524 recv_msgs=514 sent=334.33KB recv=315.73KB bandwidth=130.00KB/s queue_total=11 queue_max=4 pvss_share_avg=1.538204ms pvss_verify_avg=594.769µs pvss_prerecon_avg=917.306µs pvss_recon_avg=176.791µs rbc_avg=23.984µs bls_sign_avg=241.707µs bls_verify_avg=2.988237ms bls_agg_avg=2.823145ms
+node=node0 epoch=26 source=node1 consumed=true commit=97861d811731b52f11fb6eb133e750036a2fa43fe04f2c2e3081d86e4bc0a78c random=7e66a1217093958b
+node=node0 epoch=27 source=node0 consumed=true commit=f26ae97ccc871986a0e80d221a92e0a2184ed5d2537902cb341f3964a39dea14 random=b6bed2114038e62a
+node=node0 epoch=28 source=node2 consumed=true commit=69c5b732eadc5a172b393526cf623b3c623ef6cbc8999b48535e55f22a43089c random=7669a725df9ac135
+node=node0 epoch=29 source=node0 consumed=true commit=829a72ff07f423fadbe15b71b7145c026646ad659adfcb506a20f7d9614cbe16 random=269e0cd57d28d5f6
+node=node0 epoch=30 source=node2 consumed=true commit=30e7063dffc41ce29c7b0588a1ddbd2696f65762b087bfa749b31b15ff46e952 random=80e11cd51e894222
+node=node0 epoch=31 source=node0 consumed=true commit=f3d93795e6205ec91e23dae3ad4bbc9c229073f64073235aa351389ed8b0a0b1 random=ba105776ef4211f9
+node=node0 epoch=32 source=node1 consumed=true commit=46f1c2b2dbbe2cdbf80aa38659de254dd044611f3923bf88fa3046974e1889e5 random=eec7ee3bc9b8b8c2
+node=node0 epoch=33 source=node0 consumed=true commit=c0d6ebd4ca93652cfc7286420ea43569cdca5c60840f2d74def7a5a82631c997 random=af9bac15c549acaa
+node=node0 epoch=34 source=node2 consumed=true commit=965daef7dd3f5c4f8123d7dc46cff8224f6f7d439a8c26dd6fb9566cf3320a37 random=7cd1438251efbe93
+node=node0 epoch=35 source=node3 consumed=true commit=f2f4e1996a9025e987ee8784f15d01420323259460e7a83e2660d96acaf2dff2 random=3c831aa7165e1b73
+node=node0 epoch=36 source=node0 consumed=true commit=6e2ea74436f33d3ac63166e5618445b2455e0754d9b79bdad4a5275268a7f1f7 random=d7f0025b08352736
+node=node0 epoch=37 source=node1 consumed=true commit=45fd56c7cebaa89a8a92d07448db920b1035984fead352769fd89f74fee29ec6 random=9348226f67333101
+node=node0 epoch=38 source=node2 consumed=true commit=139d1e8da5b4ff6ea9370ad9fa8b234879a34e4d70443ef5d91e7dfeaedfb934 random=e0db53b83b98b63b
+node=node0 epoch=39 source=node1 consumed=true commit=fbd2858ae0fe5d9d82d8514a1ef3e14f72cea006cbc248b533181c3df91a92aa random=309458fcaf548f6f
+node=node0 epoch=40 source=node3 consumed=true commit=5392f3769a2ddc9a9a1f52cf614a4f57acc26ae2e6a4ee796c11fc4412401b62 random=11a11a0e33bded87
+node=node0 epoch=41 source=node2 consumed=true commit=3867aeee6cd40d734fc3c30df5be4bdc835e2d59044a72fe1acd84456a354333 random=c5b588927e00b577
+node=node0 epoch=42 source=node0 consumed=true commit=eeb239c09ad39790f92833f9042f89abf1b4118d06d9e917776b6d4864d6ab53 random=1882c938e8eb6197
+node=node0 epoch=43 source=node2 consumed=true commit=345dbb54316c838e658377e6d71d55215a90e588d4e5a3348d4ae583df909e3e random=d88f038e4bfff6af
+node=node0 epoch=44 source=node1 consumed=true commit=89675783d5d496bf7b964de1556a1f62b8bc92d191a778be90b5a05eccbe6aee random=fe8c5c566c672c0d
+node=node0 epoch=45 source=node0 consumed=true commit=ea9ebda4ebbac12b847c8efb4c61d434adf6814d535c4b21c5dd4e636b3bb75d random=5b819dbbd016076c
+node=node0 epoch=46 source=node1 consumed=true commit=e479b8f4cca2901c3023b1c4f6232bdb71eb639bb6b0125c1c6064c706b8de4c random=881b2688500ee89e
+node=node0 epoch=47 source=node3 consumed=true commit=5b34c0128238e987e19824f4844547b79dc438ae98853879bf996d2a694092d2 random=33637c43fd8599e0
+node=node0 epoch=48 source=node0 consumed=true commit=7726a23262d8914ab39a338099ca2f42d7d3a0e1849b16ef4d4ce80ca1237cb5 random=055300b2f2d785d1
+node=node0 epoch=49 source=node1 consumed=true commit=80aba0c7ffbbedf11a333dea62521368829a720f8e825466d5564430e29f2a59 random=24df48189705229e
+node=node0 epoch=50 source=node2 consumed=true commit=9f90787d8ecda468e3fb70434f0cc2d84155c1f288ac39ad7af78902969c4ad3 random=226c1e82d5c0d8df
+node=node0 epoch=51 source=node0 consumed=true commit=7996d772cfa0da44cb3c53c9ce5cc311dbb41b1d1708f0f4782aff66a7345f98 random=3cfb5e5bf8eaa721
+node=node0 epoch=52 source=node3 consumed=true commit=11b21a08f7049c80922b65e0b06e714aee65f730a3d82996bb77fa090e3c7492 random=1a025ce248059e58
+node=node0 epoch=53 source=node0 consumed=true commit=20a146f440202af27f8703500912eb06f83ea3c5c51298682cd4067a97483905 random=cfb1384696124e1d
+node=node0 epoch=54 source=node3 consumed=true commit=a8f2be1331d7f57b9801fc2df62e63e95e7d2653a4dda60c0b40268a7ef1b4f2 random=3a13fa01db4ac955
+node=node0 epoch=55 source=node1 consumed=true commit=fa3bc70765ce4dcd6b31afc5cffacbe861de777829abba10200e5b48686b6cdf random=6f87a97fb265ac6f
+node=node0 epoch=56 source=node0 consumed=true commit=2e01d5319043cd034b843e070f8ba2728d35052c0ce05e66a0d6e12b2a605be3 random=628819011bc1cb73
+node=node0 epoch=57 source=node1 consumed=true commit=f36b5414d24bd3575a0949df985b89dcd5f7c65483e4c7d6872ce883ab3f61df random=b135b5fa81c1ffa9
+node=node0 epoch=58 source=node0 consumed=true commit=2b1546792a072cc74f2b1481470de2b386c8d348783fa6ca4cd4e7228892c1f7 random=331de6d09dbcf89e
+node=node0 epoch=59 source=node1 consumed=true commit=221a585ba259f03208a02745587a4a0faabe2f3c28765aaf8b7159ebe87ef4fe random=78945d2a4ebbd902
+node=node0 epoch=60 source=node3 consumed=true commit=eee55b47916c45befcc165b0ddd6d0d93993e4f0cab6b228f202b202f3941012 random=105a860a83511939
+node=node0 epoch=61 source=node1 consumed=true commit=2626435495e09056d36c24ba837718e5d424e8b17cb5942ed3c9c612bf144d85 random=5089ffb6ab0fd1f4
+node=node0 epoch=62 source=node0 consumed=true commit=44bb328725e1feab334f831d2e5e68e2807d032dc5aeaed46ee8cf973f8888a2 random=58cccf029ec98c2f
+node=node0 epoch=63 source=node1 consumed=true commit=70e7178c2134d975e5ed26df6395949f7fba5f7711ff7addc4c8e2c91c267780 random=ca528450426603db
+node=node0 epoch=64 source=node2 consumed=true commit=7289363b56c3266f753ce135bfa4f2f0ee10f1a2ade4c7f82c92b1654f5fc4f1 random=07d912fce3f4be4d
+node=node0 epoch=65 source=node3 consumed=true commit=3d0aece8e3d4cf5505fe2838ec6c008c51dc2f1a11f2442bf7fec75b503fc9bd random=1ddaa652d5513729
+node=node0 epoch=66 source=node0 consumed=true commit=bd3f3549277ef4a50250ee3737b5e129470440e5ed4b5a59eeef8afa19c00194 random=acc775eaedfe1a74
+node=node0 epoch=67 source=node3 consumed=true commit=398de41ddf74dab0d798ba06dc605c1443f61d270b3eec050ddb33dd55bc200c random=8e6f1ce8e5b6b5d4
+node=node0 epoch=68 source=node0 consumed=true commit=c1379c20bbc6bbd2fa67f5dbe2745507471802d9f60623df0ca6a591150c697d random=ff777330a715cf90
+node=node0 epoch=69 source=node3 consumed=true commit=41d6052eb7216d977d5ef73cdbd9e194a942482eb23689af233c0394097b6e5b random=fc59218b887b2203
+node=node0 epoch=70 source=node2 consumed=true commit=5dc0d83cf4b970c27daadcdb3c834da25ee0229f725c5e7f2b0a1908111fb920 random=7a68f88c579534af
+node=node0 epoch=71 source=node0 consumed=true commit=61e6f195cbd4705d9790c35401120ba7846c808eba21bbc422b02db8d0bc838f random=486aec2230f29c91
+node=node0 epoch=72 source=node2 consumed=true commit=7a2a5bfc742f1607b63aab3dbeb4abad0e465ccf7a9317ee592e146541dc57e9 random=15e1c7b92d133f4e
+node=node0 epoch=73 source=node1 consumed=true commit=4105c7d5b838cf6b228b2214718a0119a1d19972f39bc1f2af65cc1f46b33d62 random=06f0499dbbf2a334
+node=node0 epoch=74 source=node2 consumed=true commit=677f202d46af84b9798d62681ffdfe7dbd74df8d31e44eb6e3610e885882a1c7 random=99e32a590e3e7ed6
+node=node0 epoch=75 source=node0 consumed=true commit=bdd374ba2f0adc392403b0685f00543a93ef87f989afac8cc7a345f8b3fc7477 random=8421dbd352789282
+node=node0 epoch=76 source=node3 consumed=true commit=699e6f695b5d21fd6d4e80685c1cd552cc1a28a2ed42e5ac37d8b2dd3e8fae72 random=858efaa496adccd0
+node=node0 epoch=77 source=node2 consumed=true commit=99eecde8d83c8cf8b4268d1d3b3e346514780967e782989711ab6ea6cce2890b random=19c26c79262a5898
+node=node0 epoch=78 source=node0 consumed=true commit=d6b531e070dafee05f34bb66d2983f10604edfc460e78bc393231663932f15e4 random=0dbfe3e3166631e8
+node=node0 epoch=79 source=node2 consumed=true commit=ee5b6cd16df8f37101d9fdb60403906ce93d8d70bad97b4bd231731cd88cf9ed random=ecf08edb1fc02349
+node=node0 epoch=80 source=node1 consumed=true commit=f73912412af0e7e695002cc4be60f25e987b3cfb89d945b9d86125c0f20c3397 random=4aeaa05cdc930805
+node=node0 epoch=81 source=node2 consumed=true commit=cad078f1380276ee8925062e03b063274baf3d120965402fd7238aefdf167e06 random=8dc0ec650e6e6fd8
+node=node0 epoch=82 source=node3 consumed=true commit=d8520d100b8fd2e4746cee0ac4c8a40fe0e5e31bd91f1a26232a4972ba59685b random=cb630d8141aa2841
+node=node0 epoch=83 source=node1 consumed=true commit=e03e9ef05c8f19d8564629cb7c53c930ba6e232ae565f12765b2a0f588d8cceb random=6eddfcdeed3c0894
+node=node0 epoch=84 source=node2 consumed=true commit=76b53a6187b02de930d3a8933b8bb669651c6c7812c014d332a2e513db7b83cb random=2d1c7cb328a23969
+node=node0 epoch=85 source=node3 consumed=true commit=8553153263aa6a4e621f77aafb2e2b9c5a56a3c448fb1e3656bbd698b98460f8 random=044c196a26ed8101
+node=node0 epoch=86 source=node1 consumed=true commit=5d9ed4f8b04b9830c5e73ef38f311886d4ab3137f54f8f084c2d2f7d395110af random=28b77bbbfba1e98e
+periodic metrics beacons=61 throughput=732.09beacon/min sent_msgs=1284 recv_msgs=1263 sent=828.52KB recv=774.64KB bandwidth=320.67KB/s queue_total=8 queue_max=4 pvss_share_avg=1.460881ms pvss_verify_avg=596.907µs pvss_prerecon_avg=865.024µs pvss_recon_avg=172.319µs rbc_avg=23.068µs bls_sign_avg=239.824µs bls_verify_avg=2.983183ms bls_agg_avg=2.819741ms
+node=node0 epoch=87 source=node0 consumed=true commit=d1736d03efa3d983d86c59f9e9d76e57bfb76db73eaedcd07686b1da36ba0d55 random=20aded735c1cdb3f
+node=node0 epoch=88 source=node3 consumed=true commit=1d88ad8c245ec9ae20f4f041dbac9809a77ea0695bfccf991b096b6226ebaaf4 random=c28ca3e1c8a76e04
+node=node0 epoch=89 source=node0 consumed=true commit=67da407cb04104dfb4a1fa006494935a554521724dd481e0a572c7aa5aae1426 random=54e5630a412c43aa
+node=node0 epoch=90 source=node1 consumed=true commit=fcbacb8a79382588e94c452eb403a6707c9d3792d268bbc63829be502e0af346 random=317de7cfd64e4989
+node=node0 epoch=91 source=node2 consumed=true commit=838bd2ddd465ebeb3caa0108b912c9a3b9d015ef8afaf3e557610195f9aedabc random=2a9fd3b3e960ddd5
+node=node0 epoch=92 source=node1 consumed=true commit=ad4e836fbbec3b396e690daff680015e5a87a198507e8e4e1b64e559a51255f6 random=000f471fbeea7173
+node=node0 epoch=93 source=node2 consumed=true commit=555d8d09a234722b18fccd8490fe2ac5e56185f967192c5f8b01d301f71be33e random=5eca58451d119c34
+node=node0 epoch=94 source=node3 consumed=true commit=31fd3a6089a83442ace598d3b39b13299eeb952d862d17f609c492a6a2206678 random=7e543ab11ed1f6f5
+node=node0 epoch=95 source=node2 consumed=true commit=0a2619bc8b0c28f96f2c57069978a9671cc0ffc6037604be9a67f2d51f809dfb random=30deeb0a81776319
+node=node0 epoch=96 source=node3 consumed=true commit=4d7f963897d8772bd4acfb30624a3bac5707ddb8821871b47952323f447dd696 random=c6397e6ab6652f88
+node=node0 epoch=97 source=node2 consumed=true commit=c659be061d5483cf028128c32c3e8d3864de3b250432385ac7ffc0ceffc057aa random=6241f755a9d8e2be
+node=node0 epoch=98 source=node0 consumed=true commit=06501f6c4c67631790164e69b52b3e96447bf1d6e4019ce0ae97f6d3d7907815 random=e43b567d47d3e60e
+node=node0 epoch=99 source=node2 consumed=true commit=7b3dd6857a6111c862cc1fe221ff6ff536cf0ffef1257d200b61e93f144346ad random=3deb3c4beb7b7ed8
+final metrics beacons=100 throughput=371.65beacon/min sent_msgs=2236 recv_msgs=2208 sent=1415.65KB recv=1342.18KB bandwidth=170.82KB/s queue_total=12 queue_max=4 pvss_share_avg=1.473983ms pvss_verify_avg=597.379µs pvss_prerecon_avg=873.827µs pvss_recon_avg=173.736µs rbc_avg=146.838µs bls_sign_avg=239.698µs bls_verify_avg=2.985548ms bls_agg_avg=2.846226ms
+periodic metrics beacons=13 throughput=155.99beacon/min sent_msgs=316 recv_msgs=323 sent=182.43KB recv=191.93KB bandwidth=74.87KB/s queue_total=16 queue_max=4 pvss_share_avg=1.486408ms pvss_verify_avg=605.564µs pvss_prerecon_avg=820.75µs pvss_recon_avg=174.064µs rbc_avg=23.158µs bls_sign_avg=234.515µs bls_verify_avg=2.991657ms bls_agg_avg=3.016665ms
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+periodic metrics beacons=0 throughput=0.00beacon/min sent_msgs=0 recv_msgs=0 sent=0.00KB recv=0.00KB bandwidth=0.00KB/s queue_total=16 queue_max=4 pvss_share_avg=0s pvss_verify_avg=0s pvss_prerecon_avg=0s pvss_recon_avg=0s rbc_avg=0s bls_sign_avg=0s bls_verify_avg=0s bls_agg_avg=0s
+	Command being timed: "./bin/asyrand -config benchmark/generated/aws_n4/asyrand.json -transport tcp -node node0"
+	User time (seconds): 3.71
+	System time (seconds): 0.14
+	Percent of CPU this job got: 2%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:16.14
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9700
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3145
+	Voluntary context switches: 32260
+	Involuntary context switches: 42
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

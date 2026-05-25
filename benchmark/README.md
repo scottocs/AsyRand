@@ -27,11 +27,29 @@ cd benchmark
 .\.venv\Scripts\fab logs
 ```
 
-AWS orchestration is not ported yet. The task is present, but it fails explicitly instead of calling a shell runner:
+AWS orchestration builds Linux binaries locally, uploads only those binaries plus generated configs to the EC2 nodes, and runs them over TCP:
 
 ```powershell
 cd benchmark
-.\.venv\Scripts\fab aws --machines=4 --nodes=8 --epochs=200
+.\.venv\Scripts\fab aws --nodes=4 --epochs=200
 ```
 
-The `local` Fabric task is a Python runner and does not call `scripts/*.sh`. The `aws` Fabric task intentionally fails until the AWS runner is ported, so it does not silently fall back to shell scripts.
+The `local` and `aws` Fabric tasks are Python runners and do not call `scripts/*.sh`. The AWS runner uses `settings.json` for `key.name`, `key.path`, instance type, and regions.
+By default, `fab aws` cross-compiles with `GOOS=linux`, `GOARCH=amd64`, and `CGO_ENABLED=0`. Override these with `AWS_GOOS`, `AWS_GOARCH`, and `AWS_CGO_ENABLED` if your EC2 fleet uses a different target.
+If a previous AWS run with the same `--nodes` and `--epochs` is incomplete, a later `fab aws` invocation reuses that run directory and its `aws_state.env` host list. Pass `--out=...` to force a specific directory.
+AWS per-epoch timeout defaults to `60s * ceil(nodes / 4)`, so larger deployments do not fail on the old fixed 60s timeout. Override with `EPOCH_TIMEOUT_MS` when you need a specific value.
+
+## AWS Nodes
+
+AWS node lifecycle tasks use `settings.json` by default:
+
+```powershell
+cd benchmark
+.\.venv\Scripts\fab create --nodes=1
+.\.venv\Scripts\fab info
+.\.venv\Scripts\fab stop
+.\.venv\Scripts\fab start --max=10
+.\.venv\Scripts\fab destroy
+```
+
+`create --nodes=1` means one EC2 instance per region listed in `settings.json`. It waits for the instances to reach `running` and pass AWS status checks. The AWS `KeyName` must already exist in every configured region, and `key.path` must point to its local private key.

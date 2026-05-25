@@ -243,13 +243,21 @@ func runTCP(opts runOptions) error {
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
+	if completed := node.CompletedEpoch(); completed > 0 {
+		prefilled := completed
+		if prefilled > uint64(opts.epochs) {
+			prefilled = uint64(opts.epochs)
+		}
+		stats.beacons.Add(prefilled)
+		fmt.Printf("node=%s prefilled_epochs=%d counted=%d\n", opts.nodeID, completed, prefilled)
+	}
 
-	for epoch := 1; epoch <= opts.epochs; epoch++ {
+	for counted := int(stats.beacons.Load()); counted < opts.epochs; counted++ {
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
-		beacon, err := node.RunEpochAt(epochCtx, uint64(epoch))
+		beacon, err := node.RunEpoch(epochCtx)
 		cancelEpoch()
 		if err != nil {
-			return fmt.Errorf("epoch %d: %w", epoch, err)
+			return fmt.Errorf("epoch %d: %w", counted+1, err)
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
