@@ -9,6 +9,7 @@ benchmark/generated/*
 !/benchmark/runs/**/*.csv
 !/benchmark/runs/**/**/*.log
 /benchmark/runs/**/build/*
+!/benchmark/runs/*.html
 !benchmark/generated/.gitkeep
 !benchmark/runs/.gitkeep
 pems/
