@@ -35,6 +35,14 @@ type BeaconCommitment struct {
 	CM2    string     `json:"cm2"`
 }
 
+type VerifiedBeaconCommitment struct {
+	Signer      p2p.NodeID
+	Commitment  BeaconCommitment
+	PublicShare kyber.Point
+	CM1         kyber.Point
+	CM2         kyber.Point
+}
+
 type BeaconDLEQProof struct {
 	A1        string `json:"a1"`
 	A2        string `json:"a2"`
@@ -129,27 +137,50 @@ func NewBeaconCommitment(signer p2p.NodeID, secretShare string) (BeaconCommitmen
 }
 
 func VerifyBeaconCommitment(publicShare string, commitment BeaconCommitment) bool {
+	_, ok := DecodeAndVerifyBeaconCommitment(publicShare, commitment)
+	return ok
+}
+
+func DecodeAndVerifyBeaconCommitment(publicShare string, commitment BeaconCommitment) (*VerifiedBeaconCommitment, bool) {
 	group := suite()
 	pk, err := pointG1FromHex(publicShare)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	cm1, err := pointG1FromHex(commitment.CM1)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	cm2, err := pointG2FromHex(commitment.CM2)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	left := group.Pair(pk, hPoint(group))
 	right := group.GT().Point().Add(group.Pair(cm1, hPoint(group)), group.Pair(gPoint(group), cm2))
-	return left.Equal(right)
+	if !left.Equal(right) {
+		return nil, false
+	}
+	return &VerifiedBeaconCommitment{
+		Signer:      commitment.Signer,
+		Commitment:  commitment,
+		PublicShare: pk,
+		CM1:         cm1,
+		CM2:         cm2,
+	}, true
 }
 
 func NewBeaconShare(epoch uint64, msg []byte, signer p2p.NodeID, secretShare string, alpha kyber.Scalar) (BeaconShare, error) {
+	group := suite()
+	cm1 := group.G1().Point().Mul(alpha, gPoint(group))
+	return NewBeaconShareWithCommitment(epoch, msg, signer, secretShare, alpha, cm1)
+}
+
+func NewBeaconShareWithCommitment(epoch uint64, msg []byte, signer p2p.NodeID, secretShare string, alpha kyber.Scalar, cm1 kyber.Point) (BeaconShare, error) {
 	if alpha == nil {
 		return BeaconShare{}, errors.New("nil beacon commitment alpha")
+	}
+	if cm1 == nil {
+		return BeaconShare{}, errors.New("nil beacon commitment cm1")
 	}
 	group := suite()
 	sk, err := pointG2FromHex(secretShare)
@@ -159,7 +190,7 @@ func NewBeaconShare(epoch uint64, msg []byte, signer p2p.NodeID, secretShare str
 	gr := hashToG1(group, msg)
 	sigma1 := group.G1().Point().Mul(alpha, gr)
 	sigma2 := group.Pair(gr, sk)
-	proof := proveBeaconDLEQ(group, msg, alpha, sigma1)
+	proof := proveBeaconDLEQ(group, msg, alpha, cm1, sigma1)
 	return BeaconShare{
 		Epoch: epoch, Signer: signer, Sigma1: mustPointHex(sigma1),
 		Sigma2: mustPointHexGT(sigma2), Proof: proof,
@@ -170,7 +201,15 @@ func VerifyBeaconShare(msg []byte, publicShare string, commitment BeaconCommitme
 	if share.Signer == "" || share.Signer != commitment.Signer {
 		return false
 	}
-	if !VerifyBeaconCommitment(publicShare, commitment) {
+	verified, ok := DecodeAndVerifyBeaconCommitment(publicShare, commitment)
+	if !ok {
+		return false
+	}
+	return VerifyBeaconShareWithCommitment(msg, verified, share)
+}
+
+func VerifyBeaconShareWithCommitment(msg []byte, commitment *VerifiedBeaconCommitment, share BeaconShare) bool {
+	if commitment == nil || share.Signer == "" || share.Signer != commitment.Signer {
 		return false
 	}
 	group := suite()
@@ -182,15 +221,11 @@ func VerifyBeaconShare(msg []byte, publicShare string, commitment BeaconCommitme
 	if err != nil {
 		return false
 	}
-	cm2, err := pointG2FromHex(commitment.CM2)
-	if err != nil {
-		return false
-	}
 	gr := hashToG1(group, msg)
-	if !verifyBeaconDLEQ(group, msg, commitment.CM1, sigma1, share.Proof) {
+	if !verifyBeaconDLEQWithCM1(group, msg, commitment.CM1, sigma1, share.Proof) {
 		return false
 	}
-	right := group.GT().Point().Add(group.Pair(gr, cm2), group.Pair(sigma1, hPoint(group)))
+	right := group.GT().Point().Add(group.Pair(gr, commitment.CM2), group.Pair(sigma1, hPoint(group)))
 	return sigma2.Equal(right)
 }
 
@@ -262,12 +297,11 @@ func hashToG1(group interface {
 
 func proveBeaconDLEQ(group interface {
 	G1() kyber.Group
-}, msg []byte, alpha kyber.Scalar, sigma1 kyber.Point) BeaconDLEQProof {
+}, msg []byte, alpha kyber.Scalar, cm1 kyber.Point, sigma1 kyber.Point) BeaconDLEQProof {
 	gr := hashToG1(group, msg)
 	nonce := group.G1().Scalar().Pick(suite().RandomStream())
 	a1 := group.G1().Point().Mul(nonce, gPoint(suite()))
 	a2 := group.G1().Point().Mul(nonce, gr)
-	cm1 := group.G1().Point().Mul(alpha, gPoint(suite()))
 	challenge := beaconDLEQChallenge(group, msg, cm1, sigma1, a1, a2)
 	response := group.G1().Scalar().Sub(nonce, group.G1().Scalar().Mul(challenge, alpha))
 	return BeaconDLEQProof{
@@ -283,6 +317,12 @@ func verifyBeaconDLEQ(group interface {
 	if err != nil {
 		return false
 	}
+	return verifyBeaconDLEQWithCM1(group, msg, cm1, sigma1, proof)
+}
+
+func verifyBeaconDLEQWithCM1(group interface {
+	G1() kyber.Group
+}, msg []byte, cm1 kyber.Point, sigma1 kyber.Point, proof BeaconDLEQProof) bool {
 	a1, err := pointG1FromHex(proof.A1)
 	if err != nil {
 		return false

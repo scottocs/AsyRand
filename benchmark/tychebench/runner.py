@@ -27,6 +27,7 @@ class LocalOptions:
     protocols: list[str]
     out_root: Path
     fault_threshold: int
+    grandline_fault_threshold: int
     queue_len: int = 8
     producer_ms: int = 250
     prefill_ms: int = 3000
@@ -418,6 +419,7 @@ def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
         protocols=protocol_list,
         out_root=output.resolve(),
         fault_threshold=(n - 1) // 3 if fault_threshold is None else fault_threshold,
+        grandline_fault_threshold=int(os.environ.get("GRANDLINE_F", str((n - 1) // 2))),
         queue_len=int(os.environ.get("QUEUE_LEN", "8")),
         producer_ms=int(os.environ.get("PRODUCER_MS", "250")),
         prefill_ms=int(os.environ.get("PREFILL_MS", "3000")),

@@ -38,7 +38,7 @@ type Node struct {
 	roundMu       sync.Mutex
 	rounds        map[string]*roundState
 	pendingShares map[string][]shareMessage
-	commitments   map[p2p.NodeID]asig.BeaconCommitment
+	commitments   map[p2p.NodeID]*asig.VerifiedBeaconCommitment
 	commitAlpha   kyber.Scalar
 	commitSent    bool
 
@@ -93,7 +93,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public, Transport: cfg.Transport, Perf: &PerfMetrics{},
 		State: state, PVSS: cfg.PVSS, Crypto: cryptoexec.New(cfg.CryptoWorkers), GRand: cfg.GRand,
 		rounds: make(map[string]*roundState), pendingShares: make(map[string][]shareMessage),
-		commitments: make(map[p2p.NodeID]asig.BeaconCommitment),
+		commitments: make(map[p2p.NodeID]*asig.VerifiedBeaconCommitment),
 		beacons:     make(chan *Beacon, state.N*4),
 	}, nil
 }
@@ -131,7 +131,11 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 	st := n.ensureRoundState(key, epoch, msg)
 
 	signStart := time.Now()
-	share, err := asig.NewBeaconShare(epoch, msg, n.ID, n.GRand.SecretShare, n.commitAlpha)
+	commitment, ok := n.commitmentFor(n.ID)
+	if !ok {
+		return nil, errors.New("local beacon commitment is not available")
+	}
+	share, err := asig.NewBeaconShareWithCommitment(epoch, msg, n.ID, n.GRand.SecretShare, n.commitAlpha, commitment.CM1)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +221,13 @@ func (n *Node) ensureCommitment(ctx context.Context) error {
 		n.roundMu.Unlock()
 		return err
 	}
-	n.commitments[n.ID] = commitment
+	publicShare := n.GRand.PublicShares[n.ID]
+	verified, ok := asig.DecodeAndVerifyBeaconCommitment(publicShare, commitment)
+	if !ok {
+		n.roundMu.Unlock()
+		return errors.New("generated invalid beacon commitment")
+	}
+	n.commitments[n.ID] = verified
 	n.commitAlpha = alpha
 	n.commitSent = true
 	n.roundMu.Unlock()
@@ -237,12 +247,13 @@ func (n *Node) handleCommitment(msg p2p.Message) error {
 		commitment.Signer = msg.From
 	}
 	publicShare := n.GRand.PublicShares[commitment.Signer]
-	if publicShare == "" || !asig.VerifyBeaconCommitment(publicShare, commitment) {
+	verified, ok := asig.DecodeAndVerifyBeaconCommitment(publicShare, commitment)
+	if publicShare == "" || !ok {
 		return nil
 	}
 	n.roundMu.Lock()
 	if _, exists := n.commitments[commitment.Signer]; !exists {
-		n.commitments[commitment.Signer] = commitment
+		n.commitments[commitment.Signer] = verified
 	}
 	keys := make([]string, 0, len(n.rounds))
 	for key := range n.rounds {
@@ -263,26 +274,36 @@ func (n *Node) recordShare(st *roundState, payload shareMessage) {
 	if payload.Share.Signer == "" || payload.Share.Sigma1 == "" || payload.Share.Sigma2 == "" {
 		return
 	}
-	commitment, ok := n.commitmentFor(payload.Share.Signer)
-	if !ok {
-		n.roundMu.Lock()
-		n.pendingShares[roundKey(st.epoch)] = append(n.pendingShares[roundKey(st.epoch)], payload)
+	n.roundMu.Lock()
+	if st.delivered || st.recovering {
 		n.roundMu.Unlock()
 		return
 	}
-	publicShare := n.GRand.PublicShares[payload.Share.Signer]
-	if publicShare == "" {
+	n.roundMu.Unlock()
+	commitment, ok := n.commitmentFor(payload.Share.Signer)
+	if !ok {
+		n.roundMu.Lock()
+		if !st.delivered && !st.recovering {
+			n.pendingShares[roundKey(st.epoch)] = append(n.pendingShares[roundKey(st.epoch)], payload)
+		}
+		n.roundMu.Unlock()
 		return
 	}
 	msg := append([]byte(nil), st.msg...)
 	n.Crypto.Go(context.Background(), func() {
-		n.verifyAndRecordShare(st, payload, publicShare, commitment, msg)
+		n.verifyAndRecordShare(st, payload, commitment, msg)
 	})
 }
 
-func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, publicShare string, commitment asig.BeaconCommitment, msg []byte) {
+func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commitment *asig.VerifiedBeaconCommitment, msg []byte) {
+	n.roundMu.Lock()
+	if st.delivered || st.recovering {
+		n.roundMu.Unlock()
+		return
+	}
+	n.roundMu.Unlock()
 	acceptStart := time.Now()
-	if !asig.VerifyBeaconShare(msg, publicShare, commitment, payload.Share) {
+	if !asig.VerifyBeaconShareWithCommitment(msg, commitment, payload.Share) {
 		return
 	}
 	if n.Perf != nil {
@@ -352,7 +373,7 @@ func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, public
 	}
 }
 
-func (n *Node) commitmentFor(id p2p.NodeID) (asig.BeaconCommitment, bool) {
+func (n *Node) commitmentFor(id p2p.NodeID) (*asig.VerifiedBeaconCommitment, bool) {
 	n.roundMu.Lock()
 	defer n.roundMu.Unlock()
 	commitment, ok := n.commitments[id]
@@ -364,7 +385,7 @@ func (n *Node) commitmentSnapshot() map[p2p.NodeID]asig.BeaconCommitment {
 	defer n.roundMu.Unlock()
 	out := make(map[p2p.NodeID]asig.BeaconCommitment, len(n.commitments))
 	for id, commitment := range n.commitments {
-		out[id] = commitment
+		out[id] = commitment.Commitment
 	}
 	return out
 }
