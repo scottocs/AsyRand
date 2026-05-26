@@ -111,12 +111,40 @@ def _default_vpc(client):
     return vpcs[0]["VpcId"]
 
 
-def _default_subnet(client):
+def _supported_availability_zones(client, instance_type):
+    response = client.describe_instance_type_offerings(
+        LocationType="availability-zone",
+        Filters=[{"Name": "instance-type", "Values": [instance_type]}],
+    )
+    return {
+        offering["Location"]
+        for offering in response.get("InstanceTypeOfferings", [])
+        if offering.get("Location")
+    }
+
+
+def _default_subnets(client, instance_type=None):
     response = client.describe_subnets(Filters=[{"Name": "default-for-az", "Values": ["true"]}])
-    subnets = response.get("Subnets", [])
+    subnets = sorted(response.get("Subnets", []), key=lambda subnet: subnet.get("AvailabilityZone", ""))
     if not subnets:
         raise BenchError(f"no default subnet in region {client.meta.region_name}")
-    return subnets[0]["SubnetId"]
+    if instance_type:
+        supported_zones = _supported_availability_zones(client, instance_type)
+        supported_subnets = [
+            subnet for subnet in subnets if subnet.get("AvailabilityZone") in supported_zones
+        ]
+        if supported_subnets:
+            return supported_subnets
+        zones = ", ".join(sorted(supported_zones)) or "none"
+        raise BenchError(
+            f"no default subnet in {client.meta.region_name} supports {instance_type}; "
+            f"supported availability zones: {zones}"
+        )
+    return subnets
+
+
+def _default_subnet(client, instance_type=None):
+    return _default_subnets(client, instance_type)[0]["SubnetId"]
 
 
 def _ensure_security_group(region, settings):
@@ -254,18 +282,24 @@ def _public_key_material(key_path):
     return public_key
 
 
-def create_instances(nodes=1, settings_file=None):
-    settings = load_settings(settings_file)
-    nodes = int(nodes)
-    if nodes <= 0:
-        raise BenchError("nodes must be positive")
+def _is_retryable_launch_error(exc):
+    if not isinstance(exc, ClientError):
+        return False
+    code = exc.response.get("Error", {}).get("Code")
+    return code in {
+        "InsufficientInstanceCapacity",
+        "Unsupported",
+        "UnsupportedOperation",
+    }
 
-    created = []
-    print(f"Creating {nodes} instance(s) per region across {len(settings.regions)} region(s)")
-    for region in settings.regions:
-        client = _client(region)
-        sg_id = _ensure_security_group(region, settings)
-        _ensure_key_pair(region, settings)
+
+def _launch_instances(client, region, settings, nodes, sg_id):
+    last_exc = None
+    attempted = []
+    for subnet in _default_subnets(client, settings.instance_type):
+        subnet_id = subnet["SubnetId"]
+        zone = subnet.get("AvailabilityZone", subnet_id)
+        attempted.append(zone)
         try:
             response = client.run_instances(
                 ImageId=_latest_ubuntu_ami(region),
@@ -274,7 +308,7 @@ def create_instances(nodes=1, settings_file=None):
                 MinCount=nodes,
                 MaxCount=nodes,
                 SecurityGroupIds=[sg_id],
-                SubnetId=_default_subnet(client),
+                SubnetId=subnet_id,
                 BlockDeviceMappings=[
                     {
                         "DeviceName": "/dev/sda1",
@@ -296,9 +330,41 @@ def create_instances(nodes=1, settings_file=None):
                     }
                 ],
             )
+            if len(attempted) > 1:
+                print(f"{region}: launched in {zone} after trying {', '.join(attempted[:-1])}")
+            return response
+        except (ClientError, BotoCoreError, ResponseParserError) as exc:
+            if not _is_retryable_launch_error(exc):
+                raise
+            last_exc = exc
+            print(f"{region}: launch failed in {zone}: {_aws_error(exc)}; trying next AZ")
+
+    zones = ", ".join(attempted) or "none"
+    raise BenchError(
+        f"failed to launch instances in {region}: tried availability zones {zones}; "
+        f"last error: {_aws_error(last_exc)}"
+    ) from last_exc
+
+
+def create_instances(nodes=1, settings_file=None):
+    settings = load_settings(settings_file)
+    nodes = int(nodes)
+    if nodes <= 0:
+        raise BenchError("nodes must be positive")
+
+    created = []
+    print(f"Creating {nodes} instance(s) per region across {len(settings.regions)} region(s)")
+    for region in settings.regions:
+        client = _client(region)
+        sg_id = _ensure_security_group(region, settings)
+        _ensure_key_pair(region, settings)
+        try:
+            response = _launch_instances(client, region, settings, nodes, sg_id)
             ids = [instance["InstanceId"] for instance in response.get("Instances", [])]
             created.extend((region, instance_id) for instance_id in ids)
             print(f"{region}: launched {len(ids)} instance(s)")
+        except BenchError:
+            raise
         except (ClientError, BotoCoreError, ResponseParserError) as exc:
             raise BenchError(f"failed to launch instances in {region}: {_aws_error(exc)}") from exc
 
