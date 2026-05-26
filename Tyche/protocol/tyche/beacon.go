@@ -269,7 +269,7 @@ func NewNode(cfg Config) (*Node, error) {
 		F:             f,
 		RPrev:         seed,
 		SCL:           append([]p2p.NodeID(nil), members...),
-		RSQ:           make([]p2p.NodeID, 0, f),
+		RSQ:           make([]p2p.NodeID, 0, 2*f),
 		ComQ:          make(map[p2p.NodeID]map[uint64]Object),
 		Seqs:          make(map[p2p.NodeID]uint64),
 		RmMark:        make(map[p2p.NodeID]int64),
@@ -913,7 +913,7 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 			p.Decided = true
 			p.Decision = st.Value
 			if !st.Value && n.State.RmMark[p.Source] == -1 {
-				n.State.RmMark[p.Source] = int64(p.Epoch + uint64(n.State.F))
+				n.markRemovalLocked(p.Source, p.Epoch)
 			}
 			delete(n.State.PendingABAs, inst)
 			delete(n.abaInputSent, inst)
@@ -1407,7 +1407,7 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 			p.Decided = true
 			p.Decision = st.Value
 			if !st.Value && n.State.RmMark[p.Source] == -1 {
-				n.State.RmMark[p.Source] = int64(p.Epoch + uint64(n.State.F))
+				n.markRemovalLocked(p.Source, p.Epoch)
 			}
 			delete(n.State.PendingABAs, feed.instance)
 			delete(n.abaInputSent, feed.instance)
@@ -1432,7 +1432,8 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 
 func (n *Node) rotateSourcesLocked(epoch uint64, source p2p.NodeID, seq uint64) {
 	var old p2p.NodeID
-	if len(n.State.RSQ) >= n.State.F && len(n.State.RSQ) > 0 {
+	window := n.exclusionWindowLocked()
+	if window > 0 && len(n.State.RSQ) >= window && len(n.State.RSQ) > 0 {
 		old = n.State.RSQ[0]
 		n.State.RSQ = append([]p2p.NodeID(nil), n.State.RSQ[1:]...)
 		if n.State.RmMark[old] != -1 && epoch >= uint64(n.State.RmMark[old]) {
@@ -1441,12 +1442,20 @@ func (n *Node) rotateSourcesLocked(epoch uint64, source p2p.NodeID, seq uint64) 
 			n.State.SCL = append(n.State.SCL, old)
 		}
 	}
-	if !contains(n.State.RSQ, source) {
+	if window > 0 && !contains(n.State.RSQ, source) {
 		n.State.RSQ = append(n.State.RSQ, source)
+		n.State.SCL = removeID(n.State.SCL, source)
 	}
-	n.State.SCL = removeID(n.State.SCL, source)
 	n.State.Seqs[source] = seq
 	delete(n.State.ComQ[source], seq)
+}
+
+func (n *Node) exclusionWindowLocked() int {
+	return 2 * n.State.F
+}
+
+func (n *Node) markRemovalLocked(source p2p.NodeID, epoch uint64) {
+	n.State.RmMark[source] = int64(epoch + uint64(n.exclusionWindowLocked()))
 }
 
 func (n *Node) refillSCLLocked() {
@@ -1458,10 +1467,11 @@ func (n *Node) refillSCLLocked() {
 }
 
 func (n *Node) cleanupCertifiedStateLocked(epoch uint64) {
-	if epoch <= uint64(n.State.F+2) {
+	keepSeeds := uint64(n.exclusionWindowLocked() + 2)
+	if epoch <= keepSeeds {
 		return
 	}
-	minSeed := epoch - uint64(n.State.F+2)
+	minSeed := epoch - keepSeeds
 	for e := range n.beaconSeeds {
 		if e < minSeed {
 			delete(n.beaconSeeds, e)
@@ -1583,7 +1593,7 @@ func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 		p.Decided = true
 		p.Decision = dec.Value
 		if !dec.Value && n.State.RmMark[p.Source] == -1 {
-			n.State.RmMark[p.Source] = int64(p.Epoch + uint64(n.State.F))
+			n.markRemovalLocked(p.Source, p.Epoch)
 		}
 		delete(n.State.PendingABAs, dec.Instance)
 		delete(n.abaInputSent, dec.Instance)

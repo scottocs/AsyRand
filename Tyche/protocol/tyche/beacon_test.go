@@ -640,12 +640,12 @@ func TestMarkedSourceRemovedWhenRSQExpires(t *testing.T) {
 	node := nodes[0]
 
 	node.mu.Lock()
-	node.State.RSQ = []p2p.NodeID{"n0"}
-	node.State.SCL = []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	node.State.RmMark["n0"] = 2
+	node.State.RSQ = []p2p.NodeID{"n0", "n2"}
+	node.State.SCL = []p2p.NodeID{"n1", "n3"}
+	node.State.RmMark["n0"] = 3
 	node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
 	node.State.Seqs["n0"] = 1
-	node.rotateSourcesLocked(2, "n1", 1)
+	node.rotateSourcesLocked(3, "n1", 1)
 	members := append([]p2p.NodeID(nil), node.State.Members...)
 	scl := append([]p2p.NodeID(nil), node.State.SCL...)
 	rsq := append([]p2p.NodeID(nil), node.State.RSQ...)
