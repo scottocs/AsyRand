@@ -123,6 +123,7 @@ type churnCluster struct {
 	stopped   map[p2p.NodeID]bool
 	cancels   map[p2p.NodeID]context.CancelFunc
 	pvssEpoch uint64
+	pvss      string
 }
 
 type churnResult struct {
@@ -243,7 +244,11 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 	for i := range ids {
 		ids[i] = p2p.NodeID(fmt.Sprintf("node%d", i))
 	}
-	pp, keys, err := crypto.Setup("churn-config-0", f+1, ids)
+	pvss := os.Getenv("TYCHE_CHURN_PVSS")
+	if pvss == "" {
+		pvss = crypto.PVSSO1
+	}
+	pp, keys, err := crypto.SetupPVSS(pvss, "churn-config-0", f+1, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,14 +258,15 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 		active:  make(map[p2p.NodeID]bool, n),
 		stopped: make(map[p2p.NodeID]bool, n),
 		cancels: make(map[p2p.NodeID]context.CancelFunc, n),
+		pvss:    pvss,
 	}
 	blsPublic := defaultBLSPublic(ids)
 	for _, id := range ids {
-		scheme, err := crypto.NewScheme(id, keys[id].Private, pp)
+		scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 64, PVSS: scheme, BLSPublic: blsPublic, Transport: c.net.NewTransport(id, 32768)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 64, PVSS: scheme, PVSSBackend: pvss, BLSPublic: blsPublic, Transport: c.net.NewTransport(id, 32768)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -438,11 +444,11 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	targetF := (len(targetMembers) - 1) / 3
 
 	c.pvssEpoch++
-	pp, keys, err := crypto.Setup(fmt.Sprintf("churn-config-%d", c.pvssEpoch), targetF+1, targetMembers)
+	pp, keys, err := crypto.SetupPVSS(c.pvss, fmt.Sprintf("churn-config-%d", c.pvssEpoch), targetF+1, targetMembers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	joinerScheme, err := crypto.NewScheme(joiner, keys[joiner].Private, pp)
+	joinerScheme, err := crypto.NewPVSSScheme(joiner, keys[joiner].Private, pp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +480,7 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, c.nodes[signer], tau, rho, activation))
 	}
 	for _, node := range c.activeNodes() {
-		node.RegisterPVSSKey(pp.Epoch, keys[node.ID].Private)
+		node.RegisterPVSSKey(pp.Epoch(), keys[node.ID].Private)
 		if err := node.InstallJoinCertificate(cert); err != nil {
 			t.Fatal(err)
 		}
@@ -487,11 +493,11 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	return true
 }
 
-func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PublicParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
+func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PVSSParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
 	t.Helper()
 	blsPublic := defaultBLSPublic(members)
 	for _, node := range c.activeNodes() {
-		scheme, err := crypto.NewScheme(node.ID, keys[node.ID].Private, pp)
+		scheme, err := crypto.NewPVSSScheme(node.ID, keys[node.ID].Private, pp)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -502,9 +508,9 @@ func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PublicParams, keys ma
 	}
 }
 
-func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2p.NodeID, members []p2p.NodeID, pp crypto.PublicParams, keys map[p2p.NodeID]crypto.KeyPair) {
+func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2p.NodeID, members []p2p.NodeID, pp crypto.PVSSParams, keys map[p2p.NodeID]crypto.KeyPair) {
 	t.Helper()
-	scheme, err := crypto.NewScheme(id, keys[id].Private, pp)
+	scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +518,7 @@ func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2
 	ref.mu.Lock()
 	f := ref.State.F
 	ref.mu.Unlock()
-	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 64, PVSS: scheme, BLSPublic: defaultBLSPublic(members), Transport: c.net.NewTransport(id, 32768)})
+	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 64, PVSS: scheme, PVSSBackend: c.pvss, BLSPublic: defaultBLSPublic(members), Transport: c.net.NewTransport(id, 32768)})
 	if err != nil {
 		t.Fatal(err)
 	}

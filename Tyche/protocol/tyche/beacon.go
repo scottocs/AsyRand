@@ -71,7 +71,8 @@ type Config struct {
 	RemovalExpiration time.Duration
 	ConfigVersion     uint64
 	InitialRandom     []byte
-	PVSS              *crypto.SilentSetupScheme
+	PVSS              crypto.PVSSScheme
+	PVSSBackend       string
 	PVSSKeys          map[string]kyber.Scalar
 	CryptoWorkers     int
 	// BLS and BLSPublic are only for READY certificate compression. They are
@@ -147,7 +148,7 @@ type signedReconReadyMessage struct {
 type Node struct {
 	ID        p2p.NodeID
 	Transport p2p.Transport
-	PVSS      *crypto.SilentSetupScheme
+	PVSS      crypto.PVSSScheme
 	Perf      *PerfMetrics
 	// BLS state supports the READY aggregate certificate attached to each
 	// certified beacon. It is deliberately separate from the PVSS scheme so the
@@ -182,6 +183,7 @@ type Node struct {
 	abaInputs    map[string]bool
 	lockedFrom   uint64
 	pvssKeys     map[string]kyber.Scalar
+	pvssBackend  string
 	beaconSeeds  map[uint64][]byte
 	verified     map[string]verifiedObject
 	producerLow  int
@@ -239,6 +241,10 @@ func NewNode(cfg Config) (*Node, error) {
 	removalWait := cfg.RemovalExpiration
 	if removalWait <= 0 {
 		removalWait = 5 * time.Second
+	}
+	pvssBackend := cfg.PVSSBackend
+	if pvssBackend == "" {
+		pvssBackend = crypto.PVSSO1
 	}
 	seed := append([]byte(nil), cfg.InitialRandom...)
 	if len(seed) == 0 {
@@ -299,6 +305,7 @@ func NewNode(cfg Config) (*Node, error) {
 		beaconSeeds:  make(map[uint64][]byte),
 		verified:     make(map[string]verifiedObject),
 		pvssKeys:     make(map[string]kyber.Scalar),
+		pvssBackend:  pvssBackend,
 		producerLow:  low,
 		producerHigh: high,
 		removalWait:  removalWait,
@@ -315,8 +322,8 @@ func NewNode(cfg Config) (*Node, error) {
 			n.pvssKeys[epoch] = key.Clone()
 		}
 	}
-	if current := cfg.PVSS.Params(); current.Epoch != "" && cfg.PVSS.PrivateKey() != nil {
-		n.pvssKeys[current.Epoch] = cfg.PVSS.PrivateKey()
+	if epoch := cfg.PVSS.Epoch(); epoch != "" && cfg.PVSS.PrivateKey() != nil {
+		n.pvssKeys[epoch] = cfg.PVSS.PrivateKey()
 	}
 	return n, nil
 }
@@ -1129,10 +1136,11 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	if err := n.ensureVerified(obj); err != nil {
 		return err
 	}
-	// ReconVerified still verifies each decryption proof; it only reuses the local
-	// commitment verification performed before the object was accepted into comq.
+	// These shares were inserted into n.recon only after this node verified
+	// their decryption proofs in handleRecon, so reconstruction can reuse that
+	// local validation instead of checking the same proofs again.
 	start = time.Now()
-	secret, err := n.PVSS.ReconVerified(obj.Commitment, shares)
+	secret, err := n.PVSS.ReconFromVerifiedShares(obj.Commitment, shares)
 	if n.Perf != nil {
 		n.Perf.addPVSSRecon(time.Since(start))
 	}
@@ -1541,7 +1549,7 @@ func (n *Node) installRemovalPVSSLocked() {
 		return
 	}
 	epoch := fmt.Sprintf("Tyche-v1/removal-config/%d/%v", n.State.ConfigVersion, n.State.Members)
-	pp, keys, err := crypto.Setup(epoch, n.State.F+1, n.State.Members)
+	pp, keys, err := crypto.SetupPVSS(n.pvssBackend, epoch, n.State.F+1, n.State.Members)
 	if err != nil {
 		return
 	}
@@ -1549,12 +1557,12 @@ func (n *Node) installRemovalPVSSLocked() {
 	if key.Private == nil {
 		return
 	}
-	scheme, err := crypto.NewScheme(n.ID, key.Private, pp)
+	scheme, err := crypto.NewPVSSScheme(n.ID, key.Private, pp)
 	if err != nil {
 		return
 	}
 	n.PVSS = scheme
-	n.pvssKeys[pp.Epoch] = key.Private.Clone()
+	n.pvssKeys[pp.Epoch()] = key.Private.Clone()
 }
 
 func (n *Node) resetConfigurationCachesLocked() {

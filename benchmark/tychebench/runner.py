@@ -214,7 +214,7 @@ def _run_protocol(protocol, options):
     go = _go_executable()
     log_file = options.out_root / protocol / "local.log"
 
-    if protocol == "tyche":
+    if protocol in {"tyche", "tyche-scrape"}:
         command = [
             go,
             "run",
@@ -240,13 +240,16 @@ def _run_protocol(protocol, options):
             "-max-pool",
             str(options.max_pool),
         ]
+        if protocol == "tyche-scrape":
+            command.extend(["-pvss", "scrape"])
         return _run_logged(command, REPO_ROOT / "Tyche", log_file, _run_env("tyche", options.gomaxprocs))
 
-    if protocol == "tyche-reconfig":
+    if protocol in {"tyche-reconfig", "tyche-scrape-reconfig"}:
         env = _run_env("tyche", options.gomaxprocs)
         env.update(
             {
                 "TYCHE_RECONFIG_BENCH_TEST": "1",
+                "TYCHE_CHURN_PVSS": "scrape" if protocol == "tyche-scrape-reconfig" else "o1",
                 "TYCHE_CHURN_EPOCHS": str(options.epochs),
                 "TYCHE_CHURN_RECONFIG_EVENTS": os.environ.get(
                     "TYCHE_RECONFIG_EVENTS", str(options.epochs // 20)

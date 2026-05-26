@@ -35,7 +35,11 @@ func TestSilentSetupPVSSVerifyPreReconAndRecon(t *testing.T) {
 		t.Fatal("tampered pvss object verified")
 	}
 	for i, c1 := range commit.C1 {
-		if c1.Group != "GT" || c1.Value == "" {
+		wantGroup := "G2"
+		if i < 2 {
+			wantGroup = "G1"
+		}
+		if c1.Group != wantGroup || c1.Value == "" {
 			t.Fatalf("unexpected C1 encoding at column %d: %+v", i, c1)
 		}
 	}

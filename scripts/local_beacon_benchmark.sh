@@ -65,8 +65,14 @@ run_protocol() {
     tyche)
       (cd "$REPO_ROOT/Tyche" && GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/tyche -n "$N" -f "$F" -epochs "$EPOCHS" -transport memory -queue-len "$QUEUE_LEN" -producer-ms "$PRODUCER_MS" -prefill-ms "$PREFILL_MS" -epoch-timeout-ms "$EPOCH_TIMEOUT_MS" -report-ms "$REPORT_MS" -max-pool "$MAX_POOL") > "$logf" 2>&1
       ;;
+    tyche-scrape)
+      (cd "$REPO_ROOT/Tyche" && GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/tyche -n "$N" -f "$F" -epochs "$EPOCHS" -transport memory -queue-len "$QUEUE_LEN" -producer-ms "$PRODUCER_MS" -prefill-ms "$PREFILL_MS" -epoch-timeout-ms "$EPOCH_TIMEOUT_MS" -report-ms "$REPORT_MS" -max-pool "$MAX_POOL" -pvss scrape) > "$logf" 2>&1
+      ;;
     tyche-reconfig)
       (cd "$REPO_ROOT/Tyche" && TYCHE_RECONFIG_BENCH_TEST=1 TYCHE_CHURN_EPOCHS="$EPOCHS" TYCHE_CHURN_RECONFIG_EVENTS="${TYCHE_RECONFIG_EVENTS:-$((EPOCHS / 20))}" TYCHE_CHURN_MIN_N="${TYCHE_RECONFIG_MIN_N:-4}" TYCHE_CHURN_MAX_N="${TYCHE_RECONFIG_MAX_N:-13}" TYCHE_CHURN_EPOCH_TIMEOUT_MS="$EPOCH_TIMEOUT_MS" TYCHE_CHURN_SEED="${TYCHE_RECONFIG_SEED:-20260521}" GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go test ./protocol/tyche -run TestBeaconReconfigurationBenchmark200Epochs -count=1 -v) > "$logf" 2>&1
+      ;;
+    tyche-scrape-reconfig)
+      (cd "$REPO_ROOT/Tyche" && TYCHE_RECONFIG_BENCH_TEST=1 TYCHE_CHURN_PVSS=scrape TYCHE_CHURN_EPOCHS="$EPOCHS" TYCHE_CHURN_RECONFIG_EVENTS="${TYCHE_RECONFIG_EVENTS:-$((EPOCHS / 20))}" TYCHE_CHURN_MIN_N="${TYCHE_RECONFIG_MIN_N:-4}" TYCHE_CHURN_MAX_N="${TYCHE_RECONFIG_MAX_N:-13}" TYCHE_CHURN_EPOCH_TIMEOUT_MS="$EPOCH_TIMEOUT_MS" TYCHE_CHURN_SEED="${TYCHE_RECONFIG_SEED:-20260521}" GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go test ./protocol/tyche -run TestBeaconReconfigurationBenchmark200Epochs -count=1 -v) > "$logf" 2>&1
       ;;
     asyrand)
       cfg="$(ensure_asyrand_config)"

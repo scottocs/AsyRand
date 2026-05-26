@@ -46,6 +46,7 @@ func main() {
 	epochTimeoutMS := flag.Int("epoch-timeout-ms", 10000, "timeout per epoch in milliseconds")
 	reportMS := flag.Int("report-ms", 5000, "periodic metrics interval in milliseconds")
 	maxPool := flag.Int("max-pool", 4, "maximum concurrent cryptographic worker tasks per node")
+	pvss := flag.String("pvss", "o1", "PVSS backend: o1 or scrape")
 	flag.Parse()
 
 	opts := runOptions{
@@ -53,6 +54,7 @@ func main() {
 		nodeID: p2p.NodeID(*nodeID), peersRaw: *peersRaw, listenAddr: *listenAddr, listenIP: *listenIP,
 		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
 		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS, maxPool: *maxPool,
+		pvss: strings.ToLower(*pvss),
 	}
 	if err := run(opts); err != nil {
 		log.Fatal(err)
@@ -74,11 +76,15 @@ type runOptions struct {
 	epochTimeoutMS int
 	reportMS       int
 	maxPool        int
+	pvss           string
 }
 
 func run(opts runOptions) error {
 	if opts.transport != "memory" && opts.transport != "tcp" {
 		return fmt.Errorf("unsupported transport %q", opts.transport)
+	}
+	if opts.pvss != "o1" && opts.pvss != "scrape" {
+		return fmt.Errorf("unsupported PVSS backend %q", opts.pvss)
 	}
 	if opts.n <= 0 {
 		return fmt.Errorf("-n must be positive")
@@ -115,7 +121,7 @@ func runMemory(opts runOptions) error {
 	defer cancel()
 	started := time.Now()
 
-	ids, pp, keys, err := setupRuntime(opts.n, opts.f)
+	ids, pp, keys, err := setupRuntime(opts.n, opts.f, opts.pvss)
 	if err != nil {
 		return err
 	}
@@ -123,7 +129,7 @@ func runMemory(opts runOptions) error {
 	net := p2p.NewMemoryNetwork()
 	nodes := make([]*tyche.Node, 0, len(ids))
 	for _, id := range ids {
-		scheme, err := crypto.NewScheme(id, keys[id].Private, pp)
+		scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
 		if err != nil {
 			return err
 		}
@@ -133,6 +139,7 @@ func runMemory(opts runOptions) error {
 			F:             opts.f,
 			QueueLen:      opts.queueLen,
 			PVSS:          scheme,
+			PVSSBackend:   opts.pvss,
 			CryptoWorkers: opts.maxPool,
 			Transport:     net.NewTransport(id, transportBuffer),
 		})
@@ -144,8 +151,8 @@ func runMemory(opts runOptions) error {
 		nodes = append(nodes, node)
 	}
 
-	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d\n",
-		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool)
+	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s\n",
+		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool, opts.pvss)
 
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
@@ -196,7 +203,7 @@ func runTCP(opts runOptions) error {
 	if _, ok := peers[opts.nodeID]; !ok {
 		return fmt.Errorf("-peers does not contain -node %s", opts.nodeID)
 	}
-	ids, pp, keys, err := setupRuntime(opts.n, opts.f)
+	ids, pp, keys, err := setupRuntime(opts.n, opts.f, opts.pvss)
 	if err != nil {
 		return err
 	}
@@ -215,13 +222,13 @@ func runTCP(opts runOptions) error {
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	scheme, err := crypto.NewScheme(opts.nodeID, keys[opts.nodeID].Private, pp)
+	scheme, err := crypto.NewPVSSScheme(opts.nodeID, keys[opts.nodeID].Private, pp)
 	if err != nil {
 		return err
 	}
 	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, transportBuffer)
 	node, err := tyche.NewNode(tyche.Config{
-		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, CryptoWorkers: opts.maxPool, Transport: transport,
+		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool, Transport: transport,
 	})
 	if err != nil {
 		return err
@@ -237,8 +244,8 @@ func runTCP(opts runOptions) error {
 	node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 
 	nodes := []*tyche.Node{node}
-	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d peers=%v\n",
-		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool, peers)
+	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool, opts.pvss, peers)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
@@ -266,12 +273,13 @@ func runTCP(opts runOptions) error {
 	return nil
 }
 
-func setupRuntime(n int, f int) ([]p2p.NodeID, crypto.PublicParams, map[p2p.NodeID]crypto.KeyPair, error) {
+func setupRuntime(n int, f int, pvss string) ([]p2p.NodeID, crypto.PVSSParams, map[p2p.NodeID]crypto.KeyPair, error) {
 	ids := make([]p2p.NodeID, n)
 	for i := range ids {
 		ids[i] = p2p.NodeID(fmt.Sprintf("node%d", i))
 	}
-	pp, keys, err := crypto.Setup(fmt.Sprintf("tyche-runner-n%d-f%d", n, f), f+1, ids)
+	epoch := fmt.Sprintf("tyche-runner-n%d-f%d", n, f)
+	pp, keys, err := crypto.SetupPVSS(pvss, epoch, f+1, ids)
 	return ids, pp, keys, err
 }
 

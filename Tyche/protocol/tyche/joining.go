@@ -14,15 +14,15 @@ import (
 )
 
 type JoinRequest struct {
-	ConfigVersion   uint64              `json:"config_version"`
-	ContextEpoch    uint64              `json:"context_epoch"`
-	Joiner          p2p.NodeID          `json:"joiner"`
-	PublicKey       string              `json:"public_key"`
-	BLSPublicKey    string              `json:"bls_public_key"`
-	CandidateParams crypto.PublicParams `json:"candidate_params,omitempty"`
-	Object          Object              `json:"object"`
-	FirstCoinEpoch  uint64              `json:"first_coin_epoch"`
-	ActivationEpoch uint64              `json:"activation_epoch"`
+	ConfigVersion   uint64            `json:"config_version"`
+	ContextEpoch    uint64            `json:"context_epoch"`
+	Joiner          p2p.NodeID        `json:"joiner"`
+	PublicKey       string            `json:"public_key"`
+	BLSPublicKey    string            `json:"bls_public_key"`
+	CandidateParams crypto.PVSSParams `json:"candidate_params,omitempty"`
+	Object          Object            `json:"object"`
+	FirstCoinEpoch  uint64            `json:"first_coin_epoch"`
+	ActivationEpoch uint64            `json:"activation_epoch"`
 }
 
 type TransitionIndex struct {
@@ -240,7 +240,7 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 	return n.installJoinCertificateLocked(cert, scheme)
 }
 
-func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme *crypto.SilentSetupScheme) error {
+func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme crypto.PVSSScheme) error {
 	blsPub, err := crypto.DecodeBLSPublicKey(cert.Request.BLSPublicKey)
 	if err != nil {
 		return err
@@ -317,17 +317,17 @@ func (n *Node) RegisterPVSSKey(paramsEpoch string, private kyber.Scalar) {
 	n.mu.Unlock()
 }
 
-func (n *Node) schemeForCandidate(pp crypto.PublicParams) (*crypto.SilentSetupScheme, error) {
-	if pp.Epoch == "" {
+func (n *Node) schemeForCandidate(pp crypto.PVSSParams) (crypto.PVSSScheme, error) {
+	if pp.Epoch() == "" {
 		return nil, errors.New("join candidate pvss parameters are required")
 	}
 	n.mu.Lock()
-	private := n.pvssKeys[pp.Epoch]
+	private := n.pvssKeys[pp.Epoch()]
 	n.mu.Unlock()
 	if private == nil {
 		return nil, errors.New("missing local pvss key for candidate configuration")
 	}
-	return crypto.NewScheme(n.ID, private, pp)
+	return crypto.NewPVSSScheme(n.ID, private, pp)
 }
 
 func transitionCertKey(cert JoinCertificate) string {
@@ -393,22 +393,22 @@ func (n *Node) verifyJoinRequest(req JoinRequest) error {
 	}
 	targetMembers := normalizeMembers(append(currentMembers, req.Joiner))
 	targetF := (len(targetMembers) - 1) / 3
-	if req.CandidateParams.Epoch == "" || !crypto.SetupVrf(req.CandidateParams) {
+	if req.CandidateParams.Epoch() == "" || !crypto.VerifyPVSSSetup(req.CandidateParams) {
 		return errors.New("invalid candidate pvss parameters")
 	}
-	if !sameMembers(req.CandidateParams.Members, targetMembers) || req.CandidateParams.Threshold != targetF+1 {
+	if !sameMembers(req.CandidateParams.Members(), targetMembers) || req.CandidateParams.Threshold() != targetF+1 {
 		return errors.New("candidate pvss parameters do not match target configuration")
 	}
 	if req.Object.ConfigVersion != version+1 || req.Object.Producer != req.Joiner || req.Object.Commitment.Dealer != req.Joiner || req.Object.Seq != 1 {
 		return errors.New("invalid join object")
 	}
-	if req.Object.Commitment.Epoch != req.CandidateParams.Epoch ||
-		req.Object.Commitment.Threshold != req.CandidateParams.Threshold ||
-		!sameMembers(req.Object.Commitment.Members, req.CandidateParams.Members) {
+	if req.Object.Commitment.Epoch != req.CandidateParams.Epoch() ||
+		req.Object.Commitment.Threshold != req.CandidateParams.Threshold() ||
+		!sameMembers(req.Object.Commitment.Members, req.CandidateParams.Members()) {
 		return errors.New("join pvss object is not bound to candidate parameters")
 	}
 	kp := crypto.KeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/join/verifier"), []byte(n.ID)))
-	verifier, err := crypto.NewScheme(n.ID, kp.Private, req.CandidateParams)
+	verifier, err := crypto.NewPVSSScheme(n.ID, kp.Private, req.CandidateParams)
 	if err != nil {
 		return err
 	}
