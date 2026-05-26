@@ -93,27 +93,19 @@ func TestBeaconReconfigurationBenchmark200Epochs(t *testing.T) {
 		t.Skip("set TYCHE_RECONFIG_BENCH_TEST=1 to run the reconfiguration benchmark")
 	}
 	epochs := envInt("TYCHE_CHURN_EPOCHS", 200)
+	initialN := envInt("TYCHE_CHURN_INITIAL_N", 8)
+	initialF := envInt("TYCHE_CHURN_INITIAL_F", (initialN-1)/3)
 	reconfigTarget := envInt("TYCHE_CHURN_RECONFIG_EVENTS", max(1, epochs/20))
 	epochTimeout := time.Duration(envInt("TYCHE_CHURN_EPOCH_TIMEOUT_MS", 10000)) * time.Millisecond
-	minN := envInt("TYCHE_CHURN_MIN_N", 4)
-	maxN := envInt("TYCHE_CHURN_MAX_N", 13)
+	prefill := time.Duration(envInt("TYCHE_CHURN_PREFILL_MS", 0)) * time.Millisecond
+	minN := envInt("TYCHE_CHURN_MIN_N", initialN-initialF)
+	maxN := envInt("TYCHE_CHURN_MAX_N", initialN+initialF)
+	if maxN < initialN {
+		maxN = initialN
+	}
 	seed := int64(envInt("TYCHE_CHURN_SEED", 20260521))
 
-	baseline := runChurnBenchmarkCase(t, "baseline", epochs, 0, epochTimeout, minN, maxN, seed)
-	reconfig := runChurnBenchmarkCase(t, "reconfig", epochs, reconfigTarget, epochTimeout, minN, maxN, seed)
-	t.Logf("compare epochs=%d baseline_throughput=%.4f/s reconfig_throughput=%.4f/s throughput_ratio=%.4f baseline_bandwidth=%.2fKB/s reconfig_bandwidth=%.2fKB/s bandwidth_ratio=%.4f baseline_sent_msgs=%d reconfig_sent_msgs=%d baseline_final_n=%d reconfig_final_n=%d",
-		epochs,
-		baseline.throughputPerSec,
-		reconfig.throughputPerSec,
-		ratio(reconfig.throughputPerSec, baseline.throughputPerSec),
-		baseline.bandwidthKBPerSec,
-		reconfig.bandwidthKBPerSec,
-		ratio(reconfig.bandwidthKBPerSec, baseline.bandwidthKBPerSec),
-		baseline.sentMessages,
-		reconfig.sentMessages,
-		baseline.finalN,
-		reconfig.finalN,
-	)
+	runChurnBenchmarkCase(t, "reconfig", epochs, reconfigTarget, epochTimeout, prefill, minN, maxN, seed, initialN, initialF)
 }
 
 type churnCluster struct {
@@ -145,15 +137,18 @@ type churnBenchmarkResult struct {
 	reconfigurationOps int
 }
 
-func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarget int, epochTimeout time.Duration, minN int, maxN int, seed int64) churnBenchmarkResult {
+func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarget int, epochTimeout time.Duration, prefill time.Duration, minN int, maxN int, seed int64, initialN int, initialF int) churnBenchmarkResult {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(epochs)*2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(epochs)*2*time.Second+prefill)
 	defer cancel()
-	cluster := newChurnCluster(t, ctx, 8, 2)
+	cluster := newChurnCluster(t, ctx, initialN, initialF)
 	rng := rand.New(rand.NewSource(seed))
-	nextJoin := 8
+	nextJoin := initialN
 	before := aggregateMetrics(cluster.transports())
 	start := time.Now()
+	if prefill > 0 {
+		time.Sleep(prefill)
+	}
 	reconfigs := 0
 	for epoch := 1; epoch <= epochs; epoch++ {
 		if shouldRunReconfiguration(rng, epoch, epochs, reconfigs, reconfigTarget) {
@@ -229,13 +224,6 @@ func shouldRunReconfiguration(rng *rand.Rand, epoch int, epochs int, completed i
 		return true
 	}
 	return rng.Float64() < float64(remainingEvents)/float64(remainingEpochs)
-}
-
-func ratio(num float64, den float64) float64 {
-	if den == 0 {
-		return 0
-	}
-	return num / den
 }
 
 func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnCluster {

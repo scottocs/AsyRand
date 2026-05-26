@@ -251,11 +251,18 @@ def _run_protocol(protocol, options):
                 "TYCHE_RECONFIG_BENCH_TEST": "1",
                 "TYCHE_CHURN_PVSS": "scrape" if protocol == "tyche-scrape-reconfig" else "o1",
                 "TYCHE_CHURN_EPOCHS": str(options.epochs),
+                "TYCHE_CHURN_INITIAL_N": str(options.n),
+                "TYCHE_CHURN_INITIAL_F": str(options.fault_threshold),
                 "TYCHE_CHURN_RECONFIG_EVENTS": os.environ.get(
                     "TYCHE_RECONFIG_EVENTS", str(options.epochs // 20)
                 ),
-                "TYCHE_CHURN_MIN_N": os.environ.get("TYCHE_RECONFIG_MIN_N", "4"),
-                "TYCHE_CHURN_MAX_N": os.environ.get("TYCHE_RECONFIG_MAX_N", "13"),
+                "TYCHE_CHURN_PREFILL_MS": str(options.prefill_ms),
+                "TYCHE_CHURN_MIN_N": os.environ.get(
+                    "TYCHE_RECONFIG_MIN_N", str(options.n - options.fault_threshold)
+                ),
+                "TYCHE_CHURN_MAX_N": os.environ.get(
+                    "TYCHE_RECONFIG_MAX_N", str(options.n + options.fault_threshold)
+                ),
                 "TYCHE_CHURN_EPOCH_TIMEOUT_MS": str(options.epoch_timeout_ms),
                 "TYCHE_CHURN_SEED": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
             }
