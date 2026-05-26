@@ -632,7 +632,7 @@ func TestBeaconIndexUsesFullRandomValue(t *testing.T) {
 	}
 }
 
-func TestMarkedSourceRemovedWhenRSQExpires(t *testing.T) {
+func TestMarkedSelectedSourceRemovedAtMarkerEpoch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -640,12 +640,12 @@ func TestMarkedSourceRemovedWhenRSQExpires(t *testing.T) {
 	node := nodes[0]
 
 	node.mu.Lock()
-	node.State.RSQ = []p2p.NodeID{"n0", "n2"}
-	node.State.SCL = []p2p.NodeID{"n1", "n3"}
+	node.State.RSQ = []p2p.NodeID{"n2", "n3"}
+	node.State.SCL = []p2p.NodeID{"n0", "n1"}
 	node.State.RmMark["n0"] = 3
 	node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
 	node.State.Seqs["n0"] = 1
-	node.rotateSourcesLocked(3, "n1", 1)
+	node.removeSelectedSourceIfMarkedLocked(3, "n0")
 	members := append([]p2p.NodeID(nil), node.State.Members...)
 	scl := append([]p2p.NodeID(nil), node.State.SCL...)
 	rsq := append([]p2p.NodeID(nil), node.State.RSQ...)

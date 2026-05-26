@@ -1286,7 +1286,11 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		n.mu.Unlock()
 		return
 	}
+	obj := n.State.ComQ[source][seq]
+	prev := append([]byte(nil), n.State.RPrev...)
+	secret := append([]byte(nil), n.reconSecret[key]...)
 	n.beaconSeeds[epoch] = append([]byte(nil), random...)
+	n.removeSelectedSourceIfMarkedLocked(epoch, source)
 	feeds := n.processPendingABAsLocked(epoch)
 	joinFeeds := n.processJoinCoinWaitsLocked(epoch)
 	n.mu.Unlock()
@@ -1304,9 +1308,6 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		n.mu.Unlock()
 		return
 	}
-	obj := n.State.ComQ[source][seq]
-	prev := append([]byte(nil), n.State.RPrev...)
-	secret := append([]byte(nil), n.reconSecret[key]...)
 	n.rotateSourcesLocked(epoch, source, seq)
 	n.State.Epoch = epoch
 	n.State.RPrev = append([]byte(nil), random...)
@@ -1436,18 +1437,18 @@ func (n *Node) rotateSourcesLocked(epoch uint64, source p2p.NodeID, seq uint64) 
 	if window > 0 && len(n.State.RSQ) >= window && len(n.State.RSQ) > 0 {
 		old = n.State.RSQ[0]
 		n.State.RSQ = append([]p2p.NodeID(nil), n.State.RSQ[1:]...)
-		if n.State.RmMark[old] != -1 && epoch >= uint64(n.State.RmMark[old]) {
-			n.removeMemberLocked(old)
-		} else if old != "" && contains(n.State.Members, old) && !contains(n.State.SCL, old) {
+		if old != "" && contains(n.State.Members, old) && !contains(n.State.SCL, old) {
 			n.State.SCL = append(n.State.SCL, old)
 		}
 	}
-	if window > 0 && !contains(n.State.RSQ, source) {
-		n.State.RSQ = append(n.State.RSQ, source)
-		n.State.SCL = removeID(n.State.SCL, source)
+	if contains(n.State.Members, source) {
+		if window > 0 && !contains(n.State.RSQ, source) {
+			n.State.RSQ = append(n.State.RSQ, source)
+			n.State.SCL = removeID(n.State.SCL, source)
+		}
+		n.State.Seqs[source] = seq
+		delete(n.State.ComQ[source], seq)
 	}
-	n.State.Seqs[source] = seq
-	delete(n.State.ComQ[source], seq)
 }
 
 func (n *Node) exclusionWindowLocked() int {
@@ -1456,6 +1457,12 @@ func (n *Node) exclusionWindowLocked() int {
 
 func (n *Node) markRemovalLocked(source p2p.NodeID, epoch uint64) {
 	n.State.RmMark[source] = int64(epoch + uint64(n.exclusionWindowLocked()))
+}
+
+func (n *Node) removeSelectedSourceIfMarkedLocked(epoch uint64, source p2p.NodeID) {
+	if n.State.RmMark[source] != -1 && epoch == uint64(n.State.RmMark[source]) {
+		n.removeMemberLocked(source)
+	}
 }
 
 func (n *Node) refillSCLLocked() {
