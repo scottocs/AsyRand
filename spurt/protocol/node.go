@@ -66,10 +66,6 @@ type AgreementMessage struct {
 	Leader   p2p.NodeID      `json:"leader"`
 	Digest   string          `json:"digest"`
 	Selected []CommitmentRef `json:"selected"`
-	// Aggregate is public data and is bound into Digest. Keeping it in the
-	// proposal lets every node verify the same selected-input aggregate once,
-	// while private PVSS_DATA messages only carry the recipient-specific column.
-	Aggregate asig.PVSSCommitment `json:"aggregate"`
 }
 
 type VoteMessage struct {
@@ -89,11 +85,11 @@ type PrivateDataMessage struct {
 	Leader   p2p.NodeID      `json:"leader"`
 	Digest   string          `json:"digest"`
 	Selected []CommitmentRef `json:"selected"`
-	// Columns contains this recipient's vbar/cbar/pi_bar data for the selected
-	// inputs. It intentionally does not repeat Aggregate; Aggregate is public in
-	// PROPOSAL and is checked against Digest before these private columns are
-	// accepted.
-	Columns []asig.PVSSColumnEntry `json:"columns"`
+	// Aggregate is the public vhat/chat data bound by Digest. It is carried on
+	// the leader's per-recipient private-data channel so the agreement path only
+	// gossips the compact digest, matching SPURT's paper design.
+	Aggregate asig.PVSSCommitment    `json:"aggregate"`
+	Columns   []asig.PVSSColumnEntry `json:"columns"`
 }
 
 type pendingPrivateData struct {
@@ -628,11 +624,10 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 		return
 	}
 	msg := AgreementMessage{
-		Epoch:     es.epoch,
-		Leader:    n.ID,
-		Digest:    digest,
-		Selected:  selected,
-		Aggregate: aggregate,
+		Epoch:    es.epoch,
+		Leader:   n.ID,
+		Digest:   digest,
+		Selected: selected,
 	}
 	n.mu.Lock()
 	if es.proposalBroadcast {
@@ -653,7 +648,7 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 	es.privateVerified = false
 	es.proposing = false
 	n.mu.Unlock()
-	n.sendPrivateColumns(es.epoch, n.ID, digest, selected, columns)
+	n.sendPrivateColumns(es.epoch, n.ID, digest, selected, aggregate, columns)
 	// Broadcast the public proposal after private sends are queued. Correctness
 	// does not depend on ordering: receivers buffer private columns if they
 	// arrive before this proposal.
@@ -662,9 +657,8 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 
 func (n *Node) maybeSendPrepare(es *epochState) {
 	n.mu.Lock()
-	// PREPARE is delayed until privateVerified is true so the optimization of
-	// moving Aggregate to PROPOSAL does not weaken the paper-level requirement:
-	// each node still validates its private vbar/cbar/pi_bar data first.
+	// PREPARE is delayed until privateVerified is true: each node must validate
+	// the digest-bound aggregate and its private vbar/cbar/pi_bar data first.
 	if es.leaderProposal == nil || es.aggregate == nil || !es.privateVerified || es.prepareSent {
 		n.mu.Unlock()
 		return
@@ -717,9 +711,6 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	if msg.Leader != n.State.Leader(msg.Epoch) {
 		return
 	}
-	if !n.PVSS.Verify(msg.Aggregate) {
-		return
-	}
 	if msg.Epoch > n.State.CurrentEpoch() {
 		n.mu.Lock()
 		es := n.stateAtLocked(msg.Epoch)
@@ -735,19 +726,6 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 			return
 		}
 	}
-	if ok {
-		// The proposal carries all public data needed to recompute Digest. This
-		// replaces the older implementation where every private message repeated
-		// the same aggregate, reducing per-recipient bandwidth without changing
-		// the public consistency check.
-		if !aggregateMatchesSelection(msg.Aggregate, selected) {
-			return
-		}
-		expected := computeAgreementDigest(n.State.RPrevBytes(), msg.Epoch, msg.Leader, selected, msg.Aggregate)
-		if expected == "" || expected != msg.Digest {
-			return
-		}
-	}
 	n.mu.Lock()
 	es := n.stateAtLocked(msg.Epoch)
 	if es == nil {
@@ -758,6 +736,8 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 		if es.leaderProposal.Digest == msg.Digest {
 			shouldGossip := !es.proposalGossiped
 			es.proposalGossiped = true
+			pendingPrivate := append([]pendingPrivateData(nil), es.pendingPrivate...)
+			es.pendingPrivate = nil
 			pendingVotes := append([]pendingVote(nil), es.pendingVotes...)
 			es.pendingVotes = nil
 			pendingRecon := append([]ReconMessage(nil), es.pendingRecon...)
@@ -767,6 +747,9 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 			n.mu.Unlock()
 			if shouldGossip {
 				n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
+			}
+			for _, pending := range pendingPrivate {
+				n.handlePrivateData(pending.msg, pending.from)
 			}
 			n.replayPendingVotes(pendingVotes, msg.Digest)
 			n.replayPendingRecon(pendingRecon, msg.Digest)
@@ -784,11 +767,9 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 		n.mu.Unlock()
 		return
 	}
-	aggregate := msg.Aggregate
 	es.leaderProposal = &msg
 	es.selected = selected
 	es.digest = msg.Digest
-	es.aggregate = &aggregate
 	es.selectedSet = true
 	es.pendingProposal = nil
 	shouldGossip := !es.proposalGossiped
@@ -805,7 +786,7 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	if shouldGossip {
 		n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
 	}
-	// Re-play buffered private messages after Aggregate becomes available.
+	// Re-play buffered private messages after the digest proposal is installed.
 	// handlePrivateData will still verify digest, selected inputs, aggregate
 	// membership, and column DLEQ proofs before setting privateVerified.
 	for _, pending := range pendingPrivate {
@@ -824,11 +805,6 @@ func (n *Node) tryPendingProposal(es *epochState) {
 		return
 	}
 	msg := *es.pendingProposal
-	if !n.PVSS.Verify(msg.Aggregate) {
-		es.pendingProposal = nil
-		n.mu.Unlock()
-		return
-	}
 	selected, ok, pending := n.validateProposal(msg.Epoch, msg.Selected, msg.Digest)
 	if !ok {
 		if !pending {
@@ -837,26 +813,15 @@ func (n *Node) tryPendingProposal(es *epochState) {
 		n.mu.Unlock()
 		return
 	}
-	if !aggregateMatchesSelection(msg.Aggregate, selected) {
-		es.pendingProposal = nil
-		n.mu.Unlock()
-		return
-	}
-	expected := computeAgreementDigest(n.State.RPrevBytes(), msg.Epoch, msg.Leader, selected, msg.Aggregate)
-	if expected == "" || expected != msg.Digest {
-		es.pendingProposal = nil
-		n.mu.Unlock()
-		return
-	}
-	aggregate := msg.Aggregate
 	es.leaderProposal = &msg
 	es.selected = selected
 	es.digest = msg.Digest
-	es.aggregate = &aggregate
 	es.selectedSet = true
 	es.pendingProposal = nil
 	shouldGossip := !es.proposalGossiped
 	es.proposalGossiped = true
+	pendingPrivate := append([]pendingPrivateData(nil), es.pendingPrivate...)
+	es.pendingPrivate = nil
 	pendingVotes := append([]pendingVote(nil), es.pendingVotes...)
 	es.pendingVotes = nil
 	pendingRecon := append([]ReconMessage(nil), es.pendingRecon...)
@@ -866,6 +831,9 @@ func (n *Node) tryPendingProposal(es *epochState) {
 	n.mu.Unlock()
 	if shouldGossip {
 		n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
+	}
+	for _, pending := range pendingPrivate {
+		n.handlePrivateData(pending.msg, pending.from)
 	}
 	n.replayPendingVotes(pendingVotes, msg.Digest)
 	n.replayPendingRecon(pendingRecon, msg.Digest)
@@ -889,10 +857,10 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 		n.mu.Unlock()
 		return
 	}
-	if es.aggregate == nil {
+	if es.leaderProposal == nil {
 		// Private PVSS_DATA is recipient-specific and may race ahead of the
 		// public proposal. Store it rather than rejecting it; it will be checked
-		// once the digest-bound Aggregate is available.
+		// once the digest-bound proposal is available.
 		es.pendingPrivate = append(es.pendingPrivate, pendingPrivateData{msg: msg, from: from})
 		n.mu.Unlock()
 		return
@@ -901,15 +869,21 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 		n.mu.Unlock()
 		return
 	}
-	aggregate := *es.aggregate
+	proposalSelected := append([]CommitmentRef(nil), es.selected...)
 	n.mu.Unlock()
 
+	if !n.PVSS.Verify(msg.Aggregate) {
+		return
+	}
+	if !sameRefs(selected, proposalSelected) {
+		return
+	}
+	aggregate := msg.Aggregate
 	if !aggregateMatchesSelection(aggregate, selected) {
 		return
 	}
-	// This is the optimized private-data validation point: Aggregate came from
-	// the public proposal, while msg.Columns contains only this node's private
-	// column. The check proves they match exactly.
+	// The private-data validation point: Aggregate and this recipient's
+	// vbar/cbar/pi_bar column must match the digest-only agreement proposal.
 	if !n.PVSS.VerifyAggregationColumn(n.ID, aggregate, msg.Columns) {
 		return
 	}
@@ -919,7 +893,7 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 	}
 	n.mu.Lock()
 	es = n.stateAtLocked(msg.Epoch)
-	if es == nil || es.aggregate == nil {
+	if es == nil || es.leaderProposal == nil {
 		n.mu.Unlock()
 		return
 	}
@@ -929,6 +903,7 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 	}
 	es.selected = selected
 	es.digest = msg.Digest
+	es.aggregate = &aggregate
 	es.selectedSet = true
 	es.privateVerified = true
 	n.mu.Unlock()
@@ -1372,21 +1347,7 @@ func (n *Node) send(protocol, typ string, epoch uint64, payload any) error {
 	return n.Transport.Broadcast(context.Background(), msg)
 }
 
-func (n *Node) sendPrivateData(epoch uint64, leader p2p.NodeID, digest string, selected []CommitmentRef, commitments []asig.PVSSCommitment) {
-	for _, member := range n.State.MembersSnapshot() {
-		payload, ok := privateDataForMember(epoch, leader, digest, selected, commitments, member)
-		if !ok {
-			continue
-		}
-		msg, err := p2p.NewMessage(Protocol, "PVSS_DATA", epochInstance(epoch), n.ID, member, payload)
-		if err != nil {
-			continue
-		}
-		n.sendAsync(member, msg)
-	}
-}
-
-func (n *Node) sendPrivateColumns(epoch uint64, leader p2p.NodeID, digest string, selected []CommitmentRef, columns map[p2p.NodeID][]asig.PVSSColumnEntry) {
+func (n *Node) sendPrivateColumns(epoch uint64, leader p2p.NodeID, digest string, selected []CommitmentRef, aggregate asig.PVSSCommitment, columns map[p2p.NodeID][]asig.PVSSColumnEntry) {
 	for _, member := range n.State.MembersSnapshot() {
 		memberColumns, ok := columns[member]
 		if !ok {
@@ -1394,7 +1355,8 @@ func (n *Node) sendPrivateColumns(epoch uint64, leader p2p.NodeID, digest string
 		}
 		payload := PrivateDataMessage{
 			Epoch: epoch, Leader: leader, Digest: digest, Selected: selected,
-			Columns: cloneColumns(memberColumns),
+			Aggregate: aggregate,
+			Columns:   cloneColumns(memberColumns),
 		}
 		msg, err := p2p.NewMessage(Protocol, "PVSS_DATA", epochInstance(epoch), n.ID, member, payload)
 		if err != nil {
@@ -1420,37 +1382,6 @@ func (n *Node) sendAsync(to p2p.NodeID, msg p2p.Message) {
 		defer cancel()
 		_ = n.Transport.Send(ctx, to, msg)
 	}()
-}
-
-func privateDataForMember(epoch uint64, leader p2p.NodeID, digest string, selected []CommitmentRef, commitments []asig.PVSSCommitment, member p2p.NodeID) (PrivateDataMessage, bool) {
-	// Build only the recipient's selected-input column. The aggregate is not
-	// included here because it is common public data already carried by
-	// AgreementMessage and bound by Digest.
-	columns := make([]asig.PVSSColumnEntry, 0, len(commitments))
-	for _, c := range commitments {
-		proof, ok := c.DLEQ[member]
-		if !ok {
-			return PrivateDataMessage{}, false
-		}
-		commit, ok := c.Commit[member]
-		if !ok {
-			return PrivateDataMessage{}, false
-		}
-		cipher, ok := c.Cipher[member]
-		if !ok {
-			return PrivateDataMessage{}, false
-		}
-		columns = append(columns, asig.PVSSColumnEntry{
-			Source: asig.PVSSSource{Dealer: c.Dealer, Seq: c.Seq, SecretID: c.SecretID},
-			Commit: commit,
-			Cipher: cipher,
-			Proof:  proof,
-		})
-	}
-	return PrivateDataMessage{
-		Epoch: epoch, Leader: leader, Digest: digest, Selected: selected,
-		Columns: columns,
-	}, true
 }
 
 func privateColumnsByMember(commitments []asig.PVSSCommitment, members []p2p.NodeID) (map[p2p.NodeID][]asig.PVSSColumnEntry, bool) {
@@ -1593,6 +1524,20 @@ func normalizeRefs(in []CommitmentRef) []CommitmentRef {
 		return out[i].Dealer < out[j].Dealer
 	})
 	return uniqueRefs(out)
+}
+
+func sameRefs(a, b []CommitmentRef) bool {
+	a = normalizeRefs(a)
+	b = normalizeRefs(b)
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func aggregateMatchesSelection(aggregate asig.PVSSCommitment, selected []CommitmentRef) bool {
