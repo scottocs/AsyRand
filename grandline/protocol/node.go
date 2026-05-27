@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -159,11 +160,49 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 			n.State.Advance(beacon.Random, "")
 			return beacon, nil
 		case <-overall.C:
-			return nil, errEpochTimeout
+			return n.SkipCurrentEpochAt("beacon_wait", "timeout"), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func (n *Node) SkipCurrentEpoch(reason string) *Beacon {
+	return n.SkipCurrentEpochAt(reason, reason)
+}
+
+func (n *Node) SkipCurrentEpochAt(stage string, reason string) *Beacon {
+	epoch, random := n.State.Skip(reason)
+	key := roundKey(epoch)
+	diag := n.skipDiagnostics(key)
+	n.roundMu.Lock()
+	delete(n.rounds, key)
+	delete(n.pendingShares, key)
+	n.roundMu.Unlock()
+	return &Beacon{Epoch: epoch, Random: random, Commit: reason, Skipped: true, SkipStage: stage, SkipReason: reason, SkipDiag: diag}
+}
+
+func (n *Node) skipDiagnostics(key string) string {
+	queueTotal, queueMax := n.State.QueueBacklog()
+	n.roundMu.Lock()
+	rounds := len(n.rounds)
+	pendingShares := len(n.pendingShares[key])
+	commitments := len(n.commitments)
+	commitSent := n.commitSent
+	shareCount := 0
+	delivered := false
+	recovering := false
+	if st := n.rounds[key]; st != nil {
+		shareCount = len(st.shares)
+		delivered = st.delivered
+		recovering = st.recovering
+	}
+	n.roundMu.Unlock()
+	metrics := n.Transport.Metrics()
+	return fmt.Sprintf(
+		"local_epoch=%d rounds=%d commitments=%d commit_sent=%t shares=%d pending_shares=%d delivered=%t recovering=%t queue_total=%d queue_max=%d sent_msgs=%d recv_msgs=%d",
+		n.State.CurrentEpoch(), rounds, commitments, commitSent, shareCount, pendingShares, delivered, recovering, queueTotal, queueMax, metrics.SentMessages, metrics.RecvMessages,
+	)
 }
 
 func (n *Node) dispatch(ctx context.Context) {

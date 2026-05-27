@@ -204,6 +204,14 @@ func (s *PVSSPairingFreeScheme) Aggregate(dealer p2p.NodeID, seq uint64, commitm
 		return PVSSCommitment{}, errors.New("empty pvss aggregate")
 	}
 	group := suite()
+	for _, transcript := range commitments {
+		if !s.Verify(transcript) {
+			return PVSSCommitment{}, errors.New("invalid pvss transcript in aggregate")
+		}
+		if transcript.Threshold != s.threshold {
+			return PVSSCommitment{}, errors.New("pvss threshold mismatch in aggregate")
+		}
+	}
 	// GRandLine Figure 1 Agg multiplies transcript coordinates: C_i is the
 	// sum/product of commitments and E_i is the sum/product of encryptions.
 	commit := make(map[p2p.NodeID]string, len(members))
@@ -213,12 +221,6 @@ func (s *PVSSPairingFreeScheme) Aggregate(dealer p2p.NodeID, seq uint64, commitm
 		var cSum kyber.Point
 		var eSum kyber.Point
 		for _, transcript := range commitments {
-			if !s.Verify(transcript) {
-				return PVSSCommitment{}, errors.New("invalid pvss transcript in aggregate")
-			}
-			if transcript.Threshold != s.threshold {
-				return PVSSCommitment{}, errors.New("pvss threshold mismatch in aggregate")
-			}
 			ci, err := pointG1FromHex(transcript.Commit[member])
 			if err != nil {
 				return PVSSCommitment{}, err

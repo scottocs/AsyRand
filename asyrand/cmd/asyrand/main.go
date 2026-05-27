@@ -67,7 +67,6 @@ func main() {
 func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
-	started := time.Now()
 	rt, err := prepareRuntime(cfg)
 	if err != nil {
 		return err
@@ -91,7 +90,12 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 
+	removedRetries := 0
+	maxRemovedRetries := cfg.F + 1
 	for epoch := 0; epoch < cfg.Round; epoch++ {
 		type result struct {
 			beacon   *asyrand.Beacon
@@ -117,16 +121,35 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 			}
 			if sample == nil {
 				sample = res.beacon
+			} else if res.beacon != nil && (sample.Epoch != res.beacon.Epoch || string(sample.Random) != string(res.beacon.Random) || sample.Skipped != res.beacon.Skipped) {
+				return fmt.Errorf("epoch %d inconsistent beacon: sample_epoch=%d sample_skipped=%t got_epoch=%d got_skipped=%t",
+					epoch, sample.Epoch, sample.Skipped, res.beacon.Epoch, res.beacon.Skipped)
 			}
 		}
 		if sample == nil {
 			fmt.Printf("epoch=%d removed source and retried source candidate list\n", epoch)
+			removedRetries++
+			if removedRetries > maxRemovedRetries {
+				for _, node := range nodes {
+					sample = node.SkipCurrentEpoch("", "source_unavailable")
+				}
+				fmt.Printf("epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+				removedRetries = 0
+				continue
+			}
+			epoch--
+			continue
+		}
+		removedRetries = 0
+		if sample.Skipped {
+			fmt.Printf("epoch=%d source=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.Source, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
 			continue
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("epoch=%d source=%s consumed=%d/%d commit=%s random=%x\n", sample.Epoch, sample.Source, consumedCount, len(nodes), sample.CommitID, sample.Random[:8])
 	}
-	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
 	return nil
 }
 
@@ -136,12 +159,12 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	}
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
-	started := time.Now()
 	rt, err := prepareRuntime(cfg)
 	if err != nil {
 		return err
 	}
-	transport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap(), 4096)
+	peers := cfg.PeerMap()
+	transport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)))
 	node, err := newNode(cfg, rt, cfg.NodeID, transport)
 	if err != nil {
 		return err
@@ -161,7 +184,12 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 
+	removedRetries := 0
+	maxRemovedRetries := cfg.F + 1
 	for produced := 0; produced < cfg.Round; {
 		beacon, consumed, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
 		if err != nil {
@@ -169,13 +197,26 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		}
 		if beacon == nil {
 			fmt.Printf("node=%s removed source and retried source candidate list\n", node.ID)
+			removedRetries++
+			if removedRetries > maxRemovedRetries {
+				beacon = node.SkipCurrentEpoch("", "source_unavailable")
+				fmt.Printf("node=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", node.ID, beacon.Epoch, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
+				removedRetries = 0
+				produced++
+			}
 			continue
 		}
+		removedRetries = 0
 		produced++
+		if beacon.Skipped {
+			fmt.Printf("node=%s epoch=%d source=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n", node.ID, beacon.Epoch, beacon.Source, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
+			continue
+		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s consumed=%t commit=%s random=%x\n", node.ID, beacon.Epoch, beacon.Source, consumed, beacon.CommitID, beacon.Random[:8])
 	}
-	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -337,8 +378,8 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
-		label, beacons, float64(beacons)*60/seconds,
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+		label, beacons, elapsed.Seconds(), float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
 		queueTotal, queueMax,

@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,12 +66,14 @@ class AwsOptions:
     prefill_ms: int = 8000
     epoch_timeout_ms: int = 60000
     report_ms: int = 5000
-    linger_ms: int = 120000
+    linger_ms: int = 5000
     max_pool: int = 16
     aggregation_lookahead: int = 8
     gomaxprocs: int = 4
     startup_wait_sec: int | None = None
-    ssh_connect_timeout: int = 30
+    ssh_connect_timeout: int = 6
+    ssh_probe_retries: int = 1
+    ssh_probe_delay_sec: int = 0
 
 
 def _split_csv(raw):
@@ -141,6 +143,17 @@ def _float_metric(line, key, default=0.0):
         return default
 
 
+def _protocol_elapsed_seconds(final):
+    elapsed = _float_metric(final, "elapsed_s")
+    if elapsed > 0:
+        return elapsed
+    throughput = _float_metric(final, "throughput")
+    beacons = _float_metric(final, "beacons")
+    if throughput > 0 and beacons > 0:
+        return beacons * 60 / throughput
+    return 0.0
+
+
 def _final_metrics(log_file):
     final = ""
     for line in log_file.read_text(errors="replace").splitlines():
@@ -163,6 +176,18 @@ def _protocol_fault_threshold(protocol, options):
     if protocol == "grandline" and hasattr(options, "grandline_fault_threshold"):
         return options.grandline_fault_threshold
     return options.fault_threshold
+
+
+def _protocol_success_threshold(protocol, options):
+    return options.n - _protocol_fault_threshold(protocol, options)
+
+
+def _default_protocol_success_threshold(protocol, nodes):
+    if protocol == "grandline":
+        fault_threshold = (nodes - 1) // 2
+    else:
+        fault_threshold = (nodes - 1) // 3
+    return nodes - fault_threshold
 
 
 def _protocol_config(protocol, options):
@@ -340,6 +365,7 @@ def _parse_results(options, elapsed_by_protocol):
                 "ip",
                 "throughput_beacon_min",
                 "throughput_beacon_s",
+                "elapsed_s",
                 "bandwidth_kbps",
                 "cpu_percent",
                 "sent_msgs",
@@ -374,7 +400,7 @@ def _parse_results(options, elapsed_by_protocol):
             final = _final_metrics(log_file)
             throughput_min = _float_metric(final, "throughput")
             bandwidth = _float_metric(final, "bandwidth")
-            elapsed = max(elapsed_by_protocol.get(protocol, 0.0), 1e-9)
+            elapsed = _protocol_elapsed_seconds(final) or elapsed_by_protocol.get(protocol, 0.0)
             # Cross-platform child CPU time is not available without an extra dependency.
             # Keep the column for schema compatibility and report wall-clock normalized 0.
             cpu_percent = 0.0 if sys.platform.startswith("win") else 0.0
@@ -388,6 +414,7 @@ def _parse_results(options, elapsed_by_protocol):
                     "ip": "127.0.0.1",
                     "throughput_beacon_min": f"{throughput_min:.4f}",
                     "throughput_beacon_s": f"{throughput_min / 60:.4f}",
+                    "elapsed_s": f"{elapsed:.3f}",
                     "bandwidth_kbps": f"{bandwidth:.4f}",
                     "cpu_percent": f"{cpu_percent:.2f}",
                     "sent_msgs": _metric(final, "sent_msgs"),
@@ -456,22 +483,106 @@ def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
 def _discover_aws_hosts(options, settings):
     if not options.key_file.exists():
         raise BenchError(f"local SSH key does not exist: {options.key_file}")
-    candidates = []
+    candidates_by_region = {}
     for region in settings.regions:
+        region_candidates = []
         for instance in _instances(region, ["running"]):
             ip = instance.get("PublicIpAddress")
             if ip:
-                candidates.append((region, ip))
-    if len(candidates) < options.n:
+                region_candidates.append(ip)
+        candidates_by_region[region] = region_candidates
+    total_candidates = sum(len(items) for items in candidates_by_region.values())
+    counts = ", ".join(f"{region}={len(candidates_by_region.get(region, []))}" for region in settings.regions)
+    print(f"[{time.strftime('%H:%M:%S')}] found {total_candidates} running AWS host candidate(s): {counts}")
+    if total_candidates < options.n:
         raise BenchError(
-            f"not enough running AWS hosts: found={len(candidates)} need={options.n}. "
+            f"not enough running AWS hosts: found={total_candidates} need={options.n}. "
             "Run `fab create --nodes=...` or `fab start` first."
         )
+    targets = _region_host_targets(options.n, settings.regions)
+    target_counts = ", ".join(f"{region}={targets[region]}" for region in settings.regions if targets[region] > 0)
+    print(f"[{time.strftime('%H:%M:%S')}] target AWS host distribution: {target_counts}")
+    for region, target in targets.items():
+        available = len(candidates_by_region.get(region, []))
+        if available < target:
+            raise BenchError(
+                f"not enough running AWS hosts in {region}: found={available} need={target}. "
+                "Create more instances or reduce --nodes."
+            )
+
+    selected_by_region = {region: [] for region in settings.regions}
+    cursor_by_region = {region: 0 for region in settings.regions}
+    errors = []
+
+    while any(len(selected_by_region[region]) < targets[region] for region in settings.regions):
+        batch = []
+        for region in settings.regions:
+            if len(selected_by_region[region]) >= targets[region]:
+                continue
+            candidates = candidates_by_region.get(region, [])
+            cursor = cursor_by_region[region]
+            if cursor >= len(candidates):
+                continue
+            ip = candidates[cursor]
+            cursor_by_region[region] = cursor + 1
+            batch.append((region, ip))
+        if not batch:
+            break
+
+        batch_label = ", ".join(f"{region} {ip}" for region, ip in batch)
+        print(f"[{time.strftime('%H:%M:%S')}] probing SSH on {len(batch)} AWS host candidate(s): {batch_label}")
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            futures = {
+                pool.submit(_detect_ssh_user, ip, options.key_file, options): (region, ip)
+                for region, ip in batch
+            }
+        for future in as_completed(futures):
+            region, ip = futures[future]
+            try:
+                user = future.result()
+            except BenchError as exc:
+                errors.append(f"{region} {ip}: {exc}")
+                print(f"[{time.strftime('%H:%M:%S')}] skipping unreachable AWS host {region} {ip}: {exc}")
+                continue
+            selected_by_region[region].append((ip, user))
+            print(f"[{time.strftime('%H:%M:%S')}] SSH ready: {region} {ip} user={user}")
+
+    missing = {
+        region: targets[region] - len(selected_by_region[region])
+        for region in settings.regions
+        if len(selected_by_region[region]) < targets[region]
+    }
+    if missing:
+        missing_counts = ", ".join(f"{region}={count}" for region, count in missing.items())
+        detail = "\n".join(errors[-8:])
+        raise BenchError(
+            f"not enough SSH-ready AWS hosts for target distribution: missing {missing_counts}. "
+            "Wait a minute and retry, or create extra backup instances in the affected region(s)."
+            + (f"\nRecent SSH failures:\n{detail}" if detail else "")
+        )
+
     hosts = []
-    for index, (region, ip) in enumerate(candidates[: options.n]):
-        user = _detect_ssh_user(ip, options.key_file, options)
-        hosts.append(AwsHost(index=index, region=region, ip=ip, key_file=options.key_file, user=user))
+    for slot in range(max(targets.values(), default=0)):
+        for region in settings.regions:
+            if slot >= len(selected_by_region[region]):
+                continue
+            ip, user = selected_by_region[region][slot]
+            host = AwsHost(index=len(hosts), region=region, ip=ip, key_file=options.key_file, user=user)
+            hosts.append(host)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] selected AWS host "
+                f"{len(hosts)}/{options.n}: {region} {ip}"
+            )
     return hosts
+
+
+def _region_host_targets(nodes, regions):
+    base = nodes // len(regions)
+    extra = nodes % len(regions)
+    return {
+        region: base + (1 if index < extra else 0)
+        for index, region in enumerate(regions)
+    }
 
 
 def _connect(host, options):
@@ -484,25 +595,25 @@ def _connect(host, options):
 
 
 def _detect_ssh_user(ip, key_file, options):
-    users = []
-    if options.ssh_user:
-        users.append(options.ssh_user)
-    users.extend(["ubuntu", "ec2-user", "admin"])
+    users = [options.ssh_user or "ubuntu"]
 
     last_error = None
-    for user in dict.fromkeys(users):
-        host = AwsHost(index=0, region="unknown", ip=ip, key_file=key_file, user=user)
-        try:
-            with _connect(host, options) as conn:
-                conn.run("hostname >/dev/null", hide=True, warn=False)
-            return user
-        except Exception as exc:
-            last_error = exc
+    for attempt in range(max(1, options.ssh_probe_retries)):
+        for user in dict.fromkeys(users):
+            host = AwsHost(index=0, region="unknown", ip=ip, key_file=key_file, user=user)
+            try:
+                with _connect(host, options) as conn:
+                    conn.run("hostname >/dev/null", hide=True, warn=False, in_stream=False)
+                return user
+            except Exception as exc:
+                last_error = exc
+        if attempt + 1 < options.ssh_probe_retries:
+            time.sleep(max(0, options.ssh_probe_delay_sec))
     raise BenchError(f"cannot ssh to {ip} with key {key_file}: {last_error}")
 
 
 def _remote_home(conn):
-    return conn.run("printf %s \"$HOME\"", hide=True).stdout.strip()
+    return conn.run("printf %s \"$HOME\"", hide=True, in_stream=False).stdout.strip()
 
 
 def _remote_root(conn, options):
@@ -547,21 +658,23 @@ def _build_local_aws_binaries(options):
 
 
 def _upload_binaries_to_host(host, options):
+    print(f"[{time.strftime('%H:%M:%S')}] uploading binaries to host{host.index} {host.region} {host.ip}")
     with _connect(host, options) as conn:
         remote_root = _remote_root(conn, options)
         remote_bin = f"{remote_root}/bin"
-        conn.run(f"rm -rf {_remote_quote(remote_root)} && mkdir -p {_remote_quote(remote_bin)}", hide=True)
+        conn.run(f"rm -rf {_remote_quote(remote_root)} && mkdir -p {_remote_quote(remote_bin)}", hide=True, in_stream=False)
         for _, _, binary_name in _aws_binary_targets(options.protocols):
             local_file = options.local_bin_dir / binary_name
             if not local_file.is_file():
                 raise BenchError(f"missing locally built binary: {local_file}")
+            print(f"[{time.strftime('%H:%M:%S')}] host{host.index}: put bin/{binary_name}")
             conn.put(str(local_file), remote=f"{remote_bin}/{binary_name}")
-        conn.run(f"chmod +x {_remote_quote(remote_bin)}/*", hide=True)
+        conn.run(f"chmod +x {_remote_quote(remote_bin)}/*", hide=True, in_stream=False)
 
 
 def _run_host(host, options, command, hide=True, warn=False):
     with _connect(host, options) as conn:
-        return conn.run(command, hide=hide, warn=warn)
+        return conn.run(command, hide=hide, warn=warn, in_stream=False)
 
 
 def _install_remote_tools(host, options):
@@ -588,8 +701,18 @@ def _startup_wait_seconds(options):
 
 
 def _default_aws_epoch_timeout_ms(nodes):
-    scale = max(1, (nodes + 3) // 4)
-    return 60000 * scale
+    return 60000
+
+
+def _aws_epoch_timeout_ms(nodes):
+    requested = int(os.environ.get("EPOCH_TIMEOUT_MS", str(_default_aws_epoch_timeout_ms(nodes))))
+    if requested > 60000:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] clamping AWS epoch timeout "
+            f"from {requested}ms to 60000ms"
+        )
+        return 60000
+    return requested
 
 
 def _aws_config(protocol, options, hosts):
@@ -637,13 +760,20 @@ def _write_aws_configs(options, hosts):
 
 
 def _upload_generated_configs(host, options):
+    print(f"[{time.strftime('%H:%M:%S')}] uploading configs to host{host.index} {host.region} {host.ip}")
     with _connect(host, options) as conn:
         remote_root = _remote_root(conn, options)
         remote_dir = f"{remote_root}/benchmark/generated/aws_n{options.n}"
-        conn.run(f"rm -rf {_remote_quote(remote_dir)} && mkdir -p {_remote_quote(remote_dir)}", hide=True)
+        conn.run(f"rm -rf {_remote_quote(remote_dir)} && mkdir -p {_remote_quote(remote_dir)}", hide=True, in_stream=False)
         for local_file in options.generated_dir.glob("*"):
             if local_file.is_file():
+                print(f"[{time.strftime('%H:%M:%S')}] host{host.index}: put generated/{local_file.name}")
                 conn.put(str(local_file), remote=f"{remote_dir}/{local_file.name}")
+
+
+def _upload_payload_to_host(host, options):
+    _upload_binaries_to_host(host, options)
+    _upload_generated_configs(host, options)
 
 
 def _remote_command_for_node(protocol, node, options):
@@ -651,10 +781,14 @@ def _remote_command_for_node(protocol, node, options):
     log_file = f"runlogs/{protocol}/node{node}.log"
     if protocol == "tyche":
         peers = (options.generated_dir / "tyche_peers.txt").read_text(encoding="utf-8")
+        attempt_ms = os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", "10000")
+        tyche_env = f"GOMAXPROCS={options.gomaxprocs} TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(attempt_ms)}"
+        if os.environ.get("TYCHE_DEBUG"):
+            tyche_env += f" TYCHE_DEBUG={_remote_quote(os.environ['TYCHE_DEBUG'])}"
         return (
             f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
             "export PATH=/usr/local/go/bin:$PATH "
-            f"GOMAXPROCS={options.gomaxprocs} && "
+            f"{tyche_env} && "
             f"/usr/bin/time -v ./bin/tyche -transport tcp -node node{node} "
             f"-n {options.n} -f {options.fault_threshold} -epochs {options.epochs} "
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
@@ -687,10 +821,11 @@ def _run_protocol_on_host(host, options, protocol):
             f"cd {_remote_quote(root)} && rm -rf {_remote_quote('runlogs/' + protocol)} "
             f"&& mkdir -p {_remote_quote('runlogs/' + protocol)}",
             hide=True,
+            in_stream=False,
         )
         command = "set -u; pids=\"\"; failed=0; " + "; ".join(node_commands)
         command += "; for p in $pids; do wait \"$p\" || failed=1; done; exit \"$failed\""
-        conn.run(f"cd {_remote_quote(root)} && {command}", hide=False)
+        conn.run(f"cd {_remote_quote(root)} && {command}", hide=False, in_stream=False)
 
 
 def _fetch_node_log(host, options, protocol, node):
@@ -701,11 +836,80 @@ def _fetch_node_log(host, options, protocol, node):
         conn.get(f"{root}/runlogs/{protocol}/node{node}.log", local=str(local_log))
 
 
+def _remote_node_log_tail(host, options, protocol, node):
+    log_file = f"runlogs/{protocol}/node{node}.log"
+    try:
+        with _connect(host, options) as conn:
+            root = _remote_root(conn, options)
+            result = conn.run(
+                f"cd {_remote_quote(root)} && "
+                f"if [ -f {_remote_quote(log_file)} ]; then tail -n 1 {_remote_quote(log_file)}; fi",
+                hide=True,
+                warn=True,
+                in_stream=False,
+            )
+    except Exception as exc:
+        return f"progress unavailable: {exc}"
+    return result.stdout.strip()
+
+
+def _remote_node_completion(host, options, protocol, node):
+    log_file = f"runlogs/{protocol}/node{node}.log"
+    try:
+        with _connect(host, options) as conn:
+            root = _remote_root(conn, options)
+            result = conn.run(
+                f"cd {_remote_quote(root)} && "
+                f"if [ ! -f {_remote_quote(log_file)} ]; then echo missing; exit 0; fi; "
+                f"tail -n 1 {_remote_quote(log_file)}; "
+                f"if grep -q 'Exit status: 0' {_remote_quote(log_file)} "
+                f"&& grep -q '^final metrics ' {_remote_quote(log_file)}; then "
+                f"echo __BENCH_DONE_OK__; "
+                f"elif grep -q 'Exit status:' {_remote_quote(log_file)}; then "
+                f"echo __BENCH_DONE_FAIL__; "
+                f"fi",
+                hide=True,
+                warn=True,
+                in_stream=False,
+            )
+    except Exception as exc:
+        return False, False, f"progress unavailable: {exc}"
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    ok = "__BENCH_DONE_OK__" in lines
+    failed = "__BENCH_DONE_FAIL__" in lines
+    tail_lines = [line for line in lines if not line.startswith("__BENCH_DONE_")]
+    tail = tail_lines[-1] if tail_lines else ""
+    return ok or failed, ok, tail
+
+
+def _remote_completed_hosts(hosts, options, protocol, pending_hosts):
+    if not pending_hosts:
+        return {}, {}
+    completed = {}
+    failed = {}
+    workers = min(16, len(pending_hosts))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_remote_node_completion, host, options, protocol, host.index): host
+            for host in pending_hosts
+        }
+        for future in as_completed(futures):
+            host = futures[future]
+            done, ok, tail = future.result()
+            if not done:
+                continue
+            if ok:
+                completed[host.index] = tail
+            else:
+                failed[host.index] = BenchError(tail or "remote command exited without final metrics")
+    return completed, failed
+
+
 def _stop_remote_processes(host, options):
     _run_host(
         host,
         options,
-        f"pkill -f '{options.remote_dir}/bin/(tyche|asyrand|grandline|spurt)' >/dev/null 2>&1 || true",
+        "pkill -f '([./]|/)bin/(tyche|asyrand|grandline|spurt)' >/dev/null 2>&1 || true",
         warn=True,
     )
 
@@ -731,6 +935,24 @@ def _line_value(lines, prefix):
     return ""
 
 
+def _line_token(line, key):
+    match = re.search(rf'\b{re.escape(key)}=("[^"]*"|\S+)', line)
+    if not match:
+        return ""
+    value = match.group(1)
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def _skip_summary(lines):
+    skipped = [line for line in lines if " skipped " in f" {line} "]
+    if not skipped:
+        return 0, "", "", ""
+    last = skipped[-1]
+    return len(skipped), _line_token(last, "stage"), _line_token(last, "reason"), _line_token(last, "diag")
+
+
 AWS_RESULT_FIELDS = [
     "protocol",
     "node",
@@ -739,11 +961,16 @@ AWS_RESULT_FIELDS = [
     "ip",
     "throughput_beacon_min",
     "throughput_beacon_s",
+    "elapsed_s",
     "latency_s",
     "bandwidth_kbps",
     "sent_kb",
     "recv_kb",
     "cpu_percent",
+    "skipped_epochs",
+    "last_skip_stage",
+    "last_skip_reason",
+    "last_skip_diag",
     "log",
 ]
 
@@ -758,9 +985,11 @@ def _aws_result_row(options, hosts, protocol, node):
     sent = _float_metric(final, "sent")
     recv = _float_metric(final, "recv")
     elapsed = _parse_duration_seconds(_line_value(lines, "Elapsed (wall clock) time"))
+    protocol_elapsed = _protocol_elapsed_seconds(final) or elapsed
     user = float(_line_value(lines, "User time (seconds)") or 0)
     sys_time = float(_line_value(lines, "System time (seconds)") or 0)
-    cpu_pct = ((user + sys_time) / elapsed * 100) if elapsed > 0 else 0
+    cpu_pct = ((user + sys_time) / protocol_elapsed * 100) if protocol_elapsed > 0 else 0
+    skipped_epochs, last_skip_stage, last_skip_reason, last_skip_diag = _skip_summary(lines)
     return {
         "protocol": protocol,
         "node": f"node{node}",
@@ -769,11 +998,16 @@ def _aws_result_row(options, hosts, protocol, node):
         "ip": host.ip,
         "throughput_beacon_min": f"{throughput:.4f}",
         "throughput_beacon_s": f"{throughput / 60:.4f}",
+        "elapsed_s": f"{protocol_elapsed:.3f}",
         "latency_s": f"{(60 / throughput) if throughput > 0 else 0:.4f}",
         "bandwidth_kbps": f"{bandwidth:.4f}",
         "sent_kb": f"{sent:.4f}",
         "recv_kb": f"{recv:.4f}",
         "cpu_percent": f"{cpu_pct:.2f}",
+        "skipped_epochs": str(skipped_epochs),
+        "last_skip_stage": last_skip_stage,
+        "last_skip_reason": last_skip_reason,
+        "last_skip_diag": last_skip_diag,
         "log": str(log_file),
     }
 
@@ -827,7 +1061,7 @@ def _run_complete_for_protocols(path, protocols, nodes):
     if (path / "failures.csv").exists():
         return False
     counts = _result_protocol_counts(path / "results.csv")
-    return all(counts.get(protocol, 0) >= nodes for protocol in protocols)
+    return all(counts.get(protocol, 0) >= _default_protocol_success_threshold(protocol, nodes) for protocol in protocols)
 
 
 def _completed_protocols(path, nodes):
@@ -838,7 +1072,11 @@ def _completed_protocols(path, nodes):
     else:
         failed = set()
     counts = _result_protocol_counts(path / "results.csv")
-    return {protocol for protocol, count in counts.items() if count >= nodes and protocol not in failed}
+    return {
+        protocol
+        for protocol, count in counts.items()
+        if count >= _default_protocol_success_threshold(protocol, nodes) and protocol not in failed
+    }
 
 
 def _find_resume_run(nodes, epochs, protocols):
@@ -851,23 +1089,45 @@ def _find_resume_run(nodes, epochs, protocols):
     return None
 
 
-def _parse_aws_results(options, hosts, protocol_failures=None):
+def _parse_aws_results(options, hosts, protocol_failures=None, preserve_protocols=None, completed_nodes=None):
     protocol_failures = protocol_failures or {}
+    preserve_protocols = preserve_protocols or set()
+    completed_nodes = completed_nodes or {}
     results_path = options.out_root / "results.csv"
     rows = []
     if results_path.exists():
         with results_path.open("r", newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
-                if row.get("protocol") not in set(options.protocols):
+                protocol = row.get("protocol", "")
+                if protocol in preserve_protocols or protocol not in set(options.protocols):
                     rows.append({field: row.get(field, "") for field in AWS_RESULT_FIELDS})
 
     parse_errors = []
     for protocol in options.protocols:
-        for node in range(options.n):
+        if protocol in preserve_protocols:
+            continue
+        protocol_rows = []
+        protocol_parse_errors = []
+        nodes_to_parse = sorted(completed_nodes.get(protocol, range(options.n)))
+        for node in nodes_to_parse:
             try:
-                rows.append(_aws_result_row(options, hosts, protocol, node))
+                row = _aws_result_row(options, hosts, protocol, node)
+                protocol_rows.append(row)
+                skipped_epochs = int(row.get("skipped_epochs") or "0")
+                if skipped_epochs > 0:
+                    protocol_parse_errors.append(
+                        (
+                            protocol,
+                            node,
+                            f"skipped_epochs={skipped_epochs} last_stage={row.get('last_skip_stage', '')} "
+                            f"last_reason={row.get('last_skip_reason', '')} diag={row.get('last_skip_diag', '')}",
+                        )
+                    )
             except Exception as exc:
-                parse_errors.append((protocol, node, str(exc)))
+                protocol_parse_errors.append((protocol, node, str(exc)))
+        rows.extend(protocol_rows)
+        if len(protocol_rows) < _protocol_success_threshold(protocol, options) or protocol_parse_errors:
+            parse_errors.extend(protocol_parse_errors)
 
     with results_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=AWS_RESULT_FIELDS)
@@ -962,26 +1222,31 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
         queue_len=int(os.environ.get("QUEUE_LEN", "8")),
         producer_ms=int(os.environ.get("PRODUCER_MS", "250")),
         prefill_ms=int(os.environ.get("PREFILL_MS", "8000")),
-        epoch_timeout_ms=int(os.environ.get("EPOCH_TIMEOUT_MS", str(_default_aws_epoch_timeout_ms(nodes)))),
+        epoch_timeout_ms=_aws_epoch_timeout_ms(nodes),
         report_ms=int(os.environ.get("REPORT_MS", "5000")),
-        linger_ms=int(os.environ.get("LINGER_MS", "120000")),
+        linger_ms=int(os.environ.get("LINGER_MS", "5000")),
         max_pool=int(os.environ.get("MAX_POOL", "16")),
         aggregation_lookahead=int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
         gomaxprocs=int(os.environ.get("GOMAXPROCS_REMOTE", "4")),
         startup_wait_sec=int(os.environ["STARTUP_WAIT_SEC"]) if os.environ.get("STARTUP_WAIT_SEC") else None,
-        ssh_connect_timeout=int(os.environ.get("SSH_CONNECT_TIMEOUT", "30")),
+        ssh_connect_timeout=int(os.environ.get("SSH_CONNECT_TIMEOUT", "6")),
+        ssh_probe_retries=int(os.environ.get("SSH_PROBE_RETRIES", "1")),
+        ssh_probe_delay_sec=int(os.environ.get("SSH_PROBE_DELAY_SEC", "0")),
     )
-    protocol_retries = int(os.environ.get("AWS_PROTOCOL_RETRIES", "4"))
+    protocol_retries = int(os.environ.get("AWS_PROTOCOL_RETRIES", "2"))
     options.out_root.mkdir(parents=True, exist_ok=True)
 
     skip_protocols = set()
     if resume_run:
         print(f"[{time.strftime('%H:%M:%S')}] resuming AWS run: {options.out_root}")
         skip_protocols = _completed_protocols(options.out_root, nodes)
-    hosts = _hosts_from_state(options.out_root / "aws_state.env", options)
+    reuse_state_hosts = os.environ.get("AWS_REUSE_STATE_HOSTS", "").lower() in {"1", "true", "yes"}
+    hosts = _hosts_from_state(options.out_root / "aws_state.env", options) if reuse_state_hosts else []
     if hosts:
         print(f"[{time.strftime('%H:%M:%S')}] using AWS hosts from existing run state")
     else:
+        if resume_run:
+            print(f"[{time.strftime('%H:%M:%S')}] discovering current running AWS hosts")
         hosts = _discover_aws_hosts(options, settings)
     _write_aws_configs(options, hosts)
     _write_aws_state(options, hosts)
@@ -994,12 +1259,11 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
     print(f"[{time.strftime('%H:%M:%S')}] preparing {len(hosts)} AWS hosts")
     print(f"[{time.strftime('%H:%M:%S')}] installing remote tools on {len(hosts)} AWS hosts")
     _parallel("install remote tools", hosts, lambda host: _install_remote_tools(host, options))
-    print(f"[{time.strftime('%H:%M:%S')}] uploading local binaries to {len(hosts)} AWS hosts")
-    _parallel("upload local binaries", hosts, lambda host: _upload_binaries_to_host(host, options), max_workers=min(4, len(hosts)))
-    print(f"[{time.strftime('%H:%M:%S')}] uploading generated configs to {len(hosts)} AWS hosts")
-    _parallel("upload generated configs", hosts, lambda host: _upload_generated_configs(host, options))
+    print(f"[{time.strftime('%H:%M:%S')}] uploading binaries and configs to {len(hosts)} AWS hosts")
+    _parallel("upload benchmark payload", hosts, lambda host: _upload_payload_to_host(host, options), max_workers=len(hosts))
 
     protocol_failures = {}
+    completed_nodes = {}
     for protocol in options.protocols:
         if protocol in skip_protocols:
             print(f"[{time.strftime('%H:%M:%S')}] skipping completed protocol {protocol}")
@@ -1010,32 +1274,158 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
             print(f"[{time.strftime('%H:%M:%S')}] running {protocol} on N={nodes} epochs={epochs}{suffix}")
             _parallel("stop remote processes", hosts, lambda host: _stop_remote_processes(host, options))
             run_error = None
-            with ThreadPoolExecutor(max_workers=len(hosts)) as pool:
-                futures = [pool.submit(_run_protocol_on_host, host, options, protocol) for host in hosts]
+            success_threshold = _protocol_success_threshold(protocol, options)
+            successful_hosts = set()
+            failed_hosts = {}
+            pool = ThreadPoolExecutor(max_workers=len(hosts))
+            try:
+                future_hosts = {pool.submit(_run_protocol_on_host, host, options, protocol): host for host in hosts}
                 wait_sec = _startup_wait_seconds(options)
                 if wait_sec > 0:
                     print(f"[{time.strftime('%H:%M:%S')}] waiting {wait_sec}s for startup")
                     time.sleep(wait_sec)
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        if run_error is None:
-                            run_error = exc
-            fetch_jobs = []
-            for node in range(options.n):
-                host = hosts[node]
-                fetch_jobs.append((host, node))
-            try:
-                _parallel(
-                    f"fetch {protocol} logs",
-                    fetch_jobs,
-                    lambda item: _fetch_node_log(item[0], options, protocol, item[1]),
-                    max_workers=min(16, len(fetch_jobs)),
+                pending = set(future_hosts)
+                while pending:
+                    done, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                    if not done and pending:
+                        tail = _remote_node_log_tail(hosts[0], options, protocol, 0)
+                        suffix = f"; node0: {tail}" if tail else ""
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] {protocol} still running: "
+                            f"{len(pending)}/{len(future_hosts)} host command(s) pending{suffix}"
+                        )
+                        pending_hosts = [future_hosts[future] for future in pending]
+                        remote_done, remote_failed = _remote_completed_hosts(hosts, options, protocol, pending_hosts)
+                        if remote_done or remote_failed:
+                            for future in list(pending):
+                                host = future_hosts[future]
+                                if host.index in remote_done:
+                                    successful_hosts.add(host.index)
+                                    pending.remove(future)
+                                    future.cancel()
+                                elif host.index in remote_failed:
+                                    failed_hosts[host.index] = remote_failed[host.index]
+                                    pending.remove(future)
+                                    future.cancel()
+                            print(
+                                f"[{time.strftime('%H:%M:%S')}] {protocol} remote logs show completion: "
+                                f"{len(successful_hosts)}/{len(future_hosts)} successful, "
+                                f"{len(failed_hosts)} failed, {len(pending)} pending"
+                            )
+                            if len(successful_hosts) >= success_threshold:
+                                if pending:
+                                    stragglers = [future_hosts[future] for future in pending]
+                                    print(
+                                        f"[{time.strftime('%H:%M:%S')}] {protocol} reached quorum from remote logs: "
+                                        f"{len(successful_hosts)}/{len(future_hosts)} host command(s) completed; "
+                                        f"stopping {len(stragglers)} straggler(s)"
+                                    )
+                                    _parallel(
+                                        "stop straggler processes",
+                                        stragglers,
+                                        lambda host: _stop_remote_processes(host, options),
+                                    )
+                                    for future in pending:
+                                        future.cancel()
+                                    pending = set()
+                                break
+                        continue
+                    for future in done:
+                        host = future_hosts[future]
+                        try:
+                            future.result()
+                            successful_hosts.add(host.index)
+                        except Exception as exc:
+                            failed_hosts[host.index] = exc
+                    if len(successful_hosts) >= success_threshold:
+                        if pending:
+                            stragglers = [future_hosts[future] for future in pending]
+                            print(
+                                f"[{time.strftime('%H:%M:%S')}] {protocol} reached quorum: "
+                                f"{len(successful_hosts)}/{len(future_hosts)} host command(s) completed; "
+                                f"stopping {len(stragglers)} straggler(s)"
+                            )
+                            _parallel("stop straggler processes", stragglers, lambda host: _stop_remote_processes(host, options))
+                            stopped, pending = wait(pending, timeout=10)
+                            for future in stopped:
+                                host = future_hosts[future]
+                                try:
+                                    future.result()
+                                    successful_hosts.add(host.index)
+                                except Exception as exc:
+                                    failed_hosts[host.index] = exc
+                            for future in pending:
+                                future.cancel()
+                            pending = set()
+                        break
+                    if len(successful_hosts) + len(pending) < success_threshold:
+                        if pending:
+                            stragglers = [future_hosts[future] for future in pending]
+                            _parallel("stop remote processes", stragglers, lambda host: _stop_remote_processes(host, options))
+                            wait(pending, timeout=10)
+                            for future in pending:
+                                future.cancel()
+                            pending = set()
+                        break
+                    if pending:
+                        tail = _remote_node_log_tail(hosts[0], options, protocol, 0)
+                        suffix = f"; node0: {tail}" if tail else ""
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] {protocol} progress: "
+                            f"{len(pending)}/{len(future_hosts)} host command(s) pending{suffix}"
+                        )
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+            if len(successful_hosts) < success_threshold:
+                failures = ", ".join(f"node{node}: {exc}" for node, exc in sorted(failed_hosts.items())[:3])
+                detail = f"; first failures: {failures}" if failures else ""
+                run_error = BenchError(
+                    f"{protocol} completed on {len(successful_hosts)}/{len(hosts)} hosts, "
+                    f"need at least {success_threshold}{detail}"
                 )
-            except BenchError as exc:
-                if run_error is None:
-                    run_error = exc
+            fetch_jobs = [(hosts[node], node) for node in sorted(successful_hosts)]
+            fetched_nodes = set()
+            fetch_errors = []
+            if fetch_jobs:
+                with ThreadPoolExecutor(max_workers=min(16, len(fetch_jobs))) as pool:
+                    fetch_futures = {
+                        pool.submit(_fetch_node_log, host, options, protocol, node): node
+                        for host, node in fetch_jobs
+                    }
+                    for future in as_completed(fetch_futures):
+                        node = fetch_futures[future]
+                        try:
+                            future.result()
+                            fetched_nodes.add(node)
+                        except Exception as exc:
+                            fetch_errors.append((node, exc))
+            if len(fetched_nodes) >= success_threshold:
+                successful_hosts = fetched_nodes
+                completed_nodes[protocol] = set(fetched_nodes)
+            elif run_error is None:
+                failures = ", ".join(f"node{node}: {exc}" for node, exc in fetch_errors[:3])
+                detail = f"; first fetch failures: {failures}" if failures else ""
+                run_error = BenchError(
+                    f"fetched logs for {len(fetched_nodes)}/{len(successful_hosts)} completed {protocol} hosts, "
+                    f"need at least {success_threshold}{detail}"
+                )
+            if run_error is not None and failed_hosts:
+                diagnostic_jobs = [
+                    (hosts[node], node)
+                    for node in sorted(failed_hosts)
+                    if node not in fetched_nodes
+                ]
+                if diagnostic_jobs:
+                    with ThreadPoolExecutor(max_workers=min(16, len(diagnostic_jobs))) as pool:
+                        diagnostics = [
+                            pool.submit(_fetch_node_log, host, options, protocol, node)
+                            for host, node in diagnostic_jobs
+                        ]
+                        for future in as_completed(diagnostics):
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
             if run_error is None:
                 break
             if attempt < protocol_retries:
@@ -1044,7 +1434,13 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
             protocol_failures[protocol] = str(run_error)
             print(f"[{time.strftime('%H:%M:%S')}] {protocol} failed; continuing with remaining protocols")
 
-    results = _parse_aws_results(options, hosts, protocol_failures)
+    results = _parse_aws_results(
+        options,
+        hosts,
+        protocol_failures,
+        preserve_protocols=skip_protocols,
+        completed_nodes=completed_nodes,
+    )
     _parallel("stop remote processes", hosts, lambda host: _stop_remote_processes(host, options))
     print(f"results: {results}")
     failures = options.out_root / "failures.csv"

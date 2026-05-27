@@ -26,6 +26,29 @@ func TestStateRemoveSourceOnEmptySource(t *testing.T) {
 	}
 }
 
+func TestRunEpochRemovesUnavailableSource(t *testing.T) {
+	state := NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1, 4, []byte{0})
+	source, err := state.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &Node{ID: "n0", State: state}
+	beacon, consumed, err := node.RunEpoch(context.Background(), time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beacon != nil || consumed {
+		t.Fatalf("RunEpoch returned beacon=%+v consumed=%v, want unavailable source retry", beacon, consumed)
+	}
+	next, err := state.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == source {
+		t.Fatalf("source %s was not removed after unavailable commitment", source)
+	}
+}
+
 func TestStateComQIsDictionaryArray(t *testing.T) {
 	state := NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1, 4, []byte{0})
 	idx, ok := state.MemberIndex["n1"]
@@ -64,6 +87,27 @@ func TestStateComQIsDictionaryArray(t *testing.T) {
 	}
 	if state.Enqueue(seq1) {
 		t.Fatal("consumed old commitment was accepted again")
+	}
+}
+
+func TestStateCanSkipMissingCommitmentHead(t *testing.T) {
+	state := NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1, 4, []byte{0})
+	seq2 := asig.Commitment{Dealer: "n1", Seq: 2, SecretID: "n1/2"}
+	if !state.Enqueue(seq2) {
+		t.Fatal("seq=2 commitment was not recorded")
+	}
+	if state.HasCommitment("n1") {
+		t.Fatal("seq=2 should not satisfy missing seq=1 head")
+	}
+	if !state.AdvanceHeadToNextCommitment("n1") {
+		t.Fatal("missing head was not advanced to available commitment")
+	}
+	if !state.HasCommitment("n1") {
+		t.Fatal("advanced head did not expose seq=2")
+	}
+	got, ok := state.PopCommitment("n1")
+	if !ok || got.Seq != 2 {
+		t.Fatalf("pop after skip = %+v, %v; want seq=2", got, ok)
 	}
 }
 

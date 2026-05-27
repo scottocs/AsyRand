@@ -43,6 +43,7 @@ type Node struct {
 	mu      sync.Mutex
 	epochs  map[uint64]*epochState
 	beacons chan *Beacon
+	pending map[uint64]*Beacon
 }
 
 type NodeConfig struct {
@@ -106,6 +107,11 @@ type pendingVote struct {
 	from  p2p.NodeID
 }
 
+type pendingBeaconMessage struct {
+	msg  BeaconMessage
+	from p2p.NodeID
+}
+
 type BeaconMessage struct {
 	Epoch      uint64                 `json:"epoch"`
 	Leader     p2p.NodeID             `json:"leader"`
@@ -161,6 +167,7 @@ type epochState struct {
 	random         []byte
 	randomHash     string
 	beaconSent     bool
+	pendingBeacon  []pendingBeaconMessage
 	beaconVotes    map[string]map[p2p.NodeID]asig.BLSSignatureShare
 	certificate    asig.BLSAggregateSignature
 	certificateSet bool
@@ -199,6 +206,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		lookahead: uint64(lookahead),
 		epochs:    make(map[uint64]*epochState),
 		beacons:   make(chan *Beacon, state.N*4),
+		pending:   make(map[uint64]*Beacon),
 	}, nil
 }
 
@@ -287,6 +295,10 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 	defer deadline.Stop()
 
 	for {
+		if b := n.pendingBeacon(epoch); b != nil {
+			n.State.Advance(b.Random)
+			return b, nil
+		}
 		select {
 		case <-ticker.C:
 			n.tick(epoch)
@@ -295,12 +307,73 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 				n.State.Advance(b.Random)
 				return b, nil
 			}
+			if b != nil && b.Epoch > epoch {
+				n.pending[b.Epoch] = b
+			}
 		case <-deadline.C:
-			return nil, errEpochTimeout
+			return n.SkipCurrentEpochAt("beacon_wait", "timeout"), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func (n *Node) SkipCurrentEpoch(reason string) *Beacon {
+	return n.SkipCurrentEpochAt(reason, reason)
+}
+
+func (n *Node) SkipCurrentEpochAt(stage string, reason string) *Beacon {
+	epoch, random := n.State.Skip(reason)
+	diag := n.skipDiagnostics(epoch)
+	n.mu.Lock()
+	delete(n.epochs, epoch)
+	n.mu.Unlock()
+	return &Beacon{Epoch: epoch, Random: random, Digest: reason, Skipped: true, SkipStage: stage, SkipReason: reason, SkipDiag: diag}
+}
+
+func (n *Node) skipDiagnostics(epoch uint64) string {
+	n.mu.Lock()
+	totalEpochs := len(n.epochs)
+	pendingBeacons := len(n.pending)
+	commits := 0
+	selected := 0
+	prepare := 0
+	precommit := 0
+	commit := 0
+	finalize := 0
+	reconShares := 0
+	proposal := false
+	privateVerified := false
+	decided := false
+	reconSent := false
+	if es := n.epochs[epoch]; es != nil {
+		commits = len(es.commits)
+		selected = len(es.selected)
+		prepare = len(es.prepare)
+		precommit = len(es.precommit)
+		commit = len(es.commit)
+		finalize = len(es.finalize)
+		reconShares = len(es.reconShares)
+		proposal = es.leaderProposal != nil
+		privateVerified = es.privateVerified
+		decided = es.decided
+		reconSent = es.reconSent
+	}
+	n.mu.Unlock()
+	metrics := n.Transport.Metrics()
+	leader := n.State.Leader(epoch)
+	return fmt.Sprintf(
+		"local_epoch=%d leader=%s epochs=%d pending_beacons=%d proposal=%t commits=%d selected=%d private_verified=%t decided=%t prepare=%d precommit=%d commit=%d finalize=%d recon_sent=%t recon_shares=%d sent_msgs=%d recv_msgs=%d",
+		n.State.CurrentEpoch(), leader, totalEpochs, pendingBeacons, proposal, commits, selected, privateVerified, decided, prepare, precommit, commit, finalize, reconSent, reconShares, metrics.SentMessages, metrics.RecvMessages,
+	)
+}
+
+func (n *Node) pendingBeacon(epoch uint64) *Beacon {
+	b := n.pending[epoch]
+	if b != nil {
+		delete(n.pending, epoch)
+	}
+	return b
 }
 
 func (n *Node) propose(ctx context.Context, epoch uint64) error {
@@ -647,6 +720,15 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	if !n.PVSS.Verify(msg.Aggregate) {
 		return
 	}
+	if msg.Epoch > n.State.CurrentEpoch() {
+		n.mu.Lock()
+		es := n.stateAtLocked(msg.Epoch)
+		if es != nil && es.leaderProposal == nil {
+			es.pendingProposal = &msg
+		}
+		n.mu.Unlock()
+		return
+	}
 	selected, ok, pending := n.validateProposal(msg.Epoch, msg.Selected, msg.Digest)
 	if !ok {
 		if !pending {
@@ -680,12 +762,15 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 			es.pendingVotes = nil
 			pendingRecon := append([]ReconMessage(nil), es.pendingRecon...)
 			es.pendingRecon = nil
+			pendingBeacon := append([]pendingBeaconMessage(nil), es.pendingBeacon...)
+			es.pendingBeacon = nil
 			n.mu.Unlock()
 			if shouldGossip {
 				n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
 			}
 			n.replayPendingVotes(pendingVotes, msg.Digest)
 			n.replayPendingRecon(pendingRecon, msg.Digest)
+			n.replayPendingBeacon(pendingBeacon, msg.Digest)
 			n.maybeSendPrepare(es)
 			return
 		}
@@ -714,6 +799,8 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	es.pendingVotes = nil
 	pendingRecon := append([]ReconMessage(nil), es.pendingRecon...)
 	es.pendingRecon = nil
+	pendingBeacon := append([]pendingBeaconMessage(nil), es.pendingBeacon...)
+	es.pendingBeacon = nil
 	n.mu.Unlock()
 	if shouldGossip {
 		n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
@@ -726,6 +813,7 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	}
 	n.replayPendingVotes(pendingVotes, msg.Digest)
 	n.replayPendingRecon(pendingRecon, msg.Digest)
+	n.replayPendingBeacon(pendingBeacon, msg.Digest)
 	n.maybeSendPrepare(es)
 }
 
@@ -773,12 +861,15 @@ func (n *Node) tryPendingProposal(es *epochState) {
 	es.pendingVotes = nil
 	pendingRecon := append([]ReconMessage(nil), es.pendingRecon...)
 	es.pendingRecon = nil
+	pendingBeacon := append([]pendingBeaconMessage(nil), es.pendingBeacon...)
+	es.pendingBeacon = nil
 	n.mu.Unlock()
 	if shouldGossip {
 		n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
 	}
 	n.replayPendingVotes(pendingVotes, msg.Digest)
 	n.replayPendingRecon(pendingRecon, msg.Digest)
+	n.replayPendingBeacon(pendingBeacon, msg.Digest)
 }
 
 func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
@@ -926,6 +1017,15 @@ func (n *Node) replayPendingRecon(messages []ReconMessage, digest string) {
 			continue
 		}
 		n.handleRecon(msg, msg.Share.Holder)
+	}
+}
+
+func (n *Node) replayPendingBeacon(messages []pendingBeaconMessage, digest string) {
+	for _, pending := range messages {
+		if pending.msg.Digest != digest {
+			continue
+		}
+		n.handleBeacon(pending.msg, pending.from)
 	}
 }
 
@@ -1110,6 +1210,9 @@ func (n *Node) handleBeacon(msg BeaconMessage, from p2p.NodeID) {
 	n.mu.Lock()
 	es := n.stateAtLocked(msg.Epoch)
 	if es == nil || es.leaderProposal == nil || es.leaderProposal.Digest != msg.Digest {
+		if es != nil && es.leaderProposal == nil {
+			es.pendingBeacon = append(es.pendingBeacon, pendingBeaconMessage{msg: msg, from: from})
+		}
 		n.mu.Unlock()
 		return
 	}

@@ -14,6 +14,15 @@ import (
 )
 
 const defaultMaxMessageBytes = 64 << 20
+const minTCPBuffer = 4096
+
+func TCPBufferForPeers(peers int) int {
+	buffer := peers * peers * 16
+	if buffer < minTCPBuffer {
+		return minTCPBuffer
+	}
+	return buffer
+}
 
 type TCPTransport struct {
 	id       NodeID
@@ -137,8 +146,9 @@ func (t *TCPTransport) Send(ctx context.Context, to NodeID, msg Message) error {
 			t.recvMessages.Add(1)
 			t.recvBytes.Add(size)
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		default:
+			go t.enqueueSelf(ctx, msg, uint64(len(data))+4)
+			return nil
 		}
 	}
 	addr, ok := t.peers[to]
@@ -170,14 +180,43 @@ func (t *TCPTransport) Send(ctx context.Context, to NodeID, msg Message) error {
 	return last
 }
 
-func (t *TCPTransport) Broadcast(ctx context.Context, msg Message) error {
-	var last error
-	for id := range t.peers {
-		if err := t.Send(ctx, id, msg); err != nil {
-			last = err
-		}
+func (t *TCPTransport) enqueueSelf(ctx context.Context, msg Message, size uint64) {
+	select {
+	case t.inbox <- msg:
+		t.sentMessages.Add(1)
+		t.sentBytes.Add(size)
+		t.recvMessages.Add(1)
+		t.recvBytes.Add(size)
+	case <-ctx.Done():
 	}
-	if last != nil {
+}
+
+func (t *TCPTransport) Broadcast(ctx context.Context, msg Message) error {
+	type result struct {
+		err error
+	}
+	results := make(chan result, len(t.peers))
+	var wg sync.WaitGroup
+	for id := range t.peers {
+		msgCopy := msg
+		wg.Add(1)
+		go func(id NodeID) {
+			defer wg.Done()
+			results <- result{err: t.Send(ctx, id, msgCopy)}
+		}(id)
+	}
+	wg.Wait()
+	close(results)
+	var last error
+	sent := 0
+	for res := range results {
+		if res.err != nil {
+			last = res.err
+			continue
+		}
+		sent++
+	}
+	if sent == 0 && last != nil {
 		return last
 	}
 	return nil

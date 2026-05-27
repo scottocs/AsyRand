@@ -21,6 +21,10 @@ type Beacon struct {
 	Selected   []CommitmentRef            `json:"selected"`
 	Signature  asig.BLSAggregateSignature `json:"signature"`
 	Committeds int                        `json:"committeds"`
+	Skipped    bool                       `json:"skipped,omitempty"`
+	SkipStage  string                     `json:"skip_stage,omitempty"`
+	SkipReason string                     `json:"skip_reason,omitempty"`
+	SkipDiag   string                     `json:"skip_diag,omitempty"`
 }
 
 type State struct {
@@ -30,6 +34,7 @@ type State struct {
 	F     int
 	Epoch uint64
 	RPrev []byte
+	Seed  []byte
 
 	Members     []p2p.NodeID
 	MemberIndex map[p2p.NodeID]int
@@ -38,14 +43,15 @@ type State struct {
 func NewState(members []p2p.NodeID, f int, seed []byte) *State {
 	cp := append([]p2p.NodeID(nil), members...)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-	rprev := append([]byte(nil), seed...)
-	if len(rprev) == 0 {
-		rprev = asig.HashBytes([]byte("Spurt-v1-genesis"))
+	seedCopy := append([]byte(nil), seed...)
+	if len(seedCopy) == 0 {
+		seedCopy = asig.HashBytes([]byte("Spurt-v1-genesis"))
 	}
 	st := &State{
 		N:           len(cp),
 		F:           f,
-		RPrev:       rprev,
+		RPrev:       epochSeed(seedCopy, 0),
+		Seed:        seedCopy,
 		Members:     cp,
 		MemberIndex: make(map[p2p.NodeID]int, len(cp)),
 	}
@@ -64,7 +70,7 @@ func (s *State) CurrentEpoch() uint64 {
 func (s *State) RPrevBytes() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]byte(nil), s.RPrev...)
+	return epochSeed(s.Seed, s.Epoch)
 }
 
 func (s *State) Threshold() int {
@@ -104,8 +110,22 @@ func (s *State) Advance(random []byte) {
 	s.Epoch++
 }
 
+func (s *State) Skip(reason string) (uint64, []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	epoch := s.Epoch
+	random := asig.HashBytes([]byte("Spurt-v1/skip"), epochSeed(s.Seed, epoch), encodeEpoch(epoch), []byte(reason))
+	s.RPrev = append([]byte(nil), random...)
+	s.Epoch++
+	return epoch, append([]byte(nil), random...)
+}
+
 func encodeEpoch(e uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, e)
 	return b
+}
+
+func epochSeed(seed []byte, epoch uint64) []byte {
+	return asig.HashBytes([]byte("Spurt-v1/epoch"), seed, encodeEpoch(epoch))
 }

@@ -17,6 +17,7 @@ import (
 )
 
 const Protocol = "asyrand"
+const maxSourceAttemptTimeout = 20 * time.Second
 
 var errCommitmentNotReady = errors.New("source commitment not ready")
 
@@ -212,7 +213,12 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, bo
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	deadline := time.Now().Add(timeout)
+	epochDeadline := time.Now().Add(timeout)
+	sourceWait := timeout
+	if sourceWait > maxSourceAttemptTimeout {
+		sourceWait = maxSourceAttemptTimeout
+	}
+	sourceDeadline := time.Now().Add(sourceWait)
 	epoch := n.State.CurrentEpoch()
 	instance := fmt.Sprintf("epoch/%d/source/%s", epoch, source)
 	var commitID string
@@ -226,9 +232,12 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, bo
 				return nil, false, err
 			}
 		}
-		remaining := time.Until(deadline)
+		remaining := time.Until(sourceDeadline)
 		if remaining <= 0 {
-			return nil, false, n.epochTimeoutError(epoch, source)
+			if !n.State.AdvanceHeadToNextCommitment(source) {
+				n.State.RemoveSource(source)
+			}
+			return nil, false, nil
 		}
 		wait := 10 * time.Millisecond
 		if remaining < wait {
@@ -241,9 +250,9 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, bo
 		}
 	}
 
-	remaining := time.Until(deadline)
+	remaining := time.Until(epochDeadline)
 	if remaining <= 0 {
-		return nil, false, n.epochTimeoutError(epoch, source)
+		return n.SkipCurrentEpochAt(source, "consumer_start", "timeout"), false, nil
 	}
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
@@ -256,11 +265,40 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, bo
 			n.State.AdvanceForSource(beacon.Random, source)
 			return beacon, true, nil
 		case <-timer.C:
-			return nil, false, n.epochTimeoutError(epoch, source)
+			return n.SkipCurrentEpochAt(source, "beacon_wait", "timeout"), false, nil
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 		}
 	}
+}
+
+func (n *Node) SkipCurrentEpoch(source p2p.NodeID, reason string) *Beacon {
+	return n.SkipCurrentEpochAt(source, reason, reason)
+}
+
+func (n *Node) SkipCurrentEpochAt(source p2p.NodeID, stage string, reason string) *Beacon {
+	epoch := n.State.CurrentEpoch()
+	diag := n.skipDiagnostics(source)
+	random := n.State.Skip(source, reason)
+	return &Beacon{Epoch: epoch, Source: source, Random: random, CommitID: reason, Skipped: true, SkipStage: stage, SkipReason: reason, SkipDiag: diag}
+}
+
+func (n *Node) skipDiagnostics(source p2p.NodeID) string {
+	queueTotal, queueMax := n.State.QueueBacklog()
+	current := n.State.CurrentEpoch()
+	hasCommitment := false
+	queueLen := 0
+	consumedSeq := uint64(0)
+	if source != "" {
+		hasCommitment = n.State.HasCommitment(source)
+		queueLen = n.State.QueueLength(source)
+		consumedSeq = n.State.ConsumedSeq(source)
+	}
+	metrics := n.Transport.Metrics()
+	return fmt.Sprintf(
+		"local_epoch=%d source=%s source_has_commitment=%t source_queue=%d source_consumed_seq=%d queue_total=%d queue_max=%d sent_msgs=%d recv_msgs=%d",
+		current, source, hasCommitment, queueLen, consumedSeq, queueTotal, queueMax, metrics.SentMessages, metrics.RecvMessages,
+	)
 }
 
 func (n *Node) AcceptCommitment(commit asig.Commitment) bool {

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,13 +10,17 @@ from .errors import BenchError
 
 try:
     import boto3
+    from botocore.config import Config as BotoConfig
     from botocore.exceptions import BotoCoreError
     from botocore.exceptions import ClientError
+    from botocore.exceptions import ProxyConnectionError
     from botocore.parsers import ResponseParserError
 except ImportError:  # pragma: no cover - exercised only when dependencies are missing.
     boto3 = None
+    BotoConfig = None
     BotoCoreError = Exception
     ClientError = Exception
+    ProxyConnectionError = Exception
     ResponseParserError = Exception
 
 
@@ -68,13 +73,20 @@ def _require_boto3():
 
 def _client(region):
     _require_boto3()
-    return boto3.client("ec2", region_name=region)
+    if os.environ.get("AWS_USE_PROXY", "").lower() in {"1", "true", "yes"}:
+        return boto3.client("ec2", region_name=region)
+    return boto3.client("ec2", region_name=region, config=BotoConfig(proxies={}))
 
 
 def _aws_error(exc):
     if isinstance(exc, ClientError):
         error = exc.response.get("Error", {})
         return f"{error.get('Code', 'AWS')} {error.get('Message', exc)}"
+    if isinstance(exc, ProxyConnectionError):
+        return (
+            f"{exc}; boto3 is using proxy environment variables. "
+            "This benchmark disables proxies for AWS by default; if you explicitly need the proxy, run `$env:AWS_USE_PROXY='1'`."
+        )
     return str(exc)
 
 

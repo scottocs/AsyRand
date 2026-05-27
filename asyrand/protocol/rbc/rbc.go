@@ -130,7 +130,7 @@ func (b *Broadcaster) observe(ctx context.Context, kind string, vote VoteMessage
 	}
 	echoCount := len(b.echoes[k])
 	readyCount := len(b.readies[k])
-	needReady := !b.readySent[k] && echoCount >= 2*b.F+1
+	needReady := !b.readySent[k] && (echoCount >= 2*b.F+1 || readyCount >= b.F+1)
 	if needReady {
 		b.readySent[k] = true
 	}

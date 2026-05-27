@@ -93,7 +93,7 @@ func SetupGRandFromAPVSS(ids []p2p.NodeID, schemes map[p2p.NodeID]*PVSSPairingFr
 	secrets := make(map[p2p.NodeID]string, len(ids))
 	for _, id := range ids {
 		scheme := schemes[id]
-		dec, err := scheme.PreRecon(aggregate, id)
+		dec, err := scheme.PreReconTrusted(aggregate, id)
 		if err != nil {
 			return GRandResult{}, err
 		}

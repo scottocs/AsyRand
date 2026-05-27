@@ -40,7 +40,7 @@ def print_latest_summary(run_dir=None):
         print("results.csv is empty")
         return
 
-    headers = ("protocol", "node", "throughput_beacon_s", "bandwidth_kbps", "cpu_percent")
+    headers = ("protocol", "node", "elapsed_s", "throughput_beacon_s", "bandwidth_kbps", "cpu_percent")
     print(",".join(headers))
     for row in rows:
         print(
@@ -48,6 +48,7 @@ def print_latest_summary(run_dir=None):
                 [
                     row.get("protocol", ""),
                     row.get("node", ""),
+                    _format_float(row.get("elapsed_s"), 3),
                     _format_float(row.get("throughput_beacon_s"), 4),
                     _format_float(row.get("bandwidth_kbps"), 2),
                     _format_float(row.get("cpu_percent"), 2),

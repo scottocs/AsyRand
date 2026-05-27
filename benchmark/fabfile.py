@@ -80,7 +80,7 @@ def info(ctx, settings=""):
 
 
 @task
-def start(ctx, max=10, settings=""):
+def start(ctx, max=100, settings=""):
     """Start stopped AWS benchmark nodes."""
     _run_or_exit(start_instances, max_per_region=int(max), settings_file=settings or None)
 

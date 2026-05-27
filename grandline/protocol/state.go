@@ -11,12 +11,16 @@ import (
 )
 
 type Beacon struct {
-	Epoch  uint64     `json:"epoch"`
-	Source p2p.NodeID `json:"source"`
-	Random []byte     `json:"random"`
-	Commit string     `json:"commit"`
-	SigHex string     `json:"signature"`
-	Shares int        `json:"shares"`
+	Epoch      uint64     `json:"epoch"`
+	Source     p2p.NodeID `json:"source"`
+	Random     []byte     `json:"random"`
+	Commit     string     `json:"commit"`
+	SigHex     string     `json:"signature"`
+	Shares     int        `json:"shares"`
+	Skipped    bool       `json:"skipped,omitempty"`
+	SkipStage  string     `json:"skip_stage,omitempty"`
+	SkipReason string     `json:"skip_reason,omitempty"`
+	SkipDiag   string     `json:"skip_diag,omitempty"`
 }
 
 type State struct {
@@ -27,6 +31,7 @@ type State struct {
 	QueueLen int
 	Epoch    uint64
 	RPrev    []byte
+	Seed     []byte
 
 	Members          []p2p.NodeID
 	MemberIndex      map[p2p.NodeID]int
@@ -41,15 +46,16 @@ type State struct {
 func NewState(members []p2p.NodeID, f, queueLen int, seed []byte) *State {
 	cp := append([]p2p.NodeID(nil), members...)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-	rprev := append([]byte(nil), seed...)
-	if len(rprev) == 0 {
-		rprev = asig.HashBytes([]byte("GrandLine-v1-genesis"))
+	seedCopy := append([]byte(nil), seed...)
+	if len(seedCopy) == 0 {
+		seedCopy = asig.HashBytes([]byte("GrandLine-v1-genesis"))
 	}
 	st := &State{
 		N:                len(cp),
 		F:                f,
 		QueueLen:         queueLen,
-		RPrev:            rprev,
+		RPrev:            epochSeed(seedCopy, 0),
+		Seed:             seedCopy,
 		Members:          cp,
 		MemberIndex:      make(map[p2p.NodeID]int, len(cp)),
 		SourceCandidates: append([]p2p.NodeID(nil), cp...),
@@ -72,10 +78,11 @@ func (s *State) Source() (p2p.NodeID, error) {
 		return "", errors.New("source candidate list is empty")
 	}
 	idx := 0
-	if len(s.RPrev) >= 8 {
-		idx = int(binary.BigEndian.Uint64(s.RPrev[:8]) % uint64(len(s.SourceCandidates)))
-	} else if len(s.RPrev) > 0 {
-		idx = int(s.RPrev[0]) % len(s.SourceCandidates)
+	selector := epochSeed(s.Seed, s.Epoch)
+	if len(selector) >= 8 {
+		idx = int(binary.BigEndian.Uint64(selector[:8]) % uint64(len(s.SourceCandidates)))
+	} else if len(selector) > 0 {
+		idx = int(selector[0]) % len(s.SourceCandidates)
 	}
 	return s.SourceCandidates[idx], nil
 }
@@ -89,7 +96,7 @@ func (s *State) CurrentEpoch() uint64 {
 func (s *State) RPrevBytes() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]byte(nil), s.RPrev...)
+	return epochSeed(s.Seed, s.Epoch)
 }
 
 func (s *State) Threshold() int {
@@ -197,6 +204,16 @@ func (s *State) Advance(random []byte, source p2p.NodeID) {
 	}
 }
 
+func (s *State) Skip(reason string) (uint64, []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	epoch := s.Epoch
+	random := asig.HashBytes([]byte("GrandLine-v1/skip"), epochSeed(s.Seed, epoch), encodeUint64(epoch), []byte(reason))
+	s.RPrev = append([]byte(nil), random...)
+	s.Epoch++
+	return epoch, append([]byte(nil), random...)
+}
+
 func (s *State) QueueLength(id p2p.NodeID) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -286,4 +303,14 @@ func (s *State) activeCountLocked() int {
 		}
 	}
 	return count
+}
+
+func encodeUint64(v uint64) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, v)
+	return out
+}
+
+func epochSeed(seed []byte, epoch uint64) []byte {
+	return asig.HashBytes([]byte("GrandLine-v1/epoch"), seed, encodeUint64(epoch))
 }

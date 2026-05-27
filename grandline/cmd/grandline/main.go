@@ -65,7 +65,6 @@ func main() {
 func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
-	start := time.Now()
 
 	rt, err := prepareRuntime(cfg)
 	if err != nil {
@@ -91,6 +90,9 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 
 	limit := uint64(cfg.Round)
 	if duration > 0 {
@@ -118,18 +120,26 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 			}
 			if sample == nil {
 				sample = b
+			} else if sample.Epoch != b.Epoch || string(sample.Random) != string(b.Random) || sample.Skipped != b.Skipped {
+				return fmt.Errorf("epoch %d inconsistent beacon: sample_epoch=%d sample_skipped=%t got_epoch=%d got_skipped=%t",
+					epoch, sample.Epoch, sample.Skipped, b.Epoch, b.Skipped)
 			}
+		}
+		if sample != nil && sample.Skipped {
+			fmt.Printf("epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+			continue
 		}
 		stats.beacons.Add(1)
 		if sample != nil {
 			fmt.Printf("epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n",
 				sample.Epoch, sample.Commit, sample.Shares, sample.SigHex[:16], sample.Random[:8])
 		}
-		if duration > 0 && time.Since(start) >= duration {
+		if duration > 0 && time.Since(benchStart) >= duration {
 			break
 		}
 	}
-	printMetrics("final", nodes, time.Since(start), stats.beacons.Load())
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
 	return nil
 }
 
@@ -139,17 +149,19 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	}
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
-	start := time.Now()
+	peers := cfg.PeerMap()
+	transport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)))
+	if err := transport.Start(runCtx); err != nil {
+		return err
+	}
+	fmt.Printf("node=%s preparing grand setup nodes=%d f=%d threshold=%d\n", cfg.NodeID, len(cfg.Members()), cfg.F, cfg.F+1)
 	rt, err := prepareRuntime(cfg)
 	if err != nil {
 		return err
 	}
-	transport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap(), 4096)
+	fmt.Printf("node=%s grand setup ready\n", cfg.NodeID)
 	node, err := newNode(cfg, rt, cfg.NodeID, transport)
 	if err != nil {
-		return err
-	}
-	if err := transport.Start(runCtx); err != nil {
 		return err
 	}
 	if err := waitForTCPPeers(runCtx, cfg.NodeID, cfg.PeerMap(), 30*time.Second); err != nil {
@@ -166,21 +178,31 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
 	count := uint64(0)
+	nodes := []*grandline.Node{node}
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 	for {
-		if duration > 0 && time.Since(start) >= duration {
+		if duration > 0 && time.Since(benchStart) >= duration {
 			break
 		}
 		if uint64(cfg.Round) > 0 && count >= uint64(cfg.Round) {
 			break
 		}
-		_, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
+		b, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
 		if err != nil {
 			return err
+		}
+		if b != nil && b.Skipped {
+			fmt.Printf("node=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", node.ID, b.Epoch, b.SkipStage, b.SkipReason, b.Random[:8], b.SkipDiag)
+			count++
+			continue
 		}
 		count++
 		stats.beacons.Add(1)
 	}
-	printMetrics("final", []*grandline.Node{node}, time.Since(start), stats.beacons.Load())
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -364,9 +386,10 @@ func printMetricDelta(label string, delta metricSnapshot, perf grandline.PerfSna
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d sign_avg=%s verify_avg=%s recover_avg=%s pvss_share_avg=%s pvss_verify_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d sign_avg=%s verify_avg=%s recover_avg=%s pvss_share_avg=%s pvss_verify_avg=%s\n",
 		label,
 		beacons,
+		elapsed.Seconds(),
 		float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages,
 		float64(delta.sentBytes)/1024,

@@ -68,7 +68,6 @@ func main() {
 func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
-	start := time.Now()
 	rt, err := prepareRuntime(cfg)
 	if err != nil {
 		return err
@@ -91,6 +90,9 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 
 	for epoch := uint64(0); epoch < uint64(cfg.Round); epoch++ {
 		result := make(chan *spurt.Beacon, len(nodes))
@@ -124,11 +126,17 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 		if sample == nil {
 			return fmt.Errorf("epoch %d produced no beacon", epoch)
 		}
+		if sample.Skipped {
+			fmt.Printf("epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
+				sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+			continue
+		}
 		stats.beacons.Add(1)
 		fmt.Printf("epoch=%d leader=%s digest=%s selected=%d random=%x\n",
 			sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.Digest, sample.Committeds, sample.Random[:8])
 	}
-	printMetrics("final", nodes, time.Since(start), stats.beacons.Load())
+	cacheTotal, cacheMax := collectCachedCommitments(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), cacheTotal, cacheMax, time.Since(benchStart), stats.beacons.Load())
 	return nil
 }
 
@@ -138,12 +146,12 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	}
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
-	start := time.Now()
 	rt, err := prepareRuntime(cfg)
 	if err != nil {
 		return err
 	}
-	nodeTransport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap(), 4096)
+	peers := cfg.PeerMap()
+	nodeTransport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)))
 	node, err := newNode(cfg, rt, cfg.NodeID, nodeTransport)
 	if err != nil {
 		return err
@@ -162,8 +170,11 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 
 	printConfig(cfg, 1, "tcp")
 	count := uint64(0)
+	benchStart := time.Now()
+	benchMetrics := collectMetrics([]*spurt.Node{node})
+	benchPerf := collectPerf([]*spurt.Node{node})
 	for {
-		if duration > 0 && time.Since(start) >= duration {
+		if duration > 0 && time.Since(benchStart) >= duration {
 			break
 		}
 		if count >= uint64(cfg.Round) {
@@ -174,11 +185,18 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 			return err
 		}
 		count++
+		if b.Skipped {
+			fmt.Printf("node=%s epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
+				node.ID, b.Epoch, node.State.Leader(b.Epoch), b.SkipStage, b.SkipReason, b.Random[:8], b.SkipDiag)
+			continue
+		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d leader=%s digest=%s random=%x\n",
 			node.ID, b.Epoch, node.State.Leader(b.Epoch), b.Digest, b.Random[:8])
 	}
-	printMetrics("final", []*spurt.Node{node}, time.Since(start), stats.beacons.Load())
+	nodes := []*spurt.Node{node}
+	cacheTotal, cacheMax := collectCachedCommitments(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), cacheTotal, cacheMax, time.Since(benchStart), stats.beacons.Load())
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -356,8 +374,8 @@ func printMetricDelta(label string, delta metricSnapshot, perf spurt.PerfSnapsho
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s cached_total=%d cached_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s spurt_vote_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
-		label, beacons, float64(beacons)*60/seconds,
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s cached_total=%d cached_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s spurt_vote_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+		label, beacons, elapsed.Seconds(), float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
 		cacheTotal, cacheMax,

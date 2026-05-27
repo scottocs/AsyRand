@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -119,7 +121,6 @@ func run(opts runOptions) error {
 func runMemory(opts runOptions) error {
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
-	started := time.Now()
 
 	ids, pp, keys, err := setupRuntime(opts.n, opts.f, opts.pvss)
 	if err != nil {
@@ -151,16 +152,20 @@ func runMemory(opts runOptions) error {
 		nodes = append(nodes, node)
 	}
 
-	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s\n",
-		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool, opts.pvss)
+	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
+	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s\n",
+		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.pvss)
 
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 
 	for epoch := 1; epoch <= opts.epochs; epoch++ {
-		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
+		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
 		results := make(chan result, len(nodes))
 		for _, node := range nodes {
 			go func(node *tyche.Node, epoch uint64) {
@@ -181,11 +186,17 @@ func runMemory(opts runOptions) error {
 			}
 		}
 		cancelEpoch()
+		if sample.Skipped {
+			fmt.Printf("epoch=%d source=%s seq=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.Source, sample.Seq, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+			continue
+		}
 		stats.beacons.Add(1)
 		fmt.Printf("epoch=%d source=%s seq=%d random=%x\n", sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
 	}
 
-	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	printMessageTypeMetrics(nodes)
 	return nil
 }
 
@@ -221,7 +232,6 @@ func runTCP(opts runOptions) error {
 
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
-	started := time.Now()
 	scheme, err := crypto.NewPVSSScheme(opts.nodeID, keys[opts.nodeID].Private, pp)
 	if err != nil {
 		return err
@@ -244,33 +254,55 @@ func runTCP(opts runOptions) error {
 	node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 
 	nodes := []*tyche.Node{node}
-	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s peers=%v\n",
-		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, opts.reportMS, opts.maxPool, opts.pvss, peers)
+	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
+	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.pvss, peers)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
 	if completed := node.CompletedEpoch(); completed > 0 {
-		prefilled := completed
-		if prefilled > uint64(opts.epochs) {
-			prefilled = uint64(opts.epochs)
-		}
-		stats.beacons.Add(prefilled)
-		fmt.Printf("node=%s prefilled_epochs=%d counted=%d\n", opts.nodeID, completed, prefilled)
+		fmt.Printf("node=%s prefilled_epochs=%d counted=0\n", opts.nodeID, completed)
 	}
+	benchStart := time.Now()
+	benchMetrics := collectMetrics(nodes)
+	benchPerf := collectPerf(nodes)
 
-	for counted := int(stats.beacons.Load()); counted < opts.epochs; counted++ {
-		epochCtx, cancelEpoch := context.WithTimeout(runCtx, time.Duration(opts.epochTimeoutMS)*time.Millisecond)
+	for counted := 0; counted < opts.epochs; counted++ {
+		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
 		beacon, err := node.RunEpoch(epochCtx)
 		cancelEpoch()
 		if err != nil {
 			return fmt.Errorf("epoch %d: %w", counted+1, err)
 		}
+		if beacon.Skipped {
+			fmt.Printf("node=%s epoch=%d source=%s seq=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
+			continue
+		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
 	}
-	printMetrics("final", nodes, time.Since(started), stats.beacons.Load())
+	queueTotal, queueMax := collectQueue(nodes)
+	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	printMessageTypeMetrics(nodes)
 	return nil
+}
+
+func tycheEpochAttemptTimeout(opts runOptions) time.Duration {
+	outer := time.Duration(opts.epochTimeoutMS) * time.Millisecond
+	raw := strings.TrimSpace(os.Getenv("TYCHE_EPOCH_ATTEMPT_MS"))
+	if raw == "" {
+		raw = "10000"
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return outer
+	}
+	attempt := time.Duration(ms) * time.Millisecond
+	if attempt > outer {
+		return outer
+	}
+	return attempt
 }
 
 func setupRuntime(n int, f int, pvss string) ([]p2p.NodeID, crypto.PVSSParams, map[p2p.NodeID]crypto.KeyPair, error) {
@@ -508,9 +540,10 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 	if delta.sentMessages > 0 {
 		abaPct = float64(delta.abaMessages) * 100 / float64(delta.sentMessages)
 	}
-	fmt.Printf("%s metrics beacons=%d throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label,
 		beacons,
+		elapsed.Seconds(),
 		float64(beacons)*60/seconds,
 		delta.sentMessages,
 		delta.recvMessages,

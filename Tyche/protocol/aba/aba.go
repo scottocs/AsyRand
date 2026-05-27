@@ -49,11 +49,21 @@ type Decision struct {
 }
 
 type Status struct {
-	Instance string
-	Round    uint64
-	Decided  bool
-	Value    bool
-	CoinWait bool
+	Instance   string
+	Round      uint64
+	Decided    bool
+	Value      bool
+	CoinWait   bool
+	Inputs     int
+	InputTrue  int
+	InputFalse int
+	Finish     int
+	BValTrue   int
+	BValFalse  int
+	BinTrue    bool
+	BinFalse   bool
+	Aux        int
+	Conf       int
 }
 
 type Agreement struct {
@@ -184,7 +194,25 @@ func (a *Agreement) Status(instance string) Status {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	st := a.get(instance)
-	return Status{Instance: instance, Round: st.round, Decided: st.decided, Value: st.decision, CoinWait: st.coinWait[st.round]}
+	round := st.round
+	a.ensureRound(st, round)
+	return Status{
+		Instance:   instance,
+		Round:      round,
+		Decided:    st.decided,
+		Value:      st.decision,
+		CoinWait:   st.coinWait[round],
+		Inputs:     len(st.inputs),
+		InputTrue:  st.inputCount[true],
+		InputFalse: st.inputCount[false],
+		Finish:     len(st.finish),
+		BValTrue:   len(st.bval[round][true]),
+		BValFalse:  len(st.bval[round][false]),
+		BinTrue:    st.bin[round][true],
+		BinFalse:   st.bin[round][false],
+		Aux:        len(st.aux[round]),
+		Conf:       len(st.conf[round]),
+	}
 }
 
 func (a *Agreement) get(instance string) *instanceState {
@@ -254,7 +282,7 @@ func (a *Agreement) handleInput(ctx context.Context, instance string, from p2p.N
 	}
 	a.mu.Unlock()
 	if shouldFinish {
-		_ = a.broadcast(ctx, "FINISH", instance, FinishMessage{Value: true})
+		a.broadcastAsync("FINISH", instance, FinishMessage{Value: true})
 	}
 }
 
@@ -313,13 +341,13 @@ func (a *Agreement) handleBVal(ctx context.Context, instance string, from p2p.No
 	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if amplify {
-		_ = a.broadcastBVal(ctx, instance, round, value)
+		a.broadcastBValAsync(instance, round, value)
 	}
 	if sendAux {
-		_ = a.broadcast(ctx, "AUX", instance, AuxMessage{Round: round, Value: auxValue})
+		a.broadcastAsync("AUX", instance, AuxMessage{Round: round, Value: auxValue})
 	}
 	if sendConf {
-		_ = a.broadcast(ctx, "CONF", instance, ConfMessage{Round: round, Values: confValues})
+		a.broadcastAsync("CONF", instance, ConfMessage{Round: round, Values: confValues})
 	}
 	if needCoin {
 		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
@@ -346,7 +374,7 @@ func (a *Agreement) handleAux(ctx context.Context, instance string, from p2p.Nod
 	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if sendConf {
-		_ = a.broadcast(ctx, "CONF", instance, ConfMessage{Round: round, Values: values})
+		a.broadcastAsync("CONF", instance, ConfMessage{Round: round, Values: values})
 	}
 	if needCoin {
 		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
@@ -469,7 +497,7 @@ func (a *Agreement) tryAdvanceWithCoin(ctx context.Context, instance string, rou
 	st.round = nextRound
 	nextEst := st.est
 	a.mu.Unlock()
-	_ = a.broadcastBVal(ctx, instance, nextRound, nextEst)
+	a.broadcastBValAsync(instance, nextRound, nextEst)
 }
 
 func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round uint64, value bool) error {
@@ -479,6 +507,15 @@ func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round ui
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()
 	return a.broadcast(ctx, "BVAL", instance, BValMessage{Round: round, Value: value})
+}
+
+func (a *Agreement) broadcastBValAsync(instance string, round uint64, value bool) {
+	a.mu.Lock()
+	st := a.get(instance)
+	a.ensureRound(st, round)
+	st.bvalSent[round][value] = true
+	a.mu.Unlock()
+	a.broadcastAsync("BVAL", instance, BValMessage{Round: round, Value: value})
 }
 
 func (a *Agreement) rebroadcastUntilReady(ctx context.Context, instance string) {
@@ -509,6 +546,18 @@ func (a *Agreement) broadcast(ctx context.Context, typ, instance string, payload
 		return err
 	}
 	return a.Transport.Broadcast(ctx, msg)
+}
+
+func (a *Agreement) broadcastAsync(typ, instance string, payload any) {
+	msg, err := p2p.NewMessage(Protocol, typ, instance, a.ID, "", payload)
+	if err != nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = a.Transport.Broadcast(ctx, msg)
+	}()
 }
 
 func CoinFromSeed(instance string, round uint64, seed []byte) bool {

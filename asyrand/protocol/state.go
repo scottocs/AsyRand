@@ -10,12 +10,16 @@ import (
 )
 
 type Beacon struct {
-	Epoch     uint64                     `json:"epoch"`
-	Source    p2p.NodeID                 `json:"source"`
-	Random    []byte                     `json:"random"`
-	CommitID  string                     `json:"commit_id"`
-	Signature asig.BLSAggregateSignature `json:"signature"`
-	Shares    []asig.DecryptedShare      `json:"shares"`
+	Epoch      uint64                     `json:"epoch"`
+	Source     p2p.NodeID                 `json:"source"`
+	Random     []byte                     `json:"random"`
+	CommitID   string                     `json:"commit_id"`
+	Signature  asig.BLSAggregateSignature `json:"signature"`
+	Shares     []asig.DecryptedShare      `json:"shares"`
+	Skipped    bool                       `json:"skipped,omitempty"`
+	SkipStage  string                     `json:"skip_stage,omitempty"`
+	SkipReason string                     `json:"skip_reason,omitempty"`
+	SkipDiag   string                     `json:"skip_diag,omitempty"`
 }
 
 type State struct {
@@ -26,6 +30,7 @@ type State struct {
 	QueueLen int
 	Epoch    uint64
 	RPrev    []byte
+	Seed     []byte
 
 	Members          []p2p.NodeID
 	MemberIndex      map[p2p.NodeID]int
@@ -40,12 +45,12 @@ type State struct {
 func NewState(members []p2p.NodeID, f, queueLen int, seed []byte) *State {
 	cp := append([]p2p.NodeID(nil), members...)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-	rprev := append([]byte(nil), seed...)
-	if len(rprev) == 0 {
-		rprev = asig.HashBytes([]byte("AsyRand-v1-genesis"))
+	seedCopy := append([]byte(nil), seed...)
+	if len(seedCopy) == 0 {
+		seedCopy = asig.HashBytes([]byte("AsyRand-v1-genesis"))
 	}
 	st := &State{
-		N: len(cp), F: f, QueueLen: queueLen, RPrev: rprev,
+		N: len(cp), F: f, QueueLen: queueLen, RPrev: epochSeed(seedCopy, 0), Seed: seedCopy,
 		Members: cp, MemberIndex: make(map[p2p.NodeID]int, len(cp)), SourceCandidates: append([]p2p.NodeID(nil), cp...),
 		ComQ: make([]map[uint64]asig.Commitment, len(cp)), HeadSeq: make([]uint64, len(cp)),
 		Removed: make(map[p2p.NodeID]bool, len(cp)),
@@ -65,10 +70,11 @@ func (s *State) Source() (p2p.NodeID, error) {
 		return "", errors.New("source candidate list is empty")
 	}
 	idx := 0
-	if len(s.RPrev) >= 8 {
-		idx = int(binary.BigEndian.Uint64(s.RPrev[:8]) % uint64(len(s.SourceCandidates)))
-	} else if len(s.RPrev) > 0 {
-		idx = int(s.RPrev[0]) % len(s.SourceCandidates)
+	selector := epochSeed(s.Seed, s.Epoch)
+	if len(selector) >= 8 {
+		idx = int(binary.BigEndian.Uint64(selector[:8]) % uint64(len(s.SourceCandidates)))
+	} else if len(selector) > 0 {
+		idx = int(selector[0]) % len(s.SourceCandidates)
 	}
 	return s.SourceCandidates[idx], nil
 }
@@ -82,7 +88,7 @@ func (s *State) CurrentEpoch() uint64 {
 func (s *State) RPrevBytes() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]byte(nil), s.RPrev...)
+	return epochSeed(s.Seed, s.Epoch)
 }
 
 func (s *State) Enqueue(c asig.Commitment) bool {
@@ -130,6 +136,30 @@ func (s *State) PopCommitment(id p2p.NodeID) (asig.Commitment, bool) {
 	return c, true
 }
 
+func (s *State) AdvanceHeadToNextCommitment(id p2p.NodeID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.indexLocked(id)
+	if !ok || s.Removed[id] {
+		return false
+	}
+	head := s.HeadSeq[idx]
+	if _, ok := s.ComQ[idx][head]; ok {
+		return false
+	}
+	var next uint64
+	for seq := range s.ComQ[idx] {
+		if seq > head && (next == 0 || seq < next) {
+			next = seq
+		}
+	}
+	if next == 0 {
+		return false
+	}
+	s.HeadSeq[idx] = next
+	return true
+}
+
 func (s *State) PeekCommitment(id p2p.NodeID) (asig.Commitment, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -169,6 +199,22 @@ func (s *State) AdvanceForSource(random []byte, source p2p.NodeID) {
 		}
 		s.rebuildSourceCandidateListLocked()
 	}
+}
+
+func (s *State) Skip(source p2p.NodeID, reason string) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	random := asig.HashBytes([]byte("AsyRand-v1/skip"), epochSeed(s.Seed, s.Epoch), encodeUint64(s.Epoch), []byte(source), []byte(reason))
+	s.RPrev = append([]byte(nil), random...)
+	s.Epoch++
+	if source != "" && !s.Removed[source] {
+		s.RecentSources = append(s.RecentSources, source)
+		if len(s.RecentSources) > s.F {
+			s.RecentSources = s.RecentSources[len(s.RecentSources)-s.F:]
+		}
+		s.rebuildSourceCandidateListLocked()
+	}
+	return append([]byte(nil), random...)
 }
 
 func (s *State) QueueLength(id p2p.NodeID) int {
@@ -284,4 +330,14 @@ func (s *State) activeCountLocked() int {
 		}
 	}
 	return count
+}
+
+func encodeUint64(v uint64) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, v)
+	return out
+}
+
+func epochSeed(seed []byte, epoch uint64) []byte {
+	return asig.HashBytes([]byte("AsyRand-v1/epoch"), seed, encodeUint64(epoch))
 }
