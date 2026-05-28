@@ -645,7 +645,8 @@ func TestMarkedSelectedSourceRemovedAtMarkedSequence(t *testing.T) {
 	node.State.RmMark["n0"] = 2
 	node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
 	node.State.Seqs["n0"] = 1
-	node.removeSelectedSourceIfMarkedLocked("n0", 2)
+	state := node.certifiedStateDigestForBeaconLocked("n0", 2)
+	node.installCertifiedStateLocked(state)
 	members := append([]p2p.NodeID(nil), node.State.Members...)
 	scl := append([]p2p.NodeID(nil), node.State.SCL...)
 	rsq := append([]p2p.NodeID(nil), node.State.RSQ...)

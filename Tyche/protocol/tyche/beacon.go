@@ -41,10 +41,6 @@ type Beacon struct {
 	Secret       []byte       `json:"secret"`
 	ObjectID     string       `json:"object_id"`
 	ReadySenders []p2p.NodeID `json:"ready_senders"`
-	Skipped      bool         `json:"skipped,omitempty"`
-	SkipStage    string       `json:"skip_stage,omitempty"`
-	SkipReason   string       `json:"skip_reason,omitempty"`
-	SkipDiag     string       `json:"skip_diag,omitempty"`
 	// Signature is the compact READY quorum certificate. ReadySenders records
 	// who voted; Signature proves those nodes signed the canonical READY
 	// statement for this epoch/source/sequence/random hash.
@@ -191,11 +187,11 @@ type Node struct {
 	pvssBackend  string
 	beaconSeeds  map[uint64][]byte
 	verified     map[string]verifiedObject
+	producerBusy map[uint64]bool
 	producerLow  int
 	producerHigh int
 	removalWait  time.Duration
 	producing    bool
-	skipABA      bool
 	waiters      map[string][]chan Beacon
 	certBeacons  map[string]Beacon
 	pendingCerts map[string]Beacon
@@ -309,13 +305,13 @@ func NewNode(cfg Config) (*Node, error) {
 		abaInputs:    make(map[string]bool),
 		beaconSeeds:  make(map[uint64][]byte),
 		verified:     make(map[string]verifiedObject),
+		producerBusy: make(map[uint64]bool),
 		pvssKeys:     make(map[string]kyber.Scalar),
 		pvssBackend:  pvssBackend,
 		producerLow:  low,
 		producerHigh: high,
 		removalWait:  removalWait,
 		producing:    true,
-		skipABA:      os.Getenv("TYCHE_SKIP_ABA") == "1",
 		waiters:      make(map[string][]chan Beacon),
 		certBeacons:  make(map[string]Beacon),
 		pendingCerts: make(map[string]Beacon),
@@ -400,15 +396,17 @@ func (n *Node) Produce(ctx context.Context) (Object, error) {
 		n.mu.Unlock()
 		return Object{}, errors.New("local producer is stopped")
 	}
-	if n.outstandingQueueDepthLocked(n.ID) >= n.State.QueueLen {
+	if n.outstandingQueueDepthLocked(n.ID)+len(n.producerBusy) >= n.State.QueueLen {
 		n.mu.Unlock()
 		return Object{}, errors.New("local producer queue is full")
 	}
 	n.State.ProducerSeq++
 	seq := n.State.ProducerSeq
 	version := n.State.ConfigVersion
+	n.producerBusy[seq] = true
 	n.mu.Unlock()
 	obj, err := n.produceSeq(ctx, seq, version)
+	n.finishProducerSeq(seq)
 	if err != nil {
 		n.rollbackProducerSeq(seq)
 		return Object{}, err
@@ -452,6 +450,44 @@ func (n *Node) rollbackProducerSeq(seq uint64) {
 	n.mu.Unlock()
 }
 
+func (n *Node) finishProducerSeq(seq uint64) {
+	n.mu.Lock()
+	delete(n.producerBusy, seq)
+	n.mu.Unlock()
+}
+
+func (n *Node) requestProduceSeq(ctx context.Context, seq uint64, version uint64) bool {
+	n.mu.Lock()
+	if !n.producing {
+		n.mu.Unlock()
+		return false
+	}
+	if _, ok := n.State.ComQ[n.ID][seq]; ok {
+		n.mu.Unlock()
+		return false
+	}
+	if n.producerBusy[seq] {
+		n.mu.Unlock()
+		return false
+	}
+	if n.State.ProducerSeq < seq {
+		n.State.ProducerSeq = seq
+	}
+	n.producerBusy[seq] = true
+	n.mu.Unlock()
+
+	go func() {
+		obj, err := n.produceSeq(ctx, seq, version)
+		n.finishProducerSeq(seq)
+		if err == nil {
+			_ = n.storeObject(obj)
+		} else {
+			n.rollbackProducerSeq(seq)
+		}
+	}()
+	return true
+}
+
 func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Millisecond
@@ -459,33 +495,21 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		var inFlight []uint64
 		producing := true
 		for {
 			n.mu.Lock()
 			depth := n.outstandingQueueDepthLocked(n.ID)
 			low, high, queueLen := n.producerLow, n.producerHigh, n.State.QueueLen
-			kept := inFlight[:0]
-			for _, seq := range inFlight {
-				_, delivered := n.State.ComQ[n.ID][seq]
-				consumed := n.State.Seqs[n.ID] >= seq
-				if !delivered && !consumed {
-					kept = append(kept, seq)
-				}
-			}
-			inFlight = kept
+			inFlight := len(n.producerBusy)
 			n.mu.Unlock()
-			level := depth + len(inFlight)
+			level := depth + inFlight
 			if level >= high {
 				producing = false
 			} else if level <= low {
 				producing = true
 			}
-			if producing && level < high && depth < queueLen && len(inFlight) < high {
-				obj, err := n.Produce(ctx)
-				if err == nil {
-					inFlight = append(inFlight, obj.Seq)
-				}
+			if producing && level < high && depth < queueLen && inFlight < high {
+				_, _ = n.Produce(ctx)
 			}
 			select {
 			case <-ticker.C:
@@ -540,26 +564,17 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 		}
 		source, seq, instance, skipCurrentABA, alreadyCertified, err := n.prepareEpoch(ctx, epoch)
 		if err != nil {
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "prepare", "timeout"), nil
-			}
 			return Beacon{}, err
 		}
 		wait := n.registerBeaconWaiter(epoch, source, seq)
 		if alreadyCertified {
 			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "already_certified_wait", "timeout"), nil
-			}
 			return b, err
 		}
 		obj, certified, err := n.waitObjectOrBeacon(ctx, epoch, source, seq, instance, wait)
 		if err != nil {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "object_wait", "timeout"), nil
-			}
 			return Beacon{}, err
 		}
 		if certified != nil {
@@ -569,9 +584,6 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 		if !skipCurrentABA {
 			if certified, err := n.proposeEpochABAInputFromLookahead(ctx, epoch, source, seq, instance, wait); err != nil {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
-				if isContextDone(err) {
-					return n.skipCurrentEpoch(epoch, source, seq, "lookahead_aba_input", "timeout"), nil
-				}
 				return Beacon{}, err
 			} else if certified != nil {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
@@ -579,17 +591,11 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 			}
 			if err := n.waitCurrentABAReady(ctx, instance); err != nil {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
-				if isContextDone(err) {
-					return n.skipCurrentEpoch(epoch, source, seq, "aba_ready", "timeout"), nil
-				}
 				return Beacon{}, err
 			}
 		}
 		if err := n.waitCoinBarrier(ctx, instance); err != nil {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "coin_barrier", "timeout"), nil
-			}
 			return Beacon{}, err
 		}
 		select {
@@ -637,141 +643,13 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 				delete(n.reconSent, key)
 				n.mu.Unlock()
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
-				if isContextDone(err) {
-					return n.skipCurrentEpoch(epoch, source, seq, "broadcast_recon", "timeout"), nil
-				}
 				return Beacon{}, err
 			}
 		}
-		for {
-			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "beacon_wait", "timeout"), nil
-			}
-			return b, err
-		}
+		b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
+		n.unregisterBeaconWaiter(epoch, source, seq, wait)
+		return b, err
 	}
-}
-
-func isContextDone(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-func (n *Node) skipCurrentEpoch(epoch uint64, source p2p.NodeID, seq uint64, stage string, reason string) Beacon {
-	key := epochKey(epoch, source, seq)
-	instance := aba.EpochInstance(epoch, source)
-	diag := n.skipDiagnostics(epoch, source, seq, instance)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if b, ok := n.certBeacons[key]; ok {
-		return b
-	}
-	if n.State.Epoch >= epoch {
-		return Beacon{Epoch: epoch, Source: source, Seq: seq, Random: append([]byte(nil), n.State.RPrev...), Skipped: true}
-	}
-	if n.State.Epoch+1 != epoch {
-		return Beacon{Epoch: epoch, Source: source, Seq: seq, Random: append([]byte(nil), n.State.RPrev...), Skipped: true}
-	}
-	prev := append([]byte(nil), n.State.RPrev...)
-	random := crypto.HashBytes([]byte("Tyche-v1/skip"), prev, []byte(fmt.Sprintf("%d", epoch)), []byte(source), []byte(fmt.Sprintf("%d", seq)), []byte(stage), []byte(reason))
-	if source != "" && seq > 0 {
-		n.rotateSourcesLocked(epoch, source, seq)
-	}
-	n.State.Epoch = epoch
-	n.State.RPrev = append([]byte(nil), random...)
-	n.beaconSeeds[epoch] = append([]byte(nil), random...)
-	delete(n.State.PendingABAs, instance)
-	delete(n.recon, key)
-	delete(n.reconSecret, key)
-	delete(n.reconDone, key)
-	delete(n.reconSent, key)
-	delete(n.echoes, key)
-	delete(n.readies, key)
-	delete(n.readySent, key)
-	delete(n.certified, key)
-	delete(n.certifying, key)
-	delete(n.waiters, key)
-	n.cleanupCertifiedStateLocked(epoch)
-	return Beacon{
-		Epoch: epoch, Source: source, Seq: seq, PrevRandom: prev, Random: random,
-		ObjectID: reason, Skipped: true, SkipStage: stage, SkipReason: reason, SkipDiag: diag,
-		ConfigVersion: n.State.ConfigVersion,
-		State:         n.stateDigestLocked(),
-	}
-}
-
-func (n *Node) skipDiagnostics(epoch uint64, source p2p.NodeID, seq uint64, instance string) string {
-	key := epochKey(epoch, source, seq)
-	abaStatus := n.ABA.Status(instance)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	obj, objectAvailable := n.State.ComQ[source][seq]
-	sourceQueueDepth := len(n.State.ComQ[source])
-	reconShares := len(n.recon[key])
-	echoMax := 0
-	for _, senders := range n.echoes[key] {
-		if len(senders) > echoMax {
-			echoMax = len(senders)
-		}
-	}
-	readyMax := 0
-	for _, senders := range n.readies[key] {
-		if len(senders) > readyMax {
-			readyMax = len(senders)
-		}
-	}
-	waiters := len(n.waiters[key])
-	pending := n.State.PendingABAs[instance]
-	pendingRound := uint64(0)
-	pendingCoinWait := false
-	pendingDecided := false
-	pendingDecision := false
-	if pending != nil {
-		pendingRound = pending.Round
-		pendingCoinWait = pending.CoinWait
-		pendingDecided = pending.Decided
-		pendingDecision = pending.Decision
-	}
-
-	return fmt.Sprintf(
-		"local_epoch=%d object_available=%t object_version=%d config_version=%d source_queue=%d scl=%d rsq=%d pending_abas=%d aba_input_sent=%t aba_input=%t aba_round=%d aba_decided=%t aba_value=%t aba_coin_wait=%t aba_inputs=%d aba_input_true=%d aba_input_false=%d aba_finish=%d aba_bval_true=%d aba_bval_false=%d aba_bin_true=%t aba_bin_false=%t aba_aux=%d aba_conf=%d pending_round=%d pending_decided=%t pending_value=%t pending_coin_wait=%t recon_sent=%t recon_done=%t recon_shares=%d echo_max=%d ready_max=%d waiters=%d",
-		n.State.Epoch,
-		objectAvailable,
-		obj.ConfigVersion,
-		n.State.ConfigVersion,
-		sourceQueueDepth,
-		len(n.State.SCL),
-		len(n.State.RSQ),
-		len(n.State.PendingABAs),
-		n.abaInputSent[instance],
-		n.abaInputs[instance],
-		abaStatus.Round,
-		abaStatus.Decided,
-		abaStatus.Value,
-		abaStatus.CoinWait,
-		abaStatus.Inputs,
-		abaStatus.InputTrue,
-		abaStatus.InputFalse,
-		abaStatus.Finish,
-		abaStatus.BValTrue,
-		abaStatus.BValFalse,
-		abaStatus.BinTrue,
-		abaStatus.BinFalse,
-		abaStatus.Aux,
-		abaStatus.Conf,
-		pendingRound,
-		pendingDecided,
-		pendingDecision,
-		pendingCoinWait,
-		n.reconSent[key],
-		n.reconDone[key],
-		reconShares,
-		echoMax,
-		readyMax,
-		waiters,
-	)
 }
 
 func (n *Node) certifiedBeaconForEpoch(epoch uint64) (Beacon, bool) {
@@ -880,7 +758,7 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 	seq := n.State.Seqs[source] + 1
 	instance := aba.EpochInstance(epoch, source)
 	skipCurrentABA := n.State.RmMark[source] != -1 && seq == uint64(n.State.RmMark[source])
-	if !skipCurrentABA && !n.skipABA && n.State.PendingABAs[instance] == nil {
+	if !skipCurrentABA && n.State.PendingABAs[instance] == nil {
 		n.State.PendingABAs[instance] = &PendingABA{Instance: instance, Epoch: epoch, Source: source, Seq: seq}
 	}
 	version := n.State.ConfigVersion
@@ -888,41 +766,11 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 	if available && obj.ConfigVersion != version {
 		available = false
 	}
-	producing := n.producing
 	n.mu.Unlock()
-	if !available && source == n.ID && producing {
-		obj, err := n.produceSeq(ctx, seq, version)
-		if err != nil {
-			return source, seq, instance, skipCurrentABA, false, err
-		}
-		_ = n.storeObject(obj)
-		n.mu.Lock()
-		if n.State.ProducerSeq < seq {
-			n.State.ProducerSeq = seq
-		}
-		n.mu.Unlock()
-		available = true
+	if !available && source == n.ID {
+		n.requestProduceSeq(ctx, seq, version)
 	}
 	return source, seq, instance, skipCurrentABA, false, nil
-}
-
-func (n *Node) waitObject(ctx context.Context, source p2p.NodeID, seq uint64) (Object, error) {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		n.mu.Lock()
-		obj, ok := n.State.ComQ[source][seq]
-		version := n.State.ConfigVersion
-		n.mu.Unlock()
-		if ok && obj.ConfigVersion == version {
-			return obj, nil
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			return Object{}, ctx.Err()
-		}
-	}
 }
 
 func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64, instance string, wait <-chan Beacon) (Object, *Beacon, error) {
@@ -956,9 +804,6 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 }
 
 func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64, instance string, wait <-chan Beacon) (*Beacon, error) {
-	if n.skipABA {
-		return nil, nil
-	}
 	next := seq + 1
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -1004,9 +849,6 @@ func (n *Node) proposeEpochABAInput(ctx context.Context, instance string, value 
 }
 
 func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
-	if n.skipABA {
-		return nil
-	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	rebroadcast := time.NewTicker(100 * time.Millisecond)
@@ -1665,12 +1507,6 @@ func (n *Node) markRemovalLocked(source p2p.NodeID, seq uint64) {
 	n.State.RmMark[source] = int64(seq + 1)
 }
 
-func (n *Node) removeSelectedSourceIfMarkedLocked(source p2p.NodeID, seq uint64) {
-	if n.State.RmMark[source] != -1 && seq == uint64(n.State.RmMark[source]) {
-		n.removeMemberLocked(source)
-	}
-}
-
 func (n *Node) refillSCLLocked() {
 	for _, id := range n.State.Members {
 		if n.State.RmMark[id] == -1 && !contains(n.State.SCL, id) {
@@ -1837,12 +1673,6 @@ func (n *Node) lookupEpochObject(epoch uint64, source p2p.NodeID, seq uint64) (O
 		return Object{}, errors.New("unknown object")
 	}
 	return obj, nil
-}
-
-func (n *Node) currentEpoch() uint64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.State.Epoch + 1
 }
 
 func (n *Node) CompletedEpoch() uint64 {

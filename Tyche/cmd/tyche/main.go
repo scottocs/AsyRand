@@ -43,7 +43,7 @@ func main() {
 	listenAddr := flag.String("listen", "", "tcp listen address, for example 0.0.0.0:9000; defaults to listen_ip plus this node's peer port")
 	listenIP := flag.String("listen-ip", "0.0.0.0", "tcp listen ip used when -listen is empty")
 	queueLen := flag.Int("queue-len", 8, "per-source commitment queue length")
-	producerMS := flag.Int("producer-ms", 250, "producer interval in milliseconds")
+	producerMS := flag.Int("producer-ms", 150, "producer interval in milliseconds")
 	prefillMS := flag.Int("prefill-ms", 3000, "producer prefill time in milliseconds")
 	epochTimeoutMS := flag.Int("epoch-timeout-ms", 10000, "timeout per epoch in milliseconds")
 	reportMS := flag.Int("report-ms", 5000, "periodic metrics interval in milliseconds")
@@ -186,10 +186,6 @@ func runMemory(opts runOptions) error {
 			}
 		}
 		cancelEpoch()
-		if sample.Skipped {
-			fmt.Printf("epoch=%d source=%s seq=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.Source, sample.Seq, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
-			continue
-		}
 		stats.beacons.Add(1)
 		fmt.Printf("epoch=%d source=%s seq=%d random=%x\n", sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
 	}
@@ -274,10 +270,6 @@ func runTCP(opts runOptions) error {
 		cancelEpoch()
 		if err != nil {
 			return fmt.Errorf("epoch %d: %w", counted+1, err)
-		}
-		if beacon.Skipped {
-			fmt.Printf("node=%s epoch=%d source=%s seq=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
-			continue
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
