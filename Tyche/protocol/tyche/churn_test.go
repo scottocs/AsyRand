@@ -286,12 +286,14 @@ func (c *churnCluster) crashAndRemove(t *testing.T, id p2p.NodeID) {
 
 func (c *churnCluster) reconcileProtocolRemovals(t *testing.T, epoch uint64) {
 	t.Helper()
-	members := c.members()
-	for _, id := range c.activeIDs() {
-		if contains(members, id) {
+	for _, id := range c.stoppedActiveIDs() {
+		if !c.protocolRemovedByAnyActiveNode(id) {
 			continue
 		}
-		t.Logf("epoch=%d event=aba_deleted node=%s n_after=%d f_after=%d stopped=%v active_before=%v members_after=%v", epoch, id, len(members), c.currentF(t), c.stoppedActiveIDs(), c.activeIDs(), members)
+		beforeActive := c.activeIDs()
+		c.closeProtocolRemovedNode(t, id)
+		members := c.members()
+		t.Logf("epoch=%d event=aba_deleted node=%s n_after=%d f_after=%d stopped=%v active_before=%v members_after=%v", epoch, id, len(members), c.currentF(t), c.stoppedActiveIDs(), beforeActive, members)
 		c.active[id] = false
 		delete(c.stopped, id)
 		if cancel := c.cancels[id]; cancel != nil {
@@ -306,12 +308,57 @@ func (c *churnCluster) reconcileProtocolRemovals(t *testing.T, epoch uint64) {
 	}
 }
 
+func (c *churnCluster) protocolRemovedByAnyActiveNode(id p2p.NodeID) bool {
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		removed := !contains(node.State.Members, id)
+		node.mu.Unlock()
+		if removed {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *churnCluster) closeProtocolRemovedNode(t *testing.T, id p2p.NodeID) {
+	t.Helper()
+	ref := c.protocolRemovedReference(id)
+	if ref == nil {
+		t.Fatalf("no certified removal state for %s", id)
+	}
+	for _, node := range c.activeNodes() {
+		if node.ID == id {
+			continue
+		}
+		if node != ref {
+			copyRuntimeState(t, ref, node)
+		}
+		node.mu.Lock()
+		delete(node.BLSPublic, string(id))
+		node.installRemovalPVSSLocked()
+		node.resetConfigurationCachesLocked()
+		node.mu.Unlock()
+	}
+}
+
+func (c *churnCluster) protocolRemovedReference(id p2p.NodeID) *Node {
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		removed := !contains(node.State.Members, id)
+		node.mu.Unlock()
+		if removed {
+			return node
+		}
+	}
+	return nil
+}
+
 func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *rand.Rand, epoch uint64, minN int, maxN int, nextJoin *int) bool {
 	t.Helper()
 	n := len(c.members())
 	pendingStop := len(c.stoppedActiveIDs()) > 0
 	canDelete := n > minN && !pendingStop
-	canJoin := n < maxN
+	canJoin := n < maxN && !pendingStop
 	if !canDelete && !canJoin {
 		return false
 	}
@@ -491,7 +538,7 @@ func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PVSSParams, keys map[
 		}
 		node.mu.Lock()
 		node.PVSS = scheme
-		node.BLSPublic = blsPublic
+		node.BLSPublic = cloneBLSPublic(blsPublic)
 		node.mu.Unlock()
 	}
 }
@@ -522,19 +569,17 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	t.Helper()
 	c.refillCandidateLists()
 	source, seq := nextSourceSeq(c.reference(t))
-	for c.stopped[source] {
-		c.applyABAFalse(t, parent, epoch, source, seq)
-		c.protocolRemoveStopped(t, epoch, source)
-		c.refillCandidateLists()
-		source, seq = nextSourceSeq(c.reference(t))
-	}
+	removingStoppedSource := c.stopped[source] && c.isMarkedForRemovalAt(source, seq)
 	sourceNode := c.nodes[source]
 	if sourceNode == nil || !c.active[source] {
 		t.Fatalf("selected inactive source %s at epoch %d active=%v members=%v", source, epoch, c.activeIDs(), c.members())
 	}
+	if c.stopped[source] && !c.isMarkedForRemoval(source) {
+		c.applyABAFalse(t, parent, epoch, source, seq)
+	}
+	c.ensureStored(t, parent, sourceNode, source, seq, epoch)
+	c.waitStoredCurrent(t, parent, source, seq)
 	if !c.stopped[source] {
-		c.ensureStored(t, parent, sourceNode, source, seq, epoch)
-		c.waitStoredCurrent(t, parent, source, seq)
 		c.ensureStored(t, parent, sourceNode, source, seq+1, epoch)
 		c.waitStoredCurrent(t, parent, source, seq+1)
 	}
@@ -542,26 +587,42 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	epochCtx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	active := c.activeNodes()
-	results := make(chan churnResult, len(active))
-	for _, node := range active {
+	required := active
+	if removingStoppedSource {
+		required = make([]*Node, 0, len(active)-1)
+		for _, node := range active {
+			if node.ID != source {
+				required = append(required, node)
+			}
+		}
+	}
+	results := make(chan churnResult, len(required))
+	for _, node := range required {
 		go func(node *Node) {
 			beacon, err := node.RunEpochAt(epochCtx, epoch)
 			results <- churnResult{beacon: beacon, err: err}
 		}(node)
 	}
 	var first Beacon
-	for i := 0; i < len(active); i++ {
+	received := 0
+	for received < len(required) {
 		select {
 		case res := <-results:
 			if res.err != nil {
 				t.Fatalf("epoch %d failed: %v\n%s", epoch, res.err, dumpNodes(active))
 			}
-			if i == 0 {
+			if received == 0 {
 				first = res.beacon
+				received++
 				continue
 			}
 			if !bytes.Equal(first.Random, res.beacon.Random) || first.Source != res.beacon.Source || first.Seq != res.beacon.Seq {
 				t.Fatalf("epoch %d beacon mismatch: first=%+v got=%+v", epoch, first, res.beacon)
+			}
+			received++
+		case <-time.After(10 * time.Millisecond):
+			if removingStoppedSource && c.protocolRemovedByAnyActiveNode(source) {
+				return
 			}
 		case <-epochCtx.Done():
 			t.Fatalf("epoch %d timed out\n%s", epoch, dumpNodes(active))
@@ -569,35 +630,18 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	}
 }
 
-func (c *churnCluster) protocolRemoveStopped(t *testing.T, epoch uint64, id p2p.NodeID) {
-	t.Helper()
-	if !c.active[id] {
-		return
-	}
-	beforeActive := c.activeIDs()
-	for _, node := range c.activeNodes() {
-		if node.ID == id {
-			continue
-		}
-		node.mu.Lock()
-		if contains(node.State.Members, id) {
-			node.removeMemberLocked(id)
-		}
-		node.mu.Unlock()
-	}
-	members := c.members()
-	t.Logf("epoch=%d event=aba_deleted node=%s n_after=%d f_after=%d stopped=%v active_before=%v members_after=%v", epoch, id, len(members), c.currentF(t), c.stoppedActiveIDs(), beforeActive, members)
-	c.active[id] = false
-	delete(c.stopped, id)
-	if cancel := c.cancels[id]; cancel != nil {
-		cancel()
-	}
-	if node := c.nodes[id]; node != nil {
-		if err := node.Transport.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Logf("epoch=%d event=aba_delete_closed node=%s active_after=%v members_after=%v", epoch, id, c.activeIDs(), members)
+func (c *churnCluster) isMarkedForRemoval(id p2p.NodeID) bool {
+	ref := c.reference(nil)
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	return ref.State.RmMark[id] != -1
+}
+
+func (c *churnCluster) isMarkedForRemovalAt(id p2p.NodeID, seq uint64) bool {
+	ref := c.reference(nil)
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	return ref.State.RmMark[id] != -1 && uint64(ref.State.RmMark[id]) == seq
 }
 
 func (c *churnCluster) refillCandidateLists() {
@@ -848,6 +892,16 @@ func defaultBLSPublic(ids []p2p.NodeID) map[string]kyber.Point {
 	for _, id := range ids {
 		kp := crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(id)))
 		out[string(id)] = kp.Public
+	}
+	return out
+}
+
+func cloneBLSPublic(in map[string]kyber.Point) map[string]kyber.Point {
+	out := make(map[string]kyber.Point, len(in))
+	for id, pub := range in {
+		if pub != nil {
+			out[id] = pub.Clone()
+		}
 	}
 	return out
 }

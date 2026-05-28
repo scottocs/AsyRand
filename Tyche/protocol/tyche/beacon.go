@@ -146,6 +146,7 @@ type signedReconReadyMessage struct {
 	Source    p2p.NodeID               `json:"source"`
 	Seq       uint64                   `json:"seq"`
 	Random    []byte                   `json:"random"`
+	State     CertifiedStateDigest     `json:"state"`
 	Signature crypto.BLSSignatureShare `json:"signature"`
 }
 
@@ -228,13 +229,13 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	low, high := cfg.ProducerLow, cfg.ProducerHigh
 	if high <= 0 {
-		high = 4
+		high = 5
 	}
 	if high <= 0 || high > queueLen {
 		high = queueLen
 	}
 	if low <= 0 {
-		low = 2
+		low = 3
 	}
 	if low > high {
 		low = high
@@ -399,7 +400,7 @@ func (n *Node) Produce(ctx context.Context) (Object, error) {
 		n.mu.Unlock()
 		return Object{}, errors.New("local producer is stopped")
 	}
-	if len(n.State.ComQ[n.ID]) >= n.State.QueueLen {
+	if n.outstandingQueueDepthLocked(n.ID) >= n.State.QueueLen {
 		n.mu.Unlock()
 		return Object{}, errors.New("local producer queue is full")
 	}
@@ -462,7 +463,7 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 		producing := true
 		for {
 			n.mu.Lock()
-			depth := len(n.State.ComQ[n.ID])
+			depth := n.outstandingQueueDepthLocked(n.ID)
 			low, high, queueLen := n.producerLow, n.producerHigh, n.State.QueueLen
 			kept := inFlight[:0]
 			for _, seq := range inFlight {
@@ -493,6 +494,17 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}()
+}
+
+func (n *Node) outstandingQueueDepthLocked(id p2p.NodeID) int {
+	consumed := n.State.Seqs[id]
+	depth := 0
+	for seq := range n.State.ComQ[id] {
+		if seq > consumed {
+			depth++
+		}
+	}
+	return depth
 }
 
 func (n *Node) QueueBacklog() (total int, max int) {
@@ -526,7 +538,7 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 		if err := n.activatePendingJoins(ctx, epoch); err != nil {
 			return Beacon{}, err
 		}
-		source, seq, instance, alreadyCertified, err := n.prepareEpoch(ctx, epoch)
+		source, seq, instance, skipCurrentABA, alreadyCertified, err := n.prepareEpoch(ctx, epoch)
 		if err != nil {
 			if isContextDone(err) {
 				return n.skipCurrentEpoch(epoch, source, seq, "prepare", "timeout"), nil
@@ -554,22 +566,24 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return *certified, nil
 		}
-		if certified, err := n.proposeEpochABAInputFromLookahead(ctx, epoch, source, seq, instance, wait); err != nil {
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "lookahead_aba_input", "timeout"), nil
+		if !skipCurrentABA {
+			if certified, err := n.proposeEpochABAInputFromLookahead(ctx, epoch, source, seq, instance, wait); err != nil {
+				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+				if isContextDone(err) {
+					return n.skipCurrentEpoch(epoch, source, seq, "lookahead_aba_input", "timeout"), nil
+				}
+				return Beacon{}, err
+			} else if certified != nil {
+				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+				return *certified, nil
 			}
-			return Beacon{}, err
-		} else if certified != nil {
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			return *certified, nil
-		}
-		if err := n.waitCurrentABAReady(ctx, instance); err != nil {
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if isContextDone(err) {
-				return n.skipCurrentEpoch(epoch, source, seq, "aba_ready", "timeout"), nil
+			if err := n.waitCurrentABAReady(ctx, instance); err != nil {
+				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+				if isContextDone(err) {
+					return n.skipCurrentEpoch(epoch, source, seq, "aba_ready", "timeout"), nil
+				}
+				return Beacon{}, err
 			}
-			return Beacon{}, err
 		}
 		if err := n.waitCoinBarrier(ctx, instance); err != nil {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
@@ -838,34 +852,35 @@ func (n *Node) unregisterBeaconWaiter(epoch uint64, source p2p.NodeID, seq uint6
 	}
 }
 
-func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint64, string, bool, error) {
+func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint64, string, bool, bool, error) {
 	n.mu.Lock()
 	if n.State.Epoch >= epoch {
 		for _, b := range n.certBeacons {
 			if b.Epoch == epoch {
 				n.mu.Unlock()
-				return b.Source, b.Seq, aba.EpochInstance(epoch, b.Source), true, nil
+				return b.Source, b.Seq, aba.EpochInstance(epoch, b.Source), false, true, nil
 			}
 		}
 		n.mu.Unlock()
-		return "", 0, "", false, fmt.Errorf("epoch %d already certified but beacon was not retained", epoch)
+		return "", 0, "", false, false, fmt.Errorf("epoch %d already certified but beacon was not retained", epoch)
 	}
 	if n.State.Epoch+1 != epoch {
 		n.mu.Unlock()
-		return "", 0, "", false, fmt.Errorf("cannot run epoch %d from local epoch %d", epoch, n.State.Epoch)
+		return "", 0, "", false, false, fmt.Errorf("cannot run epoch %d from local epoch %d", epoch, n.State.Epoch)
 	}
 	if len(n.State.SCL) == 0 {
 		n.refillSCLLocked()
 	}
 	if len(n.State.SCL) == 0 {
 		n.mu.Unlock()
-		return "", 0, "", false, errors.New("empty source candidate list")
+		return "", 0, "", false, false, errors.New("empty source candidate list")
 	}
 	idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
 	source := n.State.SCL[idx]
 	seq := n.State.Seqs[source] + 1
 	instance := aba.EpochInstance(epoch, source)
-	if !n.skipABA && n.State.PendingABAs[instance] == nil {
+	skipCurrentABA := n.State.RmMark[source] != -1 && seq == uint64(n.State.RmMark[source])
+	if !skipCurrentABA && !n.skipABA && n.State.PendingABAs[instance] == nil {
 		n.State.PendingABAs[instance] = &PendingABA{Instance: instance, Epoch: epoch, Source: source, Seq: seq}
 	}
 	version := n.State.ConfigVersion
@@ -878,7 +893,7 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 	if !available && source == n.ID && producing {
 		obj, err := n.produceSeq(ctx, seq, version)
 		if err != nil {
-			return source, seq, instance, false, err
+			return source, seq, instance, skipCurrentABA, false, err
 		}
 		_ = n.storeObject(obj)
 		n.mu.Lock()
@@ -888,7 +903,7 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 		n.mu.Unlock()
 		available = true
 	}
-	return source, seq, instance, false, nil
+	return source, seq, instance, skipCurrentABA, false, nil
 }
 
 func (n *Node) waitObject(ctx context.Context, source p2p.NodeID, seq uint64) (Object, error) {
@@ -952,6 +967,10 @@ func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint
 	for {
 		if b, ok := n.certifiedBeaconForEpoch(epoch); ok {
 			return &b, nil
+		}
+		st := n.ABA.Status(instance)
+		if st.Decided || st.CoinWait {
+			return nil, nil
 		}
 		n.mu.Lock()
 		obj, ok := n.State.ComQ[source][next]
@@ -1068,7 +1087,7 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 			p.Decided = true
 			p.Decision = st.Value
 			if !st.Value && n.State.RmMark[p.Source] == -1 {
-				n.markRemovalLocked(p.Source, p.Epoch)
+				n.markRemovalLocked(p.Source, p.Seq)
 			}
 			delete(n.State.PendingABAs, inst)
 			delete(n.abaInputSent, inst)
@@ -1189,7 +1208,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.Go(ctx, func() {
-			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, crypto.BLSSignatureShare{})
+			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, CertifiedStateDigest{}, crypto.BLSSignatureShare{})
 		})
 	case "RECON_READY":
 		body, err := p2p.DecodePayload[signedReconReadyMessage](msg)
@@ -1198,7 +1217,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.Go(ctx, func() {
-			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.Signature)
+			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.State, body.Signature)
 		})
 	case "JOIN_ACK":
 		body, err := p2p.DecodePayload[JoinAck](msg)
@@ -1317,16 +1336,19 @@ func debugf(format string, args ...any) {
 	}
 }
 
-func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, sig crypto.BLSSignatureShare) {
+func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, sig crypto.BLSSignatureShare) {
 	key := epochKey(epoch, source, seq)
 	rh := hex.EncodeToString(random)
-	readyKey := key + "/" + rh
+	stateHash := stateDigestHash(state)
+	voteKey := rh + "/" + stateHash
+	readyKey := key + "/" + voteKey
 	if kind == "ready" {
 		n.mu.Lock()
 		duplicate := n.certified[readyKey]
-		if !duplicate && n.readies[key] != nil && n.readies[key][rh] != nil {
-			_, duplicate = n.readies[key][rh][from]
+		if !duplicate && n.readies[key] != nil && n.readies[key][voteKey] != nil {
+			_, duplicate = n.readies[key][voteKey][from]
 		}
+		blsPublic := n.blsPublicSnapshotLocked()
 		n.mu.Unlock()
 		if duplicate {
 			return
@@ -1335,7 +1357,7 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// READY transcript. This preserves the original threshold rule while
 		// preventing a bare sender id from becoming part of the certificate.
 		start := time.Now()
-		valid := sig.Signer == string(from) && crypto.VerifyBLSShare(sig, n.BLSPublic, readyVoteBytes(epoch, source, seq, rh))
+		valid := sig.Signer == string(from) && crypto.VerifyBLSShare(sig, blsPublic, readyVoteBytes(epoch, source, seq, rh, stateHash))
 		if n.Perf != nil {
 			n.Perf.addBLSVerify(time.Since(start))
 		}
@@ -1344,6 +1366,12 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		}
 	}
 	n.mu.Lock()
+	if kind == "echo" {
+		state = n.certifiedStateDigestForBeaconLocked(source, seq)
+		stateHash = stateDigestHash(state)
+		voteKey = rh + "/" + stateHash
+		readyKey = key + "/" + voteKey
+	}
 	if n.echoes[key] == nil {
 		n.echoes[key] = make(map[string]map[p2p.NodeID]bool)
 	}
@@ -1353,16 +1381,16 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	if n.echoes[key][rh] == nil {
 		n.echoes[key][rh] = make(map[p2p.NodeID]bool)
 	}
-	if n.readies[key][rh] == nil {
-		n.readies[key][rh] = make(map[p2p.NodeID]crypto.BLSSignatureShare)
+	if n.readies[key][voteKey] == nil {
+		n.readies[key][voteKey] = make(map[p2p.NodeID]crypto.BLSSignatureShare)
 	}
 	if kind == "echo" {
 		n.echoes[key][rh][from] = true
 	} else {
-		n.readies[key][rh][from] = sig
+		n.readies[key][voteKey][from] = sig
 	}
 	echoCount := len(n.echoes[key][rh])
-	readyCount := len(n.readies[key][rh])
+	readyCount := len(n.readies[key][voteKey])
 	needReady := !n.readySent[readyKey] && (echoCount >= 2*n.State.F+1 || readyCount >= n.State.F+1)
 	if needReady {
 		n.readySent[readyKey] = true
@@ -1370,10 +1398,12 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	certify := !n.certified[readyKey] && readyCount >= 2*n.State.F+1
 	var senders []p2p.NodeID
 	var votes []crypto.BLSSignatureShare
+	var blsPublic map[string]kyber.Point
 	if certify {
-		for id := range n.readies[key][rh] {
+		blsPublic = n.blsPublicSnapshotLocked()
+		for id := range n.readies[key][voteKey] {
 			senders = append(senders, id)
-			votes = append(votes, n.readies[key][rh][id])
+			votes = append(votes, n.readies[key][voteKey][id])
 		}
 		sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
 	}
@@ -1383,14 +1413,14 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// observed, this node broadcasts READY. The added BLS share signs the
 		// same canonical statement that will later be aggregated.
 		start := time.Now()
-		sig, err := crypto.SignBLS(string(n.ID), n.BLS.Private, readyVoteBytes(epoch, source, seq, rh))
+		sig, err := crypto.SignBLS(string(n.ID), n.BLS.Private, readyVoteBytes(epoch, source, seq, rh, stateHash))
 		if n.Perf != nil {
 			n.Perf.addBLSSign(time.Since(start))
 		}
 		if err == nil {
-			msg, err := p2p.NewMessage(Protocol, "RECON_READY", key, n.ID, "", signedReconReadyMessage{Epoch: epoch, Source: source, Seq: seq, Random: random, Signature: sig})
+			msg, err := p2p.NewMessage(Protocol, "RECON_READY", key, n.ID, "", signedReconReadyMessage{Epoch: epoch, Source: source, Seq: seq, Random: random, State: state, Signature: sig})
 			if err == nil {
-				_ = n.Transport.Broadcast(ctx, msg)
+				n.safeBroadcast(ctx, msg)
 			}
 		}
 	}
@@ -1400,7 +1430,7 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// unchanged; only the representation of the READY certificate is smaller
 		// and externally verifiable.
 		start := time.Now()
-		cert, err := crypto.AggregateBLSTrusted(votes, n.BLSPublic, readyVoteBytes(epoch, source, seq, rh), 2*n.State.F+1)
+		cert, err := crypto.AggregateBLSTrusted(votes, blsPublic, readyVoteBytes(epoch, source, seq, rh, stateHash), 2*n.State.F+1)
 		if n.Perf != nil {
 			n.Perf.addBLSAggregate(time.Since(start))
 		}
@@ -1414,11 +1444,11 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		}
 		n.certified[readyKey] = true
 		n.mu.Unlock()
-		n.certifyBeacon(epoch, source, seq, random, senders, cert)
+		n.certifyBeacon(epoch, source, seq, random, state, senders, cert)
 	}
 }
 
-func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
+func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
@@ -1431,10 +1461,10 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 	}
 	n.certifying[key] = true
 	n.mu.Unlock()
-	go n.finishCertifyBeacon(epoch, source, seq, random, senders, cert)
+	go n.finishCertifyBeacon(epoch, source, seq, random, state, senders, cert)
 }
 
-func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
+func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
@@ -1446,9 +1476,9 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	prev := append([]byte(nil), n.State.RPrev...)
 	secret := append([]byte(nil), n.reconSecret[key]...)
 	n.beaconSeeds[epoch] = append([]byte(nil), random...)
-	n.removeSelectedSourceIfMarkedLocked(epoch, source)
 	feeds := n.processPendingABAsLocked(epoch)
 	joinFeeds := n.processJoinCoinWaitsLocked(epoch)
+	n.discardCertifiedEpochABAsLocked(epoch)
 	n.mu.Unlock()
 	for _, feed := range feeds {
 		n.ABA.FeedSeed(context.Background(), feed.instance, feed.round, random)
@@ -1464,14 +1494,15 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		n.mu.Unlock()
 		return
 	}
-	n.rotateSourcesLocked(epoch, source, seq)
+	configVersion := n.State.ConfigVersion
+	n.installCertifiedStateLocked(state)
 	n.State.Epoch = epoch
 	n.State.RPrev = append([]byte(nil), random...)
 	n.cleanupCertifiedStateLocked(epoch)
 	b := Beacon{
 		Epoch: epoch, Source: source, Seq: seq, PrevRandom: prev, Random: append([]byte(nil), random...),
 		Secret: secret, ObjectID: obj.Commitment.SecretID, ReadySenders: senders, Signature: cert,
-		ConfigVersion: n.State.ConfigVersion, State: n.stateDigestLocked(),
+		ConfigVersion: configVersion, State: state,
 	}
 	n.certBeacons[key] = b
 	delete(n.certifying, key)
@@ -1490,8 +1521,15 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	}
 	msg, err := p2p.NewMessage(Protocol, "BEACON_CERT", key, n.ID, "", b)
 	if err == nil {
-		_ = n.Transport.Broadcast(context.Background(), msg)
+		n.safeBroadcast(context.Background(), msg)
 	}
+}
+
+func (n *Node) safeBroadcast(ctx context.Context, msg p2p.Message) {
+	defer func() {
+		_ = recover()
+	}()
+	_ = n.Transport.Broadcast(ctx, msg)
 }
 
 func (n *Node) handleBeaconCert(b Beacon) error {
@@ -1514,6 +1552,7 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 	}
 	obj, ok := n.State.ComQ[b.Source][b.Seq]
 	threshold := 2*n.State.F + 1
+	blsPublic := n.blsPublicSnapshotLocked()
 	n.mu.Unlock()
 	if !ok || obj.ConfigVersion != b.ConfigVersion {
 		n.mu.Lock()
@@ -1524,13 +1563,14 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 		return false
 	}
 	rh := hex.EncodeToString(b.Random)
-	if err := crypto.VerifyBLSAggregate(b.Signature, n.BLSPublic, readyVoteBytes(b.Epoch, b.Source, b.Seq, rh), threshold); err != nil {
+	stateHash := stateDigestHash(b.State)
+	if err := crypto.VerifyBLSAggregate(b.Signature, blsPublic, readyVoteBytes(b.Epoch, b.Source, b.Seq, rh, stateHash), threshold); err != nil {
 		return false
 	}
 	n.mu.Lock()
 	delete(n.pendingCerts, key)
 	n.mu.Unlock()
-	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, b.ReadySenders, b.Signature)
+	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, b.State, b.ReadySenders, b.Signature)
 	return true
 }
 
@@ -1549,6 +1589,16 @@ func (n *Node) processPendingABAsLocked(certEpoch uint64) []coinFeed {
 	return feeds
 }
 
+func (n *Node) discardCertifiedEpochABAsLocked(epoch uint64) {
+	for inst, p := range n.State.PendingABAs {
+		if p.Epoch == epoch {
+			delete(n.State.PendingABAs, inst)
+			delete(n.abaInputSent, inst)
+			delete(n.abaInputs, inst)
+		}
+	}
+}
+
 func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -1564,7 +1614,7 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 			p.Decided = true
 			p.Decision = st.Value
 			if !st.Value && n.State.RmMark[p.Source] == -1 {
-				n.markRemovalLocked(p.Source, p.Epoch)
+				n.markRemovalLocked(p.Source, p.Seq)
 			}
 			delete(n.State.PendingABAs, feed.instance)
 			delete(n.abaInputSent, feed.instance)
@@ -1611,12 +1661,12 @@ func (n *Node) exclusionWindowLocked() int {
 	return 2 * n.State.F
 }
 
-func (n *Node) markRemovalLocked(source p2p.NodeID, epoch uint64) {
-	n.State.RmMark[source] = int64(epoch + uint64(n.exclusionWindowLocked()))
+func (n *Node) markRemovalLocked(source p2p.NodeID, seq uint64) {
+	n.State.RmMark[source] = int64(seq + 1)
 }
 
-func (n *Node) removeSelectedSourceIfMarkedLocked(epoch uint64, source p2p.NodeID) {
-	if n.State.RmMark[source] != -1 && epoch == uint64(n.State.RmMark[source]) {
+func (n *Node) removeSelectedSourceIfMarkedLocked(source p2p.NodeID, seq uint64) {
+	if n.State.RmMark[source] != -1 && seq == uint64(n.State.RmMark[source]) {
 		n.removeMemberLocked(source)
 	}
 }
@@ -1691,6 +1741,57 @@ func (n *Node) removeMemberLocked(id p2p.NodeID) {
 	n.resetConfigurationCachesLocked()
 }
 
+func (n *Node) blsPublicSnapshotLocked() map[string]kyber.Point {
+	snapshot := make(map[string]kyber.Point, len(n.BLSPublic))
+	for id, pub := range n.BLSPublic {
+		snapshot[id] = pub
+	}
+	return snapshot
+}
+
+func (n *Node) installCertifiedStateLocked(d CertifiedStateDigest) {
+	oldMembers := append([]p2p.NodeID(nil), n.State.Members...)
+	for _, id := range oldMembers {
+		if !contains(d.Members, id) {
+			n.removeMemberLocked(id)
+		}
+	}
+	n.State.Members = append([]p2p.NodeID(nil), d.Members...)
+	n.State.SCL = append([]p2p.NodeID(nil), d.SCL...)
+	n.State.RSQ = append([]p2p.NodeID(nil), d.RSQ...)
+	n.State.Seqs = make(map[p2p.NodeID]uint64, len(d.Seqs))
+	for id, seq := range d.Seqs {
+		n.State.Seqs[id] = seq
+	}
+	n.State.RmMark = make(map[p2p.NodeID]int64, len(d.RmMark))
+	for id, marker := range d.RmMark {
+		n.State.RmMark[id] = marker
+	}
+	for _, id := range d.Members {
+		if n.State.ComQ[id] == nil {
+			n.State.ComQ[id] = make(map[uint64]Object)
+		}
+		if _, ok := n.State.RmMark[id]; !ok {
+			n.State.RmMark[id] = -1
+		}
+	}
+	for id := range n.State.ComQ {
+		if !contains(d.Members, id) {
+			delete(n.State.ComQ, id)
+			continue
+		}
+		consumed := n.State.Seqs[id]
+		for seq := range n.State.ComQ[id] {
+			if seq <= consumed {
+				delete(n.State.ComQ[id], seq)
+			}
+		}
+	}
+	n.State.F = (len(n.State.Members) - 1) / 3
+	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
+	n.ABA.N, n.ABA.F = len(n.State.Members), n.State.F
+}
+
 func (n *Node) installRemovalPVSSLocked() {
 	if !contains(n.State.Members, n.ID) || len(n.State.Members) == 0 {
 		n.producing = false
@@ -1756,7 +1857,7 @@ func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 		p.Decided = true
 		p.Decision = dec.Value
 		if !dec.Value && n.State.RmMark[p.Source] == -1 {
-			n.markRemovalLocked(p.Source, p.Epoch)
+			n.markRemovalLocked(p.Source, p.Seq)
 		}
 		delete(n.State.PendingABAs, dec.Instance)
 		delete(n.abaInputSent, dec.Instance)
@@ -1830,6 +1931,37 @@ func (n *Node) stateDigestLocked() CertifiedStateDigest {
 	}
 }
 
+func (n *Node) certifiedStateDigestForBeaconLocked(source p2p.NodeID, seq uint64) CertifiedStateDigest {
+	d := n.stateDigestLocked()
+	window := n.exclusionWindowLocked()
+	if window > 0 && len(d.RSQ) >= window && len(d.RSQ) > 0 {
+		old := d.RSQ[0]
+		d.RSQ = append([]p2p.NodeID(nil), d.RSQ[1:]...)
+		if old != "" && contains(d.Members, old) && !contains(d.SCL, old) {
+			d.SCL = append(d.SCL, old)
+		}
+	}
+	if contains(d.Members, source) {
+		if window > 0 && !contains(d.RSQ, source) {
+			d.RSQ = append(d.RSQ, source)
+			d.SCL = removeID(d.SCL, source)
+		}
+		d.Seqs[source] = seq
+	}
+	if d.RmMark[source] != -1 && seq == uint64(d.RmMark[source]) {
+		d.Members = removeID(d.Members, source)
+		d.SCL = removeID(d.SCL, source)
+		d.RSQ = removeID(d.RSQ, source)
+		delete(d.Seqs, source)
+		delete(d.RmMark, source)
+	}
+	return d
+}
+
+func stateDigestHash(d CertifiedStateDigest) string {
+	return hex.EncodeToString(crypto.HashBytes([]byte("Tyche-v1/state"), canonicalJSON(d)))
+}
+
 func epochKey(epoch uint64, source p2p.NodeID, seq uint64) string {
 	return fmt.Sprintf("epoch/%d/%s/%d", epoch, source, seq)
 }
@@ -1854,7 +1986,7 @@ func objectCacheKey(obj Object) string {
 	return fmt.Sprintf("%d/%s", obj.ConfigVersion, obj.Commitment.SecretID)
 }
 
-func readyVoteBytes(epoch uint64, source p2p.NodeID, seq uint64, randomHash string) []byte {
+func readyVoteBytes(epoch uint64, source p2p.NodeID, seq uint64, randomHash string, stateHash string) []byte {
 	// Keep one canonical transcript for both individual READY signatures and
 	// aggregate certificate verification. The random hash is used instead of the
 	// full random value so signatures bind the same compact statement carried by
@@ -1865,6 +1997,7 @@ func readyVoteBytes(epoch uint64, source p2p.NodeID, seq uint64, randomHash stri
 		[]byte(source),
 		[]byte(fmt.Sprintf("%d", seq)),
 		[]byte(randomHash),
+		[]byte(stateHash),
 	)
 }
 

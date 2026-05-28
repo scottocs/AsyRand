@@ -89,7 +89,7 @@ func (n *Node) HandleJoinRequest(ctx context.Context, req JoinRequest) error {
 	}
 	rho := JoinDigest(req)
 	n.mu.Lock()
-	if req.ConfigVersion != n.State.ConfigVersion || !n.noRemovalBeforeLocked(req.ActivationEpoch) {
+	if req.ConfigVersion != n.State.ConfigVersion || !n.noPendingRemovalLocked() {
 		n.mu.Unlock()
 		return nil
 	}
@@ -218,7 +218,7 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if cert.Request.ConfigVersion != n.State.ConfigVersion || !n.noRemovalBeforeLocked(cert.Request.ActivationEpoch) {
+	if cert.Request.ConfigVersion != n.State.ConfigVersion || !n.noPendingRemovalLocked() {
 		n.discardStaleJoinLocked(cert)
 		return nil
 	}
@@ -274,9 +274,9 @@ func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme crypto.
 	return nil
 }
 
-func (n *Node) noRemovalBeforeLocked(activation uint64) bool {
+func (n *Node) noPendingRemovalLocked() bool {
 	for _, marker := range n.State.RmMark {
-		if marker != -1 && uint64(marker) <= activation {
+		if marker != -1 {
 			return false
 		}
 	}
@@ -344,7 +344,7 @@ func transitionCertKey(cert JoinCertificate) string {
 func (n *Node) broadcastJoinCommit(ctx context.Context, req JoinRequest) error {
 	rho := JoinDigest(req)
 	n.mu.Lock()
-	if req.ConfigVersion != n.State.ConfigVersion || req.ActivationEpoch <= n.State.Epoch || !n.noRemovalBeforeLocked(req.ActivationEpoch) || (n.lockedFrom != 0 && req.ActivationEpoch >= n.lockedFrom) {
+	if req.ConfigVersion != n.State.ConfigVersion || req.ActivationEpoch <= n.State.Epoch || !n.noPendingRemovalLocked() || (n.lockedFrom != 0 && req.ActivationEpoch >= n.lockedFrom) {
 		n.mu.Unlock()
 		return nil
 	}

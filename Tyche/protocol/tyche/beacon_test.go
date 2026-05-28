@@ -64,7 +64,7 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 			if len(b.ReadySenders) < 3 {
 				t.Fatalf("weak ready certificate: %+v", b.ReadySenders)
 			}
-			msg := readyVoteBytes(b.Epoch, b.Source, b.Seq, hex.EncodeToString(b.Random))
+			msg := readyVoteBytes(b.Epoch, b.Source, b.Seq, hex.EncodeToString(b.Random), stateDigestHash(b.State))
 			if err := crypto.VerifyBLSAggregate(b.Signature, nodes[0].BLSPublic, msg, 3); err != nil {
 				t.Fatalf("invalid ready aggregate certificate: %v", err)
 			}
@@ -594,8 +594,8 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 	_, pending := nodes[0].State.PendingABAs[inst]
 	rm := nodes[0].State.RmMark["n0"]
 	nodes[0].mu.Unlock()
-	if pending || rm == -1 {
-		t.Fatalf("cached seed did not advance pending ABA to removal marker: pending=%v rm=%d", pending, rm)
+	if pending || rm != 2 {
+		t.Fatalf("cached seed did not advance pending ABA to sequence marker: pending=%v rm=%d", pending, rm)
 	}
 }
 
@@ -632,7 +632,7 @@ func TestBeaconIndexUsesFullRandomValue(t *testing.T) {
 	}
 }
 
-func TestMarkedSelectedSourceRemovedAtMarkerEpoch(t *testing.T) {
+func TestMarkedSelectedSourceRemovedAtMarkedSequence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -642,10 +642,10 @@ func TestMarkedSelectedSourceRemovedAtMarkerEpoch(t *testing.T) {
 	node.mu.Lock()
 	node.State.RSQ = []p2p.NodeID{"n2", "n3"}
 	node.State.SCL = []p2p.NodeID{"n0", "n1"}
-	node.State.RmMark["n0"] = 3
+	node.State.RmMark["n0"] = 2
 	node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
 	node.State.Seqs["n0"] = 1
-	node.removeSelectedSourceIfMarkedLocked(3, "n0")
+	node.removeSelectedSourceIfMarkedLocked("n0", 2)
 	members := append([]p2p.NodeID(nil), node.State.Members...)
 	scl := append([]p2p.NodeID(nil), node.State.SCL...)
 	rsq := append([]p2p.NodeID(nil), node.State.RSQ...)
