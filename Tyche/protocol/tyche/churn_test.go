@@ -109,18 +109,26 @@ func TestBeaconReconfigurationBenchmark200Epochs(t *testing.T) {
 }
 
 type churnCluster struct {
-	net       *p2p.MemoryNetwork
-	nodes     map[p2p.NodeID]*Node
-	active    map[p2p.NodeID]bool
-	stopped   map[p2p.NodeID]bool
-	cancels   map[p2p.NodeID]context.CancelFunc
-	pvssEpoch uint64
-	pvss      string
+	net          *p2p.MemoryNetwork
+	nodes        map[p2p.NodeID]*Node
+	active       map[p2p.NodeID]bool
+	stopped      map[p2p.NodeID]bool
+	cancels      map[p2p.NodeID]context.CancelFunc
+	pendingJoins map[p2p.NodeID]pendingChurnJoin
+	pvssEpoch    uint64
+	pvss         string
 }
 
 type churnResult struct {
 	beacon Beacon
 	err    error
+}
+
+type pendingChurnJoin struct {
+	activation uint64
+	members    []p2p.NodeID
+	params     crypto.PVSSParams
+	keys       map[p2p.NodeID]crypto.KeyPair
 }
 
 type churnBenchmarkResult struct {
@@ -157,6 +165,7 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 				cluster.assertMembershipBounds(t, minN, maxN)
 			}
 		}
+		cluster.reconcilePendingJoins(t, ctx, uint64(epoch))
 		cluster.assertMembershipBounds(t, minN, maxN)
 		cluster.runEpoch(t, ctx, uint64(epoch), epochTimeout)
 		cluster.reconcileProtocolRemovals(t, uint64(epoch))
@@ -241,12 +250,13 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 		t.Fatal(err)
 	}
 	c := &churnCluster{
-		net:     p2p.NewMemoryNetwork(),
-		nodes:   make(map[p2p.NodeID]*Node, n),
-		active:  make(map[p2p.NodeID]bool, n),
-		stopped: make(map[p2p.NodeID]bool, n),
-		cancels: make(map[p2p.NodeID]context.CancelFunc, n),
-		pvss:    pvss,
+		net:          p2p.NewMemoryNetwork(),
+		nodes:        make(map[p2p.NodeID]*Node, n),
+		active:       make(map[p2p.NodeID]bool, n),
+		stopped:      make(map[p2p.NodeID]bool, n),
+		cancels:      make(map[p2p.NodeID]context.CancelFunc, n),
+		pendingJoins: make(map[p2p.NodeID]pendingChurnJoin),
+		pvss:         pvss,
 	}
 	blsPublic := defaultBLSPublic(ids)
 	for _, id := range ids {
@@ -357,8 +367,9 @@ func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *ra
 	t.Helper()
 	n := len(c.members())
 	pendingStop := len(c.stoppedActiveIDs()) > 0
+	pendingJoin := len(c.pendingJoins) > 0
 	canDelete := n > minN && !pendingStop
-	canJoin := n < maxN && !pendingStop
+	canJoin := n < maxN && !pendingStop && !pendingJoin
 	if !canDelete && !canJoin {
 		return false
 	}
@@ -385,7 +396,7 @@ func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *ra
 		t.Logf("epoch=%d event=join_stale node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
 		return true
 	}
-	t.Logf("epoch=%d event=joined node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
+	t.Logf("epoch=%d event=join_scheduled node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
 	return true
 }
 
@@ -473,7 +484,9 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	sort.Slice(targetMembers, func(i, j int) bool { return targetMembers[i] < targetMembers[j] })
 	ref.mu.Lock()
 	version := ref.State.ConfigVersion
-	activation := ref.State.Epoch + 1
+	contextEpoch := ref.State.Epoch
+	firstCoin := contextEpoch + 5
+	activation := contextEpoch + 10
 	f := ref.State.F
 	ref.mu.Unlock()
 	targetF := (len(targetMembers) - 1) / 3
@@ -493,13 +506,13 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	}
 	req := JoinRequest{
 		ConfigVersion:   version,
-		ContextEpoch:    activation - 1,
+		ContextEpoch:    contextEpoch,
 		Joiner:          joiner,
 		PublicKey:       string(joiner) + "-pk",
 		BLSPublicKey:    defaultBLSPublicHex(joiner),
 		CandidateParams: pp,
 		Object:          Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
-		FirstCoinEpoch:  activation - 1,
+		FirstCoinEpoch:  firstCoin,
 		ActivationEpoch: activation,
 	}
 	rho := JoinDigest(req)
@@ -521,11 +534,39 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 		}
 	}
 	if !contains(c.members(), joiner) {
-		return false
+		c.pendingJoins[joiner] = pendingChurnJoin{activation: activation, members: targetMembers, params: pp, keys: keys}
+		return true
 	}
 	c.installPVSS(t, pp, keys, targetMembers)
 	c.addJoinerNode(t, parent, joiner, targetMembers, pp, keys)
 	return true
+}
+
+func (c *churnCluster) reconcilePendingJoins(t *testing.T, parent context.Context, epoch uint64) {
+	t.Helper()
+	for id, pending := range c.pendingJoins {
+		if epoch < pending.activation {
+			continue
+		}
+		for _, node := range c.activeNodes() {
+			node.mu.Lock()
+			due := node.State.Epoch+1 == pending.activation
+			node.mu.Unlock()
+			if due {
+				if err := node.activatePendingJoins(parent, pending.activation); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if !contains(c.members(), id) {
+			delete(c.pendingJoins, id)
+			continue
+		}
+		c.installPVSS(t, pending.params, pending.keys, pending.members)
+		c.addJoinerNode(t, parent, id, pending.members, pending.params, pending.keys)
+		delete(c.pendingJoins, id)
+		t.Logf("epoch=%d event=joined node=%s active_after=%v members_after=%v", epoch, id, c.activeIDs(), c.members())
+	}
 }
 
 func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PVSSParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
