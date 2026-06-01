@@ -2,7 +2,7 @@ from fabric import task
 
 from tychebench.results import print_latest_summary
 from tychebench.errors import BenchError
-from tychebench.runner import run_aws, run_local
+from tychebench.runner import organize_existing_runs, run_aws, run_local
 from tychebench.aws import (
     create_instances,
     destroy_instances,
@@ -48,7 +48,7 @@ def aws(
     ctx,
     nodes=8,
     epochs=200,
-    protocols="tyche,asyrand,grandline,spurt",
+    protocols="tyche,tyche-scrape,tyche-reconfig,asyrand,grandline,spurt",
     out="",
     key_path="",
     remote_dir="TycheBench",
@@ -101,3 +101,9 @@ def destroy(ctx, settings=""):
 def logs(ctx, run=""):
     """Print a compact summary for a benchmark run directory."""
     print_latest_summary(run or None)
+
+
+@task(name="organize-runs")
+def organize_runs(ctx):
+    """Organize legacy timestamped run directories into stable config directories."""
+    _run_or_exit(organize_existing_runs)

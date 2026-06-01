@@ -36,7 +36,13 @@ cd benchmark
 
 The `local` and `aws` Fabric tasks are Python runners and do not call `scripts/*.sh`. The AWS runner uses `settings.json` for `key.name`, `key.path`, instance type, and regions.
 By default, `fab aws` cross-compiles with `GOOS=linux`, `GOARCH=amd64`, and `CGO_ENABLED=0`. Override these with `AWS_GOOS`, `AWS_GOARCH`, and `AWS_CGO_ENABLED` if your EC2 fleet uses a different target.
-If a previous AWS run with the same `--nodes` and `--epochs` is incomplete, a later `fab aws` invocation reuses that run directory and its `aws_state.env` host list. Pass `--out=...` to force a specific directory.
+By default, benchmark output uses a stable directory name based only on mode, nodes, and epochs, such as `runs/aws_n8_e200`. A run writes into a hidden `.running` directory first, then appends successful protocol results into that shared configuration directory. Pass `--out=...` to force a specific directory and bypass this publish step.
+Each published run also writes `protocol_run_log.csv`, which records the latest run time and source log for every protocol in that configuration. Older results for the same protocol remain under `attempts/`, while plots use the latest run by default. To migrate older timestamped or hash-suffixed run directories into the stable layout:
+
+```powershell
+cd benchmark
+.\.venv\Scripts\fab organize-runs
+```
 AWS per-epoch timeout defaults to `60s * ceil(nodes / 4)`, so larger deployments do not fail on the old fixed 60s timeout. Override with `EPOCH_TIMEOUT_MS` when you need a specific value.
 
 ## AWS Nodes

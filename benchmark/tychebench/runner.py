@@ -10,7 +10,8 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
 from fabric import Connection
@@ -80,8 +81,289 @@ def _split_csv(raw):
     return [item.strip() for item in str(raw).split(",") if item.strip()]
 
 
-def _timestamp():
-    return time.strftime("%Y%m%d_%H%M%S")
+def _protocol_slug(protocols):
+    value = "-".join(protocols)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "protocols"
+
+
+def _run_config_hash(config):
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _write_run_config(path, config):
+    (path / "run_config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _format_mtime(timestamp):
+    return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
+def _safe_remove_run_dir(path):
+    path = path.resolve()
+    runs_root = RUNS_DIR.resolve()
+    if path == runs_root or runs_root not in path.parents:
+        raise BenchError(f"refusing to remove path outside benchmark runs: {path}")
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _default_run_paths(config):
+    name = f"{config['kind']}_n{config['nodes']}_e{config['epochs']}"
+    final = RUNS_DIR / name
+    running = RUNS_DIR / f".{name}.running"
+    return final, running
+
+
+def _prepare_default_run_dir(config, resume=False):
+    final, running = _default_run_paths(config)
+    if running.exists() and not resume:
+        _safe_remove_run_dir(running)
+    running.mkdir(parents=True, exist_ok=True)
+    _write_run_config(running, config)
+    return final.resolve(), running.resolve()
+
+
+def _rewrite_run_paths(path, old_root, new_root):
+    old_text = str(old_root)
+    new_text = str(new_root)
+    if old_text == new_text:
+        return
+    for file in path.rglob("*"):
+        if not file.is_file() or file.suffix.lower() not in {".csv", ".log", ".md", ".json", ".env"}:
+            continue
+        try:
+            content = file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if old_text in content:
+            file.write_text(content.replace(old_text, new_text), encoding="utf-8")
+
+
+def _read_csv_rows(path):
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _write_csv_rows(path, rows):
+    fieldnames = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _rows_protocols(rows):
+    protocols = []
+    for row in rows:
+        protocol = row.get("protocol", "")
+        if protocol and protocol not in protocols:
+            protocols.append(protocol)
+    return protocols
+
+
+def _merge_run_config(final, staging, protocols):
+    final_config_path = final / "run_config.json"
+    staging_config_path = staging / "run_config.json"
+    config = {}
+    if final_config_path.exists():
+        try:
+            config = json.loads(final_config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    if not config and staging_config_path.exists():
+        try:
+            config = json.loads(staging_config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    existing = config.get("protocols") if isinstance(config.get("protocols"), list) else []
+    config["protocols"] = existing + [protocol for protocol in protocols if protocol not in existing]
+    if config:
+        _write_run_config(final, config)
+
+
+def _run_id_from_path(path):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", path.name.strip(".")) or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _stamp_rows(rows, run_id, run_time, source_run=""):
+    stamped = []
+    for row in rows:
+        updated = dict(row)
+        updated["run_id"] = updated.get("run_id") or run_id
+        updated["run_time"] = updated.get("run_time") or run_time
+        updated["source_run"] = updated.get("source_run") or source_run
+        stamped.append(updated)
+    return stamped
+
+
+def _latest_rows_per_protocol(rows):
+    latest_key_by_protocol = {}
+    for row in rows:
+        protocol = row.get("protocol", "")
+        if not protocol:
+            continue
+        run_key = row.get("run_id") or row.get("source_run") or "__legacy__"
+        run_time = row.get("run_time") or ""
+        current = latest_key_by_protocol.get(protocol)
+        if current is None or (run_time, run_key) >= current:
+            latest_key_by_protocol[protocol] = (run_time, run_key)
+    return [
+        row
+        for row in rows
+        if row.get("protocol", "")
+        and (
+            row.get("run_time") or "",
+            row.get("run_id") or row.get("source_run") or "__legacy__",
+        )
+        == latest_key_by_protocol.get(row.get("protocol", ""))
+    ]
+
+
+def _copy_protocol_attempt(source, final, run_id, protocol):
+    source_protocol = source / protocol
+    if not source_protocol.exists():
+        return None
+    attempt_protocol = final / "attempts" / run_id / protocol
+    if attempt_protocol.exists():
+        shutil.rmtree(attempt_protocol)
+    attempt_protocol.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_protocol, attempt_protocol)
+
+    latest_protocol = final / protocol
+    if latest_protocol.exists():
+        shutil.rmtree(latest_protocol)
+    shutil.copytree(attempt_protocol, latest_protocol)
+    return attempt_protocol
+
+
+def _publish_successful_run(staging, final):
+    staging = staging.resolve()
+    final = final.resolve()
+    if final == staging:
+        return final
+
+    staging_rows = _read_csv_rows(staging / "results.csv")
+    staging_protocols = _rows_protocols(staging_rows)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_time = _format_mtime(time.time())
+    final.mkdir(parents=True, exist_ok=True)
+    for protocol in staging_protocols:
+        _copy_protocol_attempt(staging, final, run_id, protocol)
+    for source_file in staging.iterdir():
+        if source_file.is_dir() or source_file.name in {"results.csv", "protocol_run_log.csv", "run_config.json"}:
+            continue
+        shutil.copy2(source_file, final / source_file.name)
+
+    attempt_root = final / "attempts" / run_id
+    new_rows = _stamp_rows(
+        _rewrite_rows_for_run(staging_rows, staging, attempt_root),
+        run_id,
+        run_time,
+        staging.name,
+    )
+    merged_rows = [
+        row for row in _read_csv_rows(final / "results.csv")
+        if row.get("protocol", "") not in staging_protocols
+    ] + new_rows
+    if merged_rows:
+        _write_csv_rows(final / "results.csv", merged_rows)
+    _merge_run_config(final, staging, _rows_protocols(merged_rows))
+    write_protocol_run_log(final)
+    _safe_remove_run_dir(staging)
+    return final
+
+
+def _protocol_log_path(run_dir, row):
+    raw = row.get("log") or ""
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.exists():
+        return path
+    try:
+        marker = f"{RUNS_DIR.name}\\"
+        raw_norm = raw.replace("/", "\\")
+        if marker in raw_norm:
+            rel = raw_norm.split(marker, 1)[1].split("\\", 1)[1]
+            candidate = run_dir / Path(rel)
+            if candidate.exists():
+                return candidate
+    except IndexError:
+        pass
+    candidate = run_dir / raw
+    return candidate if candidate.exists() else None
+
+
+def write_protocol_run_log(run_dir, source_by_protocol=None):
+    run_dir = Path(run_dir)
+    results_path = run_dir / "results.csv"
+    if not results_path.exists():
+        return None
+    source_by_protocol = source_by_protocol or {}
+    rows = _read_csv_rows(results_path)
+    latest_key_by_protocol = {}
+    for row in rows:
+        protocol = row.get("protocol", "")
+        if not protocol:
+            continue
+        run_key = row.get("run_id") or row.get("source_run") or "__legacy__"
+        run_time = row.get("run_time") or ""
+        current = latest_key_by_protocol.get(protocol)
+        if current is None or (run_time, run_key) >= current:
+            latest_key_by_protocol[protocol] = (run_time, run_key)
+
+    stats = {}
+    for row in rows:
+        protocol = row.get("protocol", "")
+        if not protocol:
+            continue
+        run_key = row.get("run_id") or row.get("source_run") or "__legacy__"
+        run_time = row.get("run_time") or ""
+        if (run_time, run_key) != latest_key_by_protocol.get(protocol):
+            continue
+        entry = stats.setdefault(
+            protocol,
+            {"rows": 0, "latest_mtime": 0.0, "latest_log": "", "source": source_by_protocol.get(protocol, "")},
+        )
+        entry["rows"] += 1
+        log_path = _protocol_log_path(run_dir, row)
+        if log_path is not None:
+            mtime = log_path.stat().st_mtime
+            latest_log = str(log_path)
+        else:
+            mtime = results_path.stat().st_mtime
+            latest_log = row.get("log", "")
+        if mtime >= entry["latest_mtime"]:
+            entry["latest_mtime"] = mtime
+            entry["latest_log"] = latest_log
+            entry["source"] = row.get("source_run") or row.get("run_id") or entry["source"]
+
+    out = run_dir / "protocol_run_log.csv"
+    with out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["protocol", "latest_run_time", "rows", "source_run", "latest_log"],
+        )
+        writer.writeheader()
+        for protocol in sorted(stats):
+            entry = stats[protocol]
+            writer.writerow(
+                {
+                    "protocol": protocol,
+                    "latest_run_time": _format_mtime(entry["latest_mtime"]) if entry["latest_mtime"] else "",
+                    "rows": entry["rows"],
+                    "source_run": entry["source"],
+                    "latest_log": entry["latest_log"],
+                }
+            )
+    return out
 
 
 def _go_executable():
@@ -179,15 +461,25 @@ def _protocol_fault_threshold(protocol, options):
 
 
 def _protocol_success_threshold(protocol, options):
+    if protocol == "tyche-reconfig":
+        return 1
     return options.n - _protocol_fault_threshold(protocol, options)
 
 
 def _default_protocol_success_threshold(protocol, nodes):
+    if protocol == "tyche-reconfig":
+        return 1
     if protocol == "grandline":
         fault_threshold = (nodes - 1) // 2
     else:
         fault_threshold = (nodes - 1) // 3
     return nodes - fault_threshold
+
+
+def _aws_protocol_node_indices(protocol, options):
+    if protocol == "tyche-reconfig":
+        return [0]
+    return list(range(options.n))
 
 
 def _protocol_config(protocol, options):
@@ -438,6 +730,29 @@ def _parse_results(options, elapsed_by_protocol):
     return results_path
 
 
+def _local_run_config(n, epochs, protocol_list, fault_threshold):
+    return {
+        "kind": "local",
+        "nodes": n,
+        "epochs": epochs,
+        "protocols": protocol_list,
+        "fault_threshold": (n - 1) // 3 if fault_threshold is None else fault_threshold,
+        "grandline_fault_threshold": int(os.environ.get("GRANDLINE_F", str((n - 1) // 2))),
+        "queue_len": int(os.environ.get("QUEUE_LEN", "8")),
+        "producer_ms": int(os.environ.get("PRODUCER_MS", "250")),
+        "prefill_ms": int(os.environ.get("PREFILL_MS", "3000")),
+        "epoch_timeout_ms": int(os.environ.get("EPOCH_TIMEOUT_MS", "15000")),
+        "report_ms": int(os.environ.get("REPORT_MS", "5000")),
+        "max_pool": int(os.environ.get("MAX_POOL", "4")),
+        "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
+        "gomaxprocs": int(os.environ.get("GOMAXPROCS_LOCAL", "4")),
+        "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
+        "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", ""),
+        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", ""),
+        "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+    }
+
+
 def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
     ensure_layout()
     if n <= 0:
@@ -449,24 +764,30 @@ def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
     if not protocol_list:
         raise BenchError("at least one protocol is required")
 
-    output = Path(out_root) if out_root else RUNS_DIR / f"local_m1n{n}_{_timestamp()}"
+    config = _local_run_config(n, epochs, protocol_list, fault_threshold)
+    final_output = None
+    if out_root:
+        output = Path(out_root).resolve()
+    else:
+        final_output, output = _prepare_default_run_dir(config)
     options = LocalOptions(
         n=n,
         epochs=epochs,
         protocols=protocol_list,
-        out_root=output.resolve(),
-        fault_threshold=(n - 1) // 3 if fault_threshold is None else fault_threshold,
-        grandline_fault_threshold=int(os.environ.get("GRANDLINE_F", str((n - 1) // 2))),
-        queue_len=int(os.environ.get("QUEUE_LEN", "8")),
-        producer_ms=int(os.environ.get("PRODUCER_MS", "250")),
-        prefill_ms=int(os.environ.get("PREFILL_MS", "3000")),
-        epoch_timeout_ms=int(os.environ.get("EPOCH_TIMEOUT_MS", "15000")),
-        report_ms=int(os.environ.get("REPORT_MS", "5000")),
-        max_pool=int(os.environ.get("MAX_POOL", "4")),
-        aggregation_lookahead=int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
-        gomaxprocs=int(os.environ.get("GOMAXPROCS_LOCAL", "4")),
+        out_root=Path(output).resolve(),
+        fault_threshold=config["fault_threshold"],
+        grandline_fault_threshold=config["grandline_fault_threshold"],
+        queue_len=config["queue_len"],
+        producer_ms=config["producer_ms"],
+        prefill_ms=config["prefill_ms"],
+        epoch_timeout_ms=config["epoch_timeout_ms"],
+        report_ms=config["report_ms"],
+        max_pool=config["max_pool"],
+        aggregation_lookahead=config["aggregation_lookahead"],
+        gomaxprocs=config["gomaxprocs"],
     )
     options.out_root.mkdir(parents=True, exist_ok=True)
+    _write_run_config(options.out_root, config)
 
     elapsed_by_protocol = {}
     for protocol in options.protocols:
@@ -477,6 +798,11 @@ def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
         elapsed_by_protocol[protocol] = _run_protocol(protocol, options)
 
     results = _parse_results(options, elapsed_by_protocol)
+    write_protocol_run_log(options.out_root)
+    if final_output is not None:
+        published = _publish_successful_run(options.out_root, final_output)
+        results = published / "results.csv"
+        print(f"published: {published}")
     print(f"results: {results}")
 
 
@@ -627,6 +953,8 @@ def _remote_quote(path):
 def _aws_binary_targets(protocols):
     targets = {
         "tyche": ("Tyche", "./cmd/tyche", "tyche"),
+        "tyche-scrape": ("Tyche", "./cmd/tyche", "tyche"),
+        "tyche-reconfig": ("Tyche", "./protocol/tyche", "tyche-reconfig.test"),
         "asyrand": ("asyrand", "./cmd/asyrand", "asyrand"),
         "grandline": ("grandline", "./cmd/grandline", "grandline"),
         "spurt": ("spurt", "./cmd/spurt", "spurt"),
@@ -634,7 +962,7 @@ def _aws_binary_targets(protocols):
     unknown = [protocol for protocol in protocols if protocol not in targets]
     if unknown:
         raise BenchError(f"unknown AWS protocol(s): {', '.join(unknown)}")
-    return [targets[protocol] for protocol in dict.fromkeys(protocols)]
+    return list(dict.fromkeys(targets[protocol] for protocol in protocols))
 
 
 def _build_local_aws_binaries(options):
@@ -653,7 +981,10 @@ def _build_local_aws_binaries(options):
     for module_dir, package, binary_name in _aws_binary_targets(options.protocols):
         binary_path = options.local_bin_dir / binary_name
         log_file = options.out_root / "build" / f"{binary_name}.log"
-        command = [go, "build", "-trimpath", "-o", str(binary_path), package]
+        if binary_name.endswith(".test"):
+            command = [go, "test", "-c", "-o", str(binary_path), package]
+        else:
+            command = [go, "build", "-trimpath", "-o", str(binary_path), package]
         _run_logged(command, REPO_ROOT / module_dir, log_file, env)
 
 
@@ -751,7 +1082,7 @@ def _write_aws_configs(options, hosts):
     peers_file.write_text(",".join(peer_items), encoding="utf-8")
 
     for protocol in options.protocols:
-        if protocol == "tyche":
+        if protocol in {"tyche", "tyche-scrape", "tyche-reconfig"}:
             continue
         if protocol not in {"asyrand", "grandline", "spurt"}:
             raise BenchError(f"unknown AWS protocol: {protocol}")
@@ -779,21 +1110,46 @@ def _upload_payload_to_host(host, options):
 def _remote_command_for_node(protocol, node, options):
     port = options.base_port + node
     log_file = f"runlogs/{protocol}/node{node}.log"
-    if protocol == "tyche":
+    if protocol in {"tyche", "tyche-scrape"}:
         peers = (options.generated_dir / "tyche_peers.txt").read_text(encoding="utf-8")
         attempt_ms = os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", "10000")
         tyche_env = f"GOMAXPROCS={options.gomaxprocs} TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(attempt_ms)}"
         if os.environ.get("TYCHE_DEBUG"):
             tyche_env += f" TYCHE_DEBUG={_remote_quote(os.environ['TYCHE_DEBUG'])}"
+        pvss_arg = " -pvss scrape" if protocol == "tyche-scrape" else ""
         return (
             f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
             "export PATH=/usr/local/go/bin:$PATH "
-            f"{tyche_env} && "
+            f"export {tyche_env} && "
             f"/usr/bin/time -v ./bin/tyche -transport tcp -node node{node} "
             f"-n {options.n} -f {options.fault_threshold} -epochs {options.epochs} "
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
             f"-producer-ms {options.producer_ms} -prefill-ms {options.prefill_ms} "
             f"-epoch-timeout-ms {options.epoch_timeout_ms} -report-ms {options.report_ms} "
+            f"{pvss_arg} > {_remote_quote(log_file)} 2>&1"
+        )
+    if protocol == "tyche-reconfig":
+        reconfig_events = os.environ.get("TYCHE_RECONFIG_EVENTS", str(options.epochs // 20))
+        reconfig_min_n = os.environ.get("TYCHE_RECONFIG_MIN_N", str(options.n - options.fault_threshold))
+        reconfig_max_n = os.environ.get("TYCHE_RECONFIG_MAX_N", str(options.n + options.fault_threshold))
+        reconfig_seed = os.environ.get("TYCHE_RECONFIG_SEED", "20260521")
+        return (
+            f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
+            "export PATH=/usr/local/go/bin:$PATH "
+            f"GOMAXPROCS={options.gomaxprocs} "
+            "TYCHE_RECONFIG_BENCH_TEST=1 "
+            "TYCHE_CHURN_PVSS=o1 "
+            f"TYCHE_CHURN_EPOCHS={options.epochs} "
+            f"TYCHE_CHURN_INITIAL_N={options.n} "
+            f"TYCHE_CHURN_INITIAL_F={options.fault_threshold} "
+            f"TYCHE_CHURN_RECONFIG_EVENTS={_remote_quote(reconfig_events)} "
+            f"TYCHE_CHURN_PREFILL_MS={options.prefill_ms} "
+            f"TYCHE_CHURN_MIN_N={_remote_quote(reconfig_min_n)} "
+            f"TYCHE_CHURN_MAX_N={_remote_quote(reconfig_max_n)} "
+            f"TYCHE_CHURN_EPOCH_TIMEOUT_MS={options.epoch_timeout_ms} "
+            f"TYCHE_CHURN_SEED={_remote_quote(reconfig_seed)} "
+            f"/usr/bin/time -v ./bin/tyche-reconfig.test "
+            "-test.run TestBeaconReconfigurationBenchmark200Epochs -test.v "
             f"> {_remote_quote(log_file)} 2>&1"
         )
     if protocol in {"asyrand", "grandline", "spurt"}:
@@ -810,7 +1166,7 @@ def _remote_command_for_node(protocol, node, options):
 
 def _run_protocol_on_host(host, options, protocol):
     node_commands = []
-    for node in range(options.n):
+    for node in _aws_protocol_node_indices(protocol, options):
         if node == host.index:
             node_commands.append(f"( {_remote_command_for_node(protocol, node, options)} ) & pids=\"$pids $!\"")
     if not node_commands:
@@ -909,7 +1265,7 @@ def _stop_remote_processes(host, options):
     _run_host(
         host,
         options,
-        "pkill -f '([./]|/)bin/(tyche|asyrand|grandline|spurt)' >/dev/null 2>&1 || true",
+        "pkill -f '([./]|/)bin/(tyche|tyche-reconfig\\.test|asyrand|grandline|spurt)' >/dev/null 2>&1 || true",
         warn=True,
     )
 
@@ -1052,11 +1408,6 @@ def _result_protocol_counts(path):
     return counts
 
 
-def _run_matches_request(path, nodes, epochs):
-    state = _read_env_file(path / "aws_state.env")
-    return state.get("N") == str(nodes) and state.get("EPOCHS") == str(epochs)
-
-
 def _run_complete_for_protocols(path, protocols, nodes):
     if (path / "failures.csv").exists():
         return False
@@ -1079,16 +1430,6 @@ def _completed_protocols(path, nodes):
     }
 
 
-def _find_resume_run(nodes, epochs, protocols):
-    candidates = sorted(RUNS_DIR.glob(f"aws_n{nodes}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in candidates:
-        if not path.is_dir() or not _run_matches_request(path, nodes, epochs):
-            continue
-        if not _run_complete_for_protocols(path, protocols, nodes):
-            return path
-    return None
-
-
 def _parse_aws_results(options, hosts, protocol_failures=None, preserve_protocols=None, completed_nodes=None):
     protocol_failures = protocol_failures or {}
     preserve_protocols = preserve_protocols or set()
@@ -1108,7 +1449,7 @@ def _parse_aws_results(options, hosts, protocol_failures=None, preserve_protocol
             continue
         protocol_rows = []
         protocol_parse_errors = []
-        nodes_to_parse = sorted(completed_nodes.get(protocol, range(options.n)))
+        nodes_to_parse = sorted(completed_nodes.get(protocol, _aws_protocol_node_indices(protocol, options)))
         for node in nodes_to_parse:
             try:
                 row = _aws_result_row(options, hosts, protocol, node)
@@ -1190,6 +1531,273 @@ def _parallel(label, items, fn, max_workers=None):
         raise BenchError(f"{label} failed for {item}: {exc}") from exc
 
 
+def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
+    return {
+        "kind": "aws",
+        "nodes": nodes,
+        "epochs": epochs,
+        "protocols": protocol_list,
+        "fault_threshold": int(os.environ.get("F", str((nodes - 1) // 3))),
+        "grandline_fault_threshold": int(os.environ.get("GRANDLINE_F", str((nodes - 1) // 2))),
+        "base_port": int(os.environ.get("BASE_PORT", "9000")),
+        "queue_len": int(os.environ.get("QUEUE_LEN", "8")),
+        "producer_ms": int(os.environ.get("PRODUCER_MS", "250")),
+        "prefill_ms": int(os.environ.get("PREFILL_MS", "8000")),
+        "epoch_timeout_ms": epoch_timeout_ms,
+        "report_ms": int(os.environ.get("REPORT_MS", "5000")),
+        "linger_ms": int(os.environ.get("LINGER_MS", "5000")),
+        "max_pool": int(os.environ.get("MAX_POOL", "16")),
+        "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
+        "gomaxprocs": int(os.environ.get("GOMAXPROCS_REMOTE", "4")),
+        "startup_wait_sec": int(os.environ["STARTUP_WAIT_SEC"]) if os.environ.get("STARTUP_WAIT_SEC") else None,
+        "ssh_connect_timeout": int(os.environ.get("SSH_CONNECT_TIMEOUT", "6")),
+        "ssh_probe_retries": int(os.environ.get("SSH_PROBE_RETRIES", "1")),
+        "ssh_probe_delay_sec": int(os.environ.get("SSH_PROBE_DELAY_SEC", "0")),
+        "aws_goos": os.environ.get("AWS_GOOS", "linux"),
+        "aws_goarch": os.environ.get("AWS_GOARCH", "amd64"),
+        "aws_cgo_enabled": os.environ.get("AWS_CGO_ENABLED", "0"),
+        "tyche_epoch_attempt_ms": os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", "10000"),
+        "tyche_debug": os.environ.get("TYCHE_DEBUG", ""),
+        "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
+        "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", ""),
+        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", ""),
+        "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+    }
+
+
+def _legacy_timestamp(path):
+    match = re.search(r"_(\d{8})_(\d{6})$", path.name)
+    if match:
+        try:
+            return datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S").timestamp()
+        except ValueError:
+            pass
+    return path.stat().st_mtime
+
+
+def _legacy_results_rows(path):
+    results_path = path / "results.csv"
+    if not results_path.exists():
+        return []
+    with results_path.open("r", newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _legacy_aws_config_from_state(path, rows):
+    state = _read_env_file(path / "aws_state.env")
+    nodes = int(state.get("N") or state.get("M") or 0)
+    epochs = int(state.get("EPOCHS") or 0)
+    if nodes <= 0 or epochs <= 0:
+        match = re.match(r"aws_n(\d+)_", path.name)
+        nodes = int(match.group(1)) if match else nodes
+    protocols = []
+    for row in rows:
+        protocol = row.get("protocol", "")
+        if protocol and protocol not in protocols:
+            protocols.append(protocol)
+    if nodes <= 0 or epochs <= 0 or not protocols:
+        return None
+    return {
+        "kind": "aws",
+        "nodes": nodes,
+        "epochs": epochs,
+        "protocols": protocols,
+        "fault_threshold": int(state.get("BFT_F") or ((nodes - 1) // 3)),
+        "grandline_fault_threshold": int(state.get("GRANDLINE_F") or ((nodes - 1) // 2)),
+        "base_port": 9000,
+        "queue_len": 8,
+        "producer_ms": 250,
+        "prefill_ms": 8000,
+        "epoch_timeout_ms": 60000,
+        "report_ms": 5000,
+        "linger_ms": 5000,
+        "max_pool": 16,
+        "aggregation_lookahead": 8,
+        "gomaxprocs": 4,
+        "startup_wait_sec": None,
+        "ssh_connect_timeout": 6,
+        "ssh_probe_retries": 1,
+        "ssh_probe_delay_sec": 0,
+        "aws_goos": "linux",
+        "aws_goarch": "amd64",
+        "aws_cgo_enabled": "0",
+        "tyche_epoch_attempt_ms": "10000",
+        "tyche_debug": "",
+        "tyche_reconfig_events": "",
+        "tyche_reconfig_min_n": "",
+        "tyche_reconfig_max_n": "",
+        "tyche_reconfig_seed": "20260521",
+    }
+
+
+def _legacy_group_key(config):
+    return (config["kind"], config["nodes"], config["epochs"])
+
+
+def _config_from_run_dir(path, rows):
+    config_path = path / "run_config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if config.get("kind") and config.get("nodes") and config.get("epochs"):
+                config["protocols"] = _rows_protocols(rows) or config.get("protocols", [])
+                return config
+        except (OSError, json.JSONDecodeError):
+            pass
+    return _legacy_aws_config_from_state(path, rows)
+
+
+def _is_simple_run_dir(path):
+    return re.fullmatch(r"(?:aws|local)_n\d+_e\d+", path.name) is not None
+
+
+def _is_extended_run_dir(path):
+    return re.fullmatch(r"(?:aws|local)_n\d+_e\d+_.+", path.name) is not None
+
+
+def _run_entries_from_dir(path, rows):
+    if path.name.startswith("."):
+        return []
+    attempts_dir = path / "attempts"
+    if attempts_dir.exists():
+        entries = []
+        run_ids = []
+        for row in rows:
+            run_id = row.get("run_id") or row.get("source_run") or ""
+            if run_id and run_id not in run_ids:
+                run_ids.append(run_id)
+        for run_id in run_ids:
+            run_rows = [row for row in rows if (row.get("run_id") or row.get("source_run") or "") == run_id]
+            attempt_path = attempts_dir / run_id
+            source = attempt_path if attempt_path.exists() else path
+            run_time = run_rows[0].get("run_time") if run_rows else ""
+            try:
+                latest = datetime.fromisoformat(run_time).timestamp() if run_time else _legacy_timestamp(source)
+            except ValueError:
+                latest = _legacy_timestamp(source)
+            entries.append({"path": source, "rows": run_rows, "latest": latest, "source_name": run_id})
+        return entries
+    return [{"path": path, "rows": rows, "latest": _legacy_timestamp(path), "source_name": path.name}]
+
+
+def _rewrite_rows_for_run(rows, old_root, new_root):
+    old_text = str(old_root.resolve())
+    new_text = str(new_root.resolve())
+    rewritten = []
+    for row in rows:
+        updated = dict(row)
+        if updated.get("log"):
+            updated["log"] = updated["log"].replace(old_text, new_text)
+        rewritten.append(updated)
+    return rewritten
+
+
+def _copy_protocol_payload(source, dest, protocol):
+    protocol_dir = source / protocol
+    if protocol_dir.exists():
+        target = dest / protocol
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(protocol_dir, target)
+
+
+def organize_existing_runs():
+    ensure_layout()
+    archive = RUNS_DIR / "_archive_legacy"
+    source_dirs = [
+        path
+        for path in RUNS_DIR.iterdir()
+        if path.is_dir()
+        and (_is_simple_run_dir(path) or _is_extended_run_dir(path) or re.match(r"aws_n\d+_\d{8}_\d{6}$", path.name))
+    ]
+    if not source_dirs and archive.exists():
+        source_dirs = [
+            path
+            for path in archive.iterdir()
+            if path.is_dir() and re.match(r"aws_n\d+_\d{8}_\d{6}$", path.name)
+        ]
+    if not source_dirs:
+        print("No run directories need organizing.")
+        return
+
+    groups = {}
+    skipped = []
+    for path in source_dirs:
+        rows = _legacy_results_rows(path)
+        config = _config_from_run_dir(path, rows)
+        if config is None:
+            skipped.append(path.name)
+            continue
+        group = groups.setdefault(_legacy_group_key(config), {"config": config, "runs": []})
+        group["runs"].extend(_run_entries_from_dir(path, rows))
+        for protocol in config["protocols"]:
+            if protocol not in group["config"].get("protocols", []):
+                group["config"].setdefault("protocols", []).append(protocol)
+
+    archive.mkdir(parents=True, exist_ok=True)
+    organized = []
+    for group in groups.values():
+        config = dict(group["config"])
+        config["protocols"] = []
+        final, staging = _default_run_paths(config)
+        rebuild = RUNS_DIR / f".{final.name}.organizing"
+        _safe_remove_run_dir(rebuild)
+        rebuild.mkdir(parents=True, exist_ok=True)
+        history_rows = []
+        latest_by_protocol = {}
+        for entry in sorted(group["runs"], key=lambda item: (item["latest"], item["path"].name)):
+            source = entry["path"]
+            run_id = entry.get("source_name") or _run_id_from_path(source)
+            run_time = _format_mtime(entry["latest"])
+            protocols = _rows_protocols(entry["rows"])
+            for protocol in protocols:
+                if protocol not in config["protocols"]:
+                    config["protocols"].append(protocol)
+                _copy_protocol_attempt(source, rebuild, run_id, protocol)
+                latest = latest_by_protocol.get(protocol)
+                if latest is None or entry["latest"] >= latest["latest"]:
+                    latest_by_protocol[protocol] = {"latest": entry["latest"], "source": source, "run_id": run_id}
+            rewritten = _rewrite_rows_for_run(entry["rows"], source, rebuild / "attempts" / run_id)
+            history_rows.extend(_stamp_rows(rewritten, run_id, run_time, entry.get("source_name") or source.name))
+
+        latest_rows = _latest_rows_per_protocol(history_rows)
+        if latest_rows:
+            _write_csv_rows(rebuild / "results.csv", latest_rows)
+
+        newest_source = max((entry["path"] for entry in group["runs"]), key=_legacy_timestamp)
+        for filename in ("aws_state.env", "spurt_remote_summary.txt"):
+            source_file = newest_source / filename
+            if source_file.exists():
+                shutil.copy2(source_file, rebuild / filename)
+        _write_run_config(rebuild, config)
+        write_protocol_run_log(rebuild)
+        if final.exists():
+            _safe_remove_run_dir(final)
+        shutil.copytree(rebuild, final)
+        _safe_remove_run_dir(rebuild)
+        _rewrite_run_paths(final, rebuild, final)
+        write_protocol_run_log(final)
+        organized.append(final.name)
+
+    for path in source_dirs:
+        if path.parent == archive or _is_simple_run_dir(path):
+            continue
+        target = archive / path.name
+        if target.exists():
+            suffix = 1
+            while (archive / f"{path.name}_{suffix}").exists():
+                suffix += 1
+            target = archive / f"{path.name}_{suffix}"
+        path.rename(target)
+
+    print(f"organized {len(organized)} run configuration(s)")
+    for name in organized:
+        print(f"  {name}")
+    if skipped:
+        print(f"skipped {len(skipped)} legacy run(s): {', '.join(skipped)}")
+    print(f"archived legacy directories under: {archive}")
+
+
 def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="TycheBench", ssh_user=None):
     ensure_layout()
     if nodes <= 0:
@@ -1199,42 +1807,56 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
         raise BenchError("at least one protocol is required")
     settings = load_settings()
     key_file = (Path(key_path).resolve() if key_path else settings.key_path)
+    epoch_timeout_ms = _aws_epoch_timeout_ms(nodes)
+    config = _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms)
 
-    resume_run = None if out_root else _find_resume_run(nodes, epochs, protocol_list)
-    output = Path(out_root) if out_root else (resume_run or RUNS_DIR / f"aws_n{nodes}_{_timestamp()}")
+    final_output = None
+    resume_run = None
+    if out_root:
+        output = Path(out_root).resolve()
+    else:
+        final_output, running_output = _default_run_paths(config)
+        if (
+            running_output.exists()
+            and not (running_output / "failures.csv").exists()
+            and not _run_complete_for_protocols(running_output, protocol_list, nodes)
+        ):
+            resume_run = running_output
+        final_output, output = _prepare_default_run_dir(config, resume=resume_run is not None)
     options = AwsOptions(
         n=nodes,
         epochs=epochs,
         protocols=protocol_list,
-        out_root=output.resolve(),
+        out_root=Path(output).resolve(),
         generated_dir=(REPO_ROOT / "benchmark" / "generated" / f"aws_n{nodes}").resolve(),
         local_bin_dir=(
             output
             / "bin"
-            / f"{os.environ.get('AWS_GOOS', 'linux')}_{os.environ.get('AWS_GOARCH', 'amd64')}"
+            / f"{config['aws_goos']}_{config['aws_goarch']}"
         ).resolve(),
         key_file=key_file,
         remote_dir=remote_dir,
         ssh_user=ssh_user,
-        fault_threshold=int(os.environ.get("F", str((nodes - 1) // 3))),
-        grandline_fault_threshold=int(os.environ.get("GRANDLINE_F", str((nodes - 1) // 2))),
-        base_port=int(os.environ.get("BASE_PORT", "9000")),
-        queue_len=int(os.environ.get("QUEUE_LEN", "8")),
-        producer_ms=int(os.environ.get("PRODUCER_MS", "250")),
-        prefill_ms=int(os.environ.get("PREFILL_MS", "8000")),
-        epoch_timeout_ms=_aws_epoch_timeout_ms(nodes),
-        report_ms=int(os.environ.get("REPORT_MS", "5000")),
-        linger_ms=int(os.environ.get("LINGER_MS", "5000")),
-        max_pool=int(os.environ.get("MAX_POOL", "16")),
-        aggregation_lookahead=int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
-        gomaxprocs=int(os.environ.get("GOMAXPROCS_REMOTE", "4")),
-        startup_wait_sec=int(os.environ["STARTUP_WAIT_SEC"]) if os.environ.get("STARTUP_WAIT_SEC") else None,
-        ssh_connect_timeout=int(os.environ.get("SSH_CONNECT_TIMEOUT", "6")),
-        ssh_probe_retries=int(os.environ.get("SSH_PROBE_RETRIES", "1")),
-        ssh_probe_delay_sec=int(os.environ.get("SSH_PROBE_DELAY_SEC", "0")),
+        fault_threshold=config["fault_threshold"],
+        grandline_fault_threshold=config["grandline_fault_threshold"],
+        base_port=config["base_port"],
+        queue_len=config["queue_len"],
+        producer_ms=config["producer_ms"],
+        prefill_ms=config["prefill_ms"],
+        epoch_timeout_ms=config["epoch_timeout_ms"],
+        report_ms=config["report_ms"],
+        linger_ms=config["linger_ms"],
+        max_pool=config["max_pool"],
+        aggregation_lookahead=config["aggregation_lookahead"],
+        gomaxprocs=config["gomaxprocs"],
+        startup_wait_sec=config["startup_wait_sec"],
+        ssh_connect_timeout=config["ssh_connect_timeout"],
+        ssh_probe_retries=config["ssh_probe_retries"],
+        ssh_probe_delay_sec=config["ssh_probe_delay_sec"],
     )
     protocol_retries = int(os.environ.get("AWS_PROTOCOL_RETRIES", "2"))
     options.out_root.mkdir(parents=True, exist_ok=True)
+    _write_run_config(options.out_root, config)
 
     skip_protocols = set()
     if resume_run:
@@ -1277,9 +1899,10 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
             success_threshold = _protocol_success_threshold(protocol, options)
             successful_hosts = set()
             failed_hosts = {}
-            pool = ThreadPoolExecutor(max_workers=len(hosts))
+            protocol_hosts = [hosts[node] for node in _aws_protocol_node_indices(protocol, options)]
+            pool = ThreadPoolExecutor(max_workers=len(protocol_hosts))
             try:
-                future_hosts = {pool.submit(_run_protocol_on_host, host, options, protocol): host for host in hosts}
+                future_hosts = {pool.submit(_run_protocol_on_host, host, options, protocol): host for host in protocol_hosts}
                 wait_sec = _startup_wait_seconds(options)
                 if wait_sec > 0:
                     print(f"[{time.strftime('%H:%M:%S')}] waiting {wait_sec}s for startup")
@@ -1441,7 +2064,17 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
         preserve_protocols=skip_protocols,
         completed_nodes=completed_nodes,
     )
+    write_protocol_run_log(options.out_root)
     _parallel("stop remote processes", hosts, lambda host: _stop_remote_processes(host, options))
+    if final_output is not None and not (options.out_root / "failures.csv").exists():
+        published = _publish_successful_run(options.out_root, final_output)
+        options = replace(
+            options,
+            out_root=published,
+            local_bin_dir=(published / "bin" / f"{config['aws_goos']}_{config['aws_goarch']}").resolve(),
+        )
+        results = published / "results.csv"
+        print(f"published: {published}")
     print(f"results: {results}")
     failures = options.out_root / "failures.csv"
     if failures.exists():

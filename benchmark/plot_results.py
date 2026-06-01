@@ -1,5 +1,6 @@
 import csv
 import html
+import json
 import math
 import re
 import statistics
@@ -23,27 +24,52 @@ def read_results():
     run_counts = defaultdict(lambda: defaultdict(int))
 
     for run_dir in sorted(RUNS_DIR.glob("aws_n*")):
-        match = re.match(r"aws_n(\d+)_", run_dir.name)
-        if not match:
+        config_path = run_dir / "run_config.json"
+        if config_path.exists():
+            try:
+                node_count = int(json.loads(config_path.read_text(encoding="utf-8")).get("nodes", 0))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                node_count = 0
+        else:
+            match = re.match(r"aws_n(\d+)(?:_|$)", run_dir.name)
+            node_count = int(match.group(1)) if match else 0
+        if node_count <= 0:
             continue
-        node_count = int(match.group(1))
         results_path = run_dir / "results.csv"
         if not results_path.exists():
             continue
+        latest_key_by_protocol = {}
+        rows = []
         with results_path.open(newline="", encoding="utf-8-sig") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                protocol = (row.get("protocol") or "").strip()
-                if protocol not in PROTOCOLS:
-                    continue
-                try:
-                    throughput = float(row.get("throughput_beacon_min") or 0)
-                except ValueError:
-                    continue
-                if throughput <= 0:
-                    continue
-                data[protocol][node_count].append(throughput)
-                run_counts[protocol][node_count] += 1
+            rows = list(csv.DictReader(handle))
+        for row in rows:
+            protocol = (row.get("protocol") or "").strip()
+            if protocol not in PROTOCOLS:
+                continue
+            run_key = row.get("run_id") or row.get("source_run") or ""
+            run_time = row.get("run_time") or ""
+            if not run_key:
+                run_key = "__legacy__"
+                run_time = ""
+            current = latest_key_by_protocol.get(protocol)
+            if current is None or (run_time, run_key) >= current:
+                latest_key_by_protocol[protocol] = (run_time, run_key)
+        for row in rows:
+            protocol = (row.get("protocol") or "").strip()
+            if protocol not in PROTOCOLS:
+                continue
+            run_key = row.get("run_id") or row.get("source_run") or "__legacy__"
+            run_time = row.get("run_time") or ""
+            if (run_time, run_key) != latest_key_by_protocol.get(protocol):
+                continue
+            try:
+                throughput = float(row.get("throughput_beacon_min") or 0)
+            except ValueError:
+                continue
+            if throughput <= 0:
+                continue
+            data[protocol][node_count].append(throughput)
+            run_counts[protocol][node_count] += 1
 
     return data, run_counts
 

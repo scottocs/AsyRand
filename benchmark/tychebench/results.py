@@ -7,7 +7,7 @@ from .paths import RUNS_DIR
 def _latest_run():
     if not RUNS_DIR.exists():
         return None
-    candidates = [path for path in RUNS_DIR.iterdir() if path.is_dir()]
+    candidates = [path for path in RUNS_DIR.iterdir() if path.is_dir() and not path.name.startswith(".")]
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
