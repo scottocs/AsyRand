@@ -162,6 +162,26 @@ func TestBeaconAutoProducerRunnerIDsCertifiesEpochsN4(t *testing.T) {
 	}
 }
 
+func TestInstallCertifiedStatePreservesLocalRemovalMarks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	node := newTestNodes(t, ctx)[0]
+	node.mu.Lock()
+	state := node.stateDigestLocked()
+	state.RmMark["n2"] = -1
+	node.State.RmMark["n2"] = 3
+	marks := copyRemovalMarks(node.State.RmMark)
+	node.installCertifiedStateLocked(state)
+	node.mergeRemovalMarksLocked(marks)
+	got := node.State.RmMark["n2"]
+	node.mu.Unlock()
+
+	if got != 3 {
+		t.Fatalf("removal mark was lost after installing certified state: got %d", got)
+	}
+}
+
 func TestBeaconAutoProducerRunnerIDsCertifiesEpochN16(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

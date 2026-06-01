@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -35,6 +36,8 @@ class LocalOptions:
     epoch_timeout_ms: int = 15000
     report_ms: int = 5000
     max_pool: int = 4
+    transport_buffer: int = 0
+    removal_expiration_ms: int = 0
     aggregation_lookahead: int = 8
     gomaxprocs: int = 4
 
@@ -69,6 +72,8 @@ class AwsOptions:
     report_ms: int = 5000
     linger_ms: int = 5000
     max_pool: int = 16
+    transport_buffer: int = 0
+    removal_expiration_ms: int = 0
     aggregation_lookahead: int = 8
     gomaxprocs: int = 4
     startup_wait_sec: int | None = None
@@ -556,6 +561,10 @@ def _run_protocol(protocol, options):
             str(options.report_ms),
             "-max-pool",
             str(options.max_pool),
+            "-transport-buffer",
+            str(options.transport_buffer),
+            "-removal-expiration-ms",
+            str(options.removal_expiration_ms),
         ]
         if protocol == "tyche-scrape":
             command.extend(["-pvss", "scrape"])
@@ -744,6 +753,8 @@ def _local_run_config(n, epochs, protocol_list, fault_threshold):
         "epoch_timeout_ms": int(os.environ.get("EPOCH_TIMEOUT_MS", "15000")),
         "report_ms": int(os.environ.get("REPORT_MS", "5000")),
         "max_pool": int(os.environ.get("MAX_POOL", "4")),
+        "transport_buffer": int(os.environ.get("TYCHE_TRANSPORT_BUFFER", "0")),
+        "removal_expiration_ms": int(os.environ.get("TYCHE_REMOVAL_EXPIRATION_MS", "0")),
         "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
         "gomaxprocs": int(os.environ.get("GOMAXPROCS_LOCAL", "4")),
         "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
@@ -783,6 +794,8 @@ def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
         epoch_timeout_ms=config["epoch_timeout_ms"],
         report_ms=config["report_ms"],
         max_pool=config["max_pool"],
+        transport_buffer=config["transport_buffer"],
+        removal_expiration_ms=config["removal_expiration_ms"],
         aggregation_lookahead=config["aggregation_lookahead"],
         gomaxprocs=config["gomaxprocs"],
     )
@@ -1032,17 +1045,11 @@ def _startup_wait_seconds(options):
 
 
 def _default_aws_epoch_timeout_ms(nodes):
-    return 60000
+    return 60000 * max(1, math.ceil(nodes / 4))
 
 
 def _aws_epoch_timeout_ms(nodes):
     requested = int(os.environ.get("EPOCH_TIMEOUT_MS", str(_default_aws_epoch_timeout_ms(nodes))))
-    if requested > 60000:
-        print(
-            f"[{time.strftime('%H:%M:%S')}] clamping AWS epoch timeout "
-            f"from {requested}ms to 60000ms"
-        )
-        return 60000
     return requested
 
 
@@ -1112,8 +1119,9 @@ def _remote_command_for_node(protocol, node, options):
     log_file = f"runlogs/{protocol}/node{node}.log"
     if protocol in {"tyche", "tyche-scrape"}:
         peers = (options.generated_dir / "tyche_peers.txt").read_text(encoding="utf-8")
-        attempt_ms = os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", "10000")
-        tyche_env = f"GOMAXPROCS={options.gomaxprocs} TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(attempt_ms)}"
+        tyche_env = f"GOMAXPROCS={options.gomaxprocs}"
+        if os.environ.get("TYCHE_EPOCH_ATTEMPT_MS"):
+            tyche_env += f" TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(os.environ['TYCHE_EPOCH_ATTEMPT_MS'])}"
         if os.environ.get("TYCHE_DEBUG"):
             tyche_env += f" TYCHE_DEBUG={_remote_quote(os.environ['TYCHE_DEBUG'])}"
         pvss_arg = " -pvss scrape" if protocol == "tyche-scrape" else ""
@@ -1124,6 +1132,9 @@ def _remote_command_for_node(protocol, node, options):
             f"/usr/bin/time -v ./bin/tyche -transport tcp -node node{node} "
             f"-n {options.n} -f {options.fault_threshold} -epochs {options.epochs} "
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
+            f"-queue-len {options.queue_len} -max-pool {options.max_pool} "
+            f"-transport-buffer {options.transport_buffer} "
+            f"-removal-expiration-ms {options.removal_expiration_ms} "
             f"-producer-ms {options.producer_ms} -prefill-ms {options.prefill_ms} "
             f"-epoch-timeout-ms {options.epoch_timeout_ms} -report-ms {options.report_ms} "
             f"{pvss_arg} > {_remote_quote(log_file)} 2>&1"
@@ -1251,7 +1262,10 @@ def _remote_completed_hosts(hosts, options, protocol, pending_hosts):
         }
         for future in as_completed(futures):
             host = futures[future]
-            done, ok, tail = future.result()
+            try:
+                done, ok, tail = future.result()
+            except Exception:
+                continue
             if not done:
                 continue
             if ok:
@@ -1547,6 +1561,8 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "report_ms": int(os.environ.get("REPORT_MS", "5000")),
         "linger_ms": int(os.environ.get("LINGER_MS", "5000")),
         "max_pool": int(os.environ.get("MAX_POOL", "16")),
+        "transport_buffer": int(os.environ.get("TYCHE_TRANSPORT_BUFFER", "0")),
+        "removal_expiration_ms": int(os.environ.get("TYCHE_REMOVAL_EXPIRATION_MS", "0")),
         "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
         "gomaxprocs": int(os.environ.get("GOMAXPROCS_REMOTE", "4")),
         "startup_wait_sec": int(os.environ["STARTUP_WAIT_SEC"]) if os.environ.get("STARTUP_WAIT_SEC") else None,
@@ -1556,7 +1572,7 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "aws_goos": os.environ.get("AWS_GOOS", "linux"),
         "aws_goarch": os.environ.get("AWS_GOARCH", "amd64"),
         "aws_cgo_enabled": os.environ.get("AWS_CGO_ENABLED", "0"),
-        "tyche_epoch_attempt_ms": os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", "10000"),
+        "tyche_epoch_attempt_ms": os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", ""),
         "tyche_debug": os.environ.get("TYCHE_DEBUG", ""),
         "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
         "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", ""),
@@ -1612,6 +1628,8 @@ def _legacy_aws_config_from_state(path, rows):
         "report_ms": 5000,
         "linger_ms": 5000,
         "max_pool": 16,
+        "transport_buffer": 0,
+        "removal_expiration_ms": 0,
         "aggregation_lookahead": 8,
         "gomaxprocs": 4,
         "startup_wait_sec": None,
@@ -1847,6 +1865,8 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
         report_ms=config["report_ms"],
         linger_ms=config["linger_ms"],
         max_pool=config["max_pool"],
+        transport_buffer=config["transport_buffer"],
+        removal_expiration_ms=config["removal_expiration_ms"],
         aggregation_lookahead=config["aggregation_lookahead"],
         gomaxprocs=config["gomaxprocs"],
         startup_wait_sec=config["startup_wait_sec"],

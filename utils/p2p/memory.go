@@ -43,6 +43,10 @@ func (t *MemoryTransport) ID() NodeID                  { return t.id }
 func (t *MemoryTransport) Inbox() <-chan Message       { return t.inbox }
 func (t *MemoryTransport) Start(context.Context) error { return nil }
 
+func (t *MemoryTransport) InboxStats() (int, int) {
+	return len(t.inbox), cap(t.inbox)
+}
+
 func (t *MemoryTransport) Send(ctx context.Context, to NodeID, msg Message) error {
 	t.net.mu.RLock()
 	peer := t.net.peers[to]

@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -159,6 +160,7 @@ type Node struct {
 	RBC       *rbc.Broadcaster
 	ABA       *aba.Agreement
 	Crypto    *cryptoexec.Executor
+	ObjCrypto *cryptoexec.Executor
 
 	mu          sync.Mutex
 	State       *State
@@ -205,6 +207,49 @@ type verifiedObject struct {
 	version uint64
 	object  Object
 	valid   bool
+}
+
+type DebugSnapshot struct {
+	Node          p2p.NodeID
+	Completed     uint64
+	NextEpoch     uint64
+	Source        p2p.NodeID
+	Seq           uint64
+	Instance      string
+	Object        bool
+	NextObject    bool
+	ReconSent     bool
+	ReconDone     bool
+	ReconCount    int
+	ReconNeed     int
+	EchoMax       int
+	ReadyMax      int
+	Certifying    bool
+	Certified     bool
+	Waiters       int
+	PendingABAs   int
+	ABAInputSent  bool
+	ABAInput      bool
+	ABADecided    bool
+	ABACoinWait   bool
+	ABARound      uint64
+	ABAInputs     int
+	ABAInputTrue  int
+	ABAInputFalse int
+	ABAFinish     int
+	ABABValTrue   int
+	ABABValFalse  int
+	ABABinTrue    bool
+	ABABinFalse   bool
+	ABAAux        int
+	ABAConf       int
+	VerifiedCache int
+	CryptoWorkers int
+	CryptoActive  int64
+	CryptoQueued  int64
+	ObjWorkers    int
+	ObjActive     int64
+	ObjQueued     int64
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -290,11 +335,12 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n := &Node{
 		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{}, BLS: blsKey, BLSPublic: blsPublic,
-		RBC:    rbc.New(cfg.ID, len(members), f, cfg.Transport),
-		ABA:    aba.New(cfg.ID, len(members), f, cfg.Transport),
-		Crypto: cryptoexec.New(cfg.CryptoWorkers),
-		State:  st,
-		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
+		RBC:       rbc.New(cfg.ID, len(members), f, cfg.Transport),
+		ABA:       aba.New(cfg.ID, len(members), f, cfg.Transport),
+		Crypto:    cryptoexec.New(criticalCryptoWorkers(cfg.CryptoWorkers)),
+		ObjCrypto: cryptoexec.New(objectCryptoWorkers(cfg.CryptoWorkers)),
+		State:     st,
+		recon:     make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
 		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.BLSSignatureShare),
 		readySent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
@@ -329,7 +375,40 @@ func NewNode(cfg Config) (*Node, error) {
 	return n, nil
 }
 
+func criticalCryptoWorkers(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	if total < 4 {
+		return 1
+	}
+	return total / 4
+}
+
+func objectCryptoWorkers(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	critical := criticalCryptoWorkers(total)
+	if total-critical < 1 {
+		return 1
+	}
+	return total - critical
+}
+
 func (n *Node) Start(ctx context.Context) {
+	abaInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 4))
+	controlInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 2))
+	rbcInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 8))
+	startMessageWorkers(ctx, abaInbox, 4, func(msg p2p.Message) {
+		_ = n.handleABAMessage(ctx, msg)
+	})
+	startMessageWorkers(ctx, controlInbox, 4, func(msg p2p.Message) {
+		_ = n.handleTyche(ctx, msg)
+	})
+	startMessageWorkers(ctx, rbcInbox, 4, func(msg p2p.Message) {
+		_ = n.handleRBCMessage(ctx, msg)
+	})
 	go func() {
 		for {
 			select {
@@ -337,7 +416,16 @@ func (n *Node) Start(ctx context.Context) {
 				if !ok {
 					return
 				}
-				_ = n.Handle(ctx, msg)
+				switch msg.Protocol {
+				case aba.Protocol:
+					enqueueProtocolMessage(ctx, abaInbox, msg)
+				case Protocol:
+					enqueueProtocolMessage(ctx, controlInbox, msg)
+				case rbc.Protocol:
+					enqueueProtocolMessage(ctx, rbcInbox, msg)
+				default:
+					_ = n.Handle(ctx, msg)
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -367,27 +455,71 @@ func (n *Node) Start(ctx context.Context) {
 	}()
 }
 
+func protocolQueueSize(n int, factor int) int {
+	size := n * n * factor
+	if size < 1024 {
+		return 1024
+	}
+	if size > 262144 {
+		return 262144
+	}
+	return size
+}
+
+func startMessageWorkers(ctx context.Context, inbox <-chan p2p.Message, workers int, handle func(p2p.Message)) {
+	if workers < 1 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case msg := <-inbox:
+					handle(msg)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+}
+
+func enqueueProtocolMessage(ctx context.Context, inbox chan<- p2p.Message, msg p2p.Message) {
+	select {
+	case inbox <- msg:
+	case <-ctx.Done():
+	}
+}
+
 func (n *Node) Handle(ctx context.Context, msg p2p.Message) error {
 	switch msg.Protocol {
 	case rbc.Protocol:
-		start := time.Now()
-		err := n.RBC.Handle(ctx, msg)
-		if n.Perf != nil {
-			n.Perf.addRBCHandle(time.Since(start))
-		}
-		return err
+		return n.handleRBCMessage(ctx, msg)
 	case aba.Protocol:
-		start := time.Now()
-		err := n.ABA.Handle(ctx, msg)
-		if n.Perf != nil {
-			n.Perf.addABAHandle(time.Since(start))
-		}
-		return err
+		return n.handleABAMessage(ctx, msg)
 	case Protocol:
 		return n.handleTyche(ctx, msg)
 	default:
 		return nil
 	}
+}
+
+func (n *Node) handleRBCMessage(ctx context.Context, msg p2p.Message) error {
+	start := time.Now()
+	err := n.RBC.Handle(ctx, msg)
+	if n.Perf != nil {
+		n.Perf.addRBCHandle(time.Since(start))
+	}
+	return err
+}
+
+func (n *Node) handleABAMessage(ctx context.Context, msg p2p.Message) error {
+	start := time.Now()
+	err := n.ABA.Handle(ctx, msg)
+	if n.Perf != nil {
+		n.Perf.addABAHandle(time.Since(start))
+	}
+	return err
 }
 
 func (n *Node) Produce(ctx context.Context) (Object, error) {
@@ -572,6 +704,7 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return b, err
 		}
+
 		obj, certified, err := n.waitObjectOrBeacon(ctx, epoch, source, seq, instance, wait)
 		if err != nil {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
@@ -581,6 +714,7 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return *certified, nil
 		}
+
 		if !skipCurrentABA {
 			if certified, err := n.proposeEpochABAInputFromLookahead(ctx, epoch, source, seq, instance, wait); err != nil {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
@@ -963,7 +1097,7 @@ func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
 			return nil
 		}
 		obj := *env.Object
-		n.Crypto.Go(ctx, func() { _ = n.storeObject(obj) })
+		n.ObjCrypto.Go(ctx, func() { _ = n.storeObject(obj) })
 		return nil
 	case "join":
 		if env.Join == nil {
@@ -980,8 +1114,26 @@ func (n *Node) storeObject(obj Object) error {
 		debugf("node=%s drop object producer=%s seq=%d reason=invalid", n.ID, obj.Producer, obj.Seq)
 		return errors.New("invalid pvss object")
 	}
+	if obj.Producer == n.ID {
+		defer n.finishProducerSeq(obj.Seq)
+	}
 	n.mu.Lock()
 	if obj.ConfigVersion != n.State.ConfigVersion {
+		n.mu.Unlock()
+		return nil
+	}
+	if n.State.ComQ[obj.Producer] == nil {
+		n.mu.Unlock()
+		return nil
+	}
+	nextSeq := n.State.Seqs[obj.Producer] + 1
+	maxSeq := n.State.Seqs[obj.Producer] + uint64(n.State.QueueLen)
+	if obj.Seq < nextSeq || obj.Seq > maxSeq {
+		n.mu.Unlock()
+		debugf("node=%s drop object producer=%s seq=%d reason=window next=%d max=%d", n.ID, obj.Producer, obj.Seq, nextSeq, maxSeq)
+		return nil
+	}
+	if _, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists {
 		n.mu.Unlock()
 		return nil
 	}
@@ -996,12 +1148,15 @@ func (n *Node) storeObject(obj Object) error {
 		return nil
 	}
 	if n.State.ComQ[obj.Producer] == nil {
-		n.State.ComQ[obj.Producer] = make(map[uint64]Object)
+		return nil
 	}
-	nextSeq := n.State.Seqs[obj.Producer] + 1
-	maxSeq := n.State.Seqs[obj.Producer] + uint64(n.State.QueueLen)
+	nextSeq = n.State.Seqs[obj.Producer] + 1
+	maxSeq = n.State.Seqs[obj.Producer] + uint64(n.State.QueueLen)
 	if obj.Seq < nextSeq || obj.Seq > maxSeq {
 		debugf("node=%s drop object producer=%s seq=%d reason=window next=%d max=%d", n.ID, obj.Producer, obj.Seq, nextSeq, maxSeq)
+		return nil
+	}
+	if _, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists {
 		return nil
 	}
 	n.State.ComQ[obj.Producer][obj.Seq] = obj
@@ -1336,8 +1491,10 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		n.mu.Unlock()
 		return
 	}
+	removalMarks := copyRemovalMarks(n.State.RmMark)
 	configVersion := n.State.ConfigVersion
 	n.installCertifiedStateLocked(state)
+	n.mergeRemovalMarksLocked(removalMarks)
 	n.State.Epoch = epoch
 	n.State.RPrev = append([]byte(nil), random...)
 	n.cleanupCertifiedStateLocked(epoch)
@@ -1396,6 +1553,7 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 	threshold := 2*n.State.F + 1
 	blsPublic := n.blsPublicSnapshotLocked()
 	n.mu.Unlock()
+
 	if !ok || obj.ConfigVersion != b.ConfigVersion {
 		n.mu.Lock()
 		if n.State.Epoch < b.Epoch && b.ConfigVersion == n.State.ConfigVersion {
@@ -1628,6 +1786,26 @@ func (n *Node) installCertifiedStateLocked(d CertifiedStateDigest) {
 	n.ABA.N, n.ABA.F = len(n.State.Members), n.State.F
 }
 
+func (n *Node) mergeRemovalMarksLocked(marks map[p2p.NodeID]int64) {
+	for id, mark := range marks {
+		if mark == -1 || !contains(n.State.Members, id) {
+			continue
+		}
+		current, ok := n.State.RmMark[id]
+		if !ok || current == -1 || mark < current {
+			n.State.RmMark[id] = mark
+		}
+	}
+}
+
+func copyRemovalMarks(in map[p2p.NodeID]int64) map[p2p.NodeID]int64 {
+	out := make(map[p2p.NodeID]int64, len(in))
+	for id, mark := range in {
+		out[id] = mark
+	}
+	return out
+}
+
 func (n *Node) installRemovalPVSSLocked() {
 	if !contains(n.State.Members, n.ID) || len(n.State.Members) == 0 {
 		n.producing = false
@@ -1679,6 +1857,96 @@ func (n *Node) CompletedEpoch() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.State.Epoch
+}
+
+func (n *Node) DebugSnapshot() DebugSnapshot {
+	n.mu.Lock()
+	s := DebugSnapshot{
+		Node:          n.ID,
+		Completed:     n.State.Epoch,
+		NextEpoch:     n.State.Epoch + 1,
+		PendingABAs:   len(n.State.PendingABAs),
+		VerifiedCache: len(n.verified),
+	}
+	if len(n.State.SCL) > 0 {
+		idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
+		s.Source = n.State.SCL[idx]
+		s.Seq = n.State.Seqs[s.Source] + 1
+		s.Instance = aba.EpochInstance(s.NextEpoch, s.Source)
+		key := epochKey(s.NextEpoch, s.Source, s.Seq)
+		if obj, ok := n.State.ComQ[s.Source][s.Seq]; ok && obj.ConfigVersion == n.State.ConfigVersion {
+			s.Object = true
+			s.ReconNeed = obj.Commitment.Threshold
+		}
+		if obj, ok := n.State.ComQ[s.Source][s.Seq+1]; ok && obj.ConfigVersion == n.State.ConfigVersion {
+			s.NextObject = true
+		}
+		s.ReconSent = n.reconSent[key]
+		s.ReconDone = n.reconDone[key]
+		s.ReconCount = len(n.recon[key])
+		s.EchoMax = maxEchoCount(n.echoes[key])
+		s.ReadyMax = maxReadyCount(n.readies[key])
+		s.Certifying = n.certifying[key]
+		s.Waiters = len(n.waiters[key])
+		s.ABAInputSent = n.abaInputSent[s.Instance]
+		s.ABAInput = n.abaInputs[s.Instance]
+		for readyKey := range n.certified {
+			if strings.HasPrefix(readyKey, key+"/") {
+				s.Certified = true
+				break
+			}
+		}
+	}
+	n.mu.Unlock()
+	if s.Instance != "" {
+		st := n.ABA.Status(s.Instance)
+		s.ABADecided = st.Decided
+		s.ABACoinWait = st.CoinWait
+		s.ABARound = st.Round
+		s.ABAInputs = st.Inputs
+		s.ABAInputTrue = st.InputTrue
+		s.ABAInputFalse = st.InputFalse
+		s.ABAFinish = st.Finish
+		s.ABABValTrue = st.BValTrue
+		s.ABABValFalse = st.BValFalse
+		s.ABABinTrue = st.BinTrue
+		s.ABABinFalse = st.BinFalse
+		s.ABAAux = st.Aux
+		s.ABAConf = st.Conf
+	}
+	if n.Crypto != nil {
+		stats := n.Crypto.Stats()
+		s.CryptoWorkers = stats.Workers
+		s.CryptoActive = stats.Active
+		s.CryptoQueued = stats.Queued
+	}
+	if n.ObjCrypto != nil {
+		stats := n.ObjCrypto.Stats()
+		s.ObjWorkers = stats.Workers
+		s.ObjActive = stats.Active
+		s.ObjQueued = stats.Queued
+	}
+	return s
+}
+
+func maxEchoCount(votes map[string]map[p2p.NodeID]bool) int {
+	max := 0
+	for _, bySender := range votes {
+		if len(bySender) > max {
+			max = len(bySender)
+		}
+	}
+	return max
+}
+
+func maxReadyCount(votes map[string]map[p2p.NodeID]crypto.BLSSignatureShare) int {
+	max := 0
+	for _, bySender := range votes {
+		if len(bySender) > max {
+			max = len(bySender)
+		}
+	}
+	return max
 }
 
 func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {

@@ -14,12 +14,17 @@ import (
 )
 
 const defaultMaxMessageBytes = 64 << 20
-const minTCPBuffer = 4096
+const minTCPBuffer = 1 << 20
+const maxTCPBuffer = 8 << 20
+const tcpSocketBuffer = 16 << 20
 
 func TCPBufferForPeers(peers int) int {
-	buffer := peers * peers * 16
+	buffer := peers * peers * 1024
 	if buffer < minTCPBuffer {
 		return minTCPBuffer
+	}
+	if buffer > maxTCPBuffer {
+		return maxTCPBuffer
 	}
 	return buffer
 }
@@ -67,6 +72,10 @@ func NewTCPTransport(id NodeID, addr string, peers map[NodeID]string, buffer int
 func (t *TCPTransport) ID() NodeID            { return t.id }
 func (t *TCPTransport) Inbox() <-chan Message { return t.inbox }
 
+func (t *TCPTransport) InboxStats() (int, int) {
+	return len(t.inbox), cap(t.inbox)
+}
+
 func (t *TCPTransport) Start(ctx context.Context) error {
 	if t.addr == "" {
 		t.addr = t.peers[t.id]
@@ -105,6 +114,7 @@ func (t *TCPTransport) acceptLoop() {
 
 func (t *TCPTransport) handleConn(conn net.Conn) {
 	defer conn.Close()
+	tuneTCPConn(conn)
 	r := bufio.NewReader(conn)
 	for {
 		var size uint32
@@ -268,6 +278,7 @@ func (t *TCPTransport) sendOnce(ctx context.Context, to NodeID, addr string, dat
 		if err != nil {
 			return err
 		}
+		tuneTCPConn(conn)
 		pc.conn = conn
 	}
 	_ = pc.conn.SetWriteDeadline(time.Now().Add(t.dialTimeout))
@@ -282,6 +293,15 @@ func (t *TCPTransport) sendOnce(ctx context.Context, to NodeID, addr string, dat
 		return err
 	}
 	return nil
+}
+
+func tuneTCPConn(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetReadBuffer(tcpSocketBuffer)
+	_ = tcp.SetWriteBuffer(tcpSocketBuffer)
 }
 
 func (t *TCPTransport) peerConn(to NodeID) *tcpPeerConn {

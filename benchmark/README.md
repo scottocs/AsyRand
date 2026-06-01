@@ -43,6 +43,7 @@ Each published run also writes `protocol_run_log.csv`, which records the latest 
 cd benchmark
 .\.venv\Scripts\fab organize-runs
 ```
+
 AWS per-epoch timeout defaults to `60s * ceil(nodes / 4)`, so larger deployments do not fail on the old fixed 60s timeout. Override with `EPOCH_TIMEOUT_MS` when you need a specific value.
 
 ## AWS Nodes
@@ -56,6 +57,9 @@ cd benchmark
 .\.venv\Scripts\fab stop
 .\.venv\Scripts\fab start --max=10
 .\.venv\Scripts\fab destroy
+
+
+fab create --nodes=4;fab aws --nodes=8 --epochs=200 --protocols=tyche-scrape;fab aws --nodes=16 --epochs=200 --protocols=tyche-scrape;fab create --nodes=7;fab aws --nodes=32 --epochs=200 --protocols=tyche-scrape;fab aws --nodes=64 --epochs=100 --protocols=tyche-scrape;fab create --nodes=4;fab aws --nodes=96 --epochs=100 --protocols=tyche-scrape;fab destroy;
 ```
 
 `create --nodes=1` means one EC2 instance per region listed in `settings.json`. It waits for the instances to reach `running` and pass AWS status checks. The AWS `KeyName` must already exist in every configured region, and `key.path` must point to its local private key.

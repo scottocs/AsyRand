@@ -23,12 +23,20 @@ type runStats struct {
 }
 
 type metricSnapshot struct {
-	sentMessages uint64
-	sentBytes    uint64
-	recvMessages uint64
-	recvBytes    uint64
-	abaMessages  uint64
-	abaBytes     uint64
+	sentMessages  uint64
+	sentBytes     uint64
+	recvMessages  uint64
+	recvBytes     uint64
+	abaMessages   uint64
+	abaBytes      uint64
+	inboxLen      uint64
+	inboxCap      uint64
+	cryptoActive  int64
+	cryptoQueued  int64
+	cryptoWorkers int
+	objActive     int64
+	objQueued     int64
+	objWorkers    int
 }
 
 const transportBuffer = 262144
@@ -48,6 +56,8 @@ func main() {
 	epochTimeoutMS := flag.Int("epoch-timeout-ms", 10000, "timeout per epoch in milliseconds")
 	reportMS := flag.Int("report-ms", 5000, "periodic metrics interval in milliseconds")
 	maxPool := flag.Int("max-pool", 4, "maximum concurrent cryptographic worker tasks per node")
+	transportBufferFlag := flag.Int("transport-buffer", 0, "transport inbox buffer length; defaults to a size scaled by n")
+	removalExpirationMS := flag.Int("removal-expiration-ms", 0, "epoch-control ABA false-input timeout in milliseconds; defaults to a size scaled by n")
 	pvss := flag.String("pvss", "o1", "PVSS backend: o1 or scrape")
 	flag.Parse()
 
@@ -56,6 +66,7 @@ func main() {
 		nodeID: p2p.NodeID(*nodeID), peersRaw: *peersRaw, listenAddr: *listenAddr, listenIP: *listenIP,
 		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
 		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS, maxPool: *maxPool,
+		transportBuffer: *transportBufferFlag, removalExpirationMS: *removalExpirationMS,
 		pvss: strings.ToLower(*pvss),
 	}
 	if err := run(opts); err != nil {
@@ -64,21 +75,23 @@ func main() {
 }
 
 type runOptions struct {
-	n              int
-	epochs         int
-	f              int
-	transport      string
-	nodeID         p2p.NodeID
-	peersRaw       string
-	listenAddr     string
-	listenIP       string
-	queueLen       int
-	producerMS     int
-	prefillMS      int
-	epochTimeoutMS int
-	reportMS       int
-	maxPool        int
-	pvss           string
+	n                   int
+	epochs              int
+	f                   int
+	transport           string
+	nodeID              p2p.NodeID
+	peersRaw            string
+	listenAddr          string
+	listenIP            string
+	queueLen            int
+	producerMS          int
+	prefillMS           int
+	epochTimeoutMS      int
+	reportMS            int
+	maxPool             int
+	transportBuffer     int
+	removalExpirationMS int
+	pvss                string
 }
 
 func run(opts runOptions) error {
@@ -112,6 +125,8 @@ func run(opts runOptions) error {
 	if opts.epochTimeoutMS <= 0 {
 		opts.epochTimeoutMS = 10000
 	}
+	opts.transportBuffer = resolveTransportBuffer(opts)
+	opts.removalExpirationMS = resolveRemovalExpirationMS(opts)
 	if opts.transport == "tcp" {
 		return runTCP(opts)
 	}
@@ -135,14 +150,15 @@ func runMemory(opts runOptions) error {
 			return err
 		}
 		node, err := tyche.NewNode(tyche.Config{
-			ID:            id,
-			Members:       ids,
-			F:             opts.f,
-			QueueLen:      opts.queueLen,
-			PVSS:          scheme,
-			PVSSBackend:   opts.pvss,
-			CryptoWorkers: opts.maxPool,
-			Transport:     net.NewTransport(id, transportBuffer),
+			ID:                id,
+			Members:           ids,
+			F:                 opts.f,
+			QueueLen:          opts.queueLen,
+			PVSS:              scheme,
+			PVSSBackend:       opts.pvss,
+			CryptoWorkers:     opts.maxPool,
+			RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond,
+			Transport:         net.NewTransport(id, opts.transportBuffer),
 		})
 		if err != nil {
 			return err
@@ -153,8 +169,8 @@ func runMemory(opts runOptions) error {
 	}
 
 	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
-	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s\n",
-		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.pvss)
+	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d pvss=%s\n",
+		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, opts.pvss)
 
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
@@ -232,9 +248,10 @@ func runTCP(opts runOptions) error {
 	if err != nil {
 		return err
 	}
-	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, transportBuffer)
+	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, opts.transportBuffer)
 	node, err := tyche.NewNode(tyche.Config{
-		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool, Transport: transport,
+		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool,
+		RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond, Transport: transport,
 	})
 	if err != nil {
 		return err
@@ -251,8 +268,8 @@ func runTCP(opts runOptions) error {
 
 	nodes := []*tyche.Node{node}
 	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
-	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d pvss=%s peers=%v\n",
-		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.pvss, peers)
+	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d pvss=%s peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, opts.pvss, peers)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
@@ -266,7 +283,8 @@ func runTCP(opts runOptions) error {
 
 	for counted := 0; counted < opts.epochs; counted++ {
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
-		beacon, err := node.RunEpoch(epochCtx)
+		targetEpoch := uint64(counted + 1)
+		beacon, err := node.RunEpochAt(epochCtx, targetEpoch)
 		cancelEpoch()
 		if err != nil {
 			return fmt.Errorf("epoch %d: %w", counted+1, err)
@@ -284,7 +302,7 @@ func tycheEpochAttemptTimeout(opts runOptions) time.Duration {
 	outer := time.Duration(opts.epochTimeoutMS) * time.Millisecond
 	raw := strings.TrimSpace(os.Getenv("TYCHE_EPOCH_ATTEMPT_MS"))
 	if raw == "" {
-		raw = "10000"
+		return outer
 	}
 	ms, err := strconv.Atoi(raw)
 	if err != nil || ms <= 0 {
@@ -295,6 +313,40 @@ func tycheEpochAttemptTimeout(opts runOptions) time.Duration {
 		return outer
 	}
 	return attempt
+}
+
+func resolveTransportBuffer(opts runOptions) int {
+	if opts.transportBuffer > 0 {
+		return opts.transportBuffer
+	}
+	raw := strings.TrimSpace(os.Getenv("TYCHE_TRANSPORT_BUFFER"))
+	if raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+			return value
+		}
+	}
+	scaled := p2p.TCPBufferForPeers(opts.n)
+	if scaled < transportBuffer {
+		return transportBuffer
+	}
+	return scaled
+}
+
+func resolveRemovalExpirationMS(opts runOptions) int {
+	if opts.removalExpirationMS > 0 {
+		return opts.removalExpirationMS
+	}
+	raw := strings.TrimSpace(os.Getenv("TYCHE_REMOVAL_EXPIRATION_MS"))
+	if raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+			return value
+		}
+	}
+	// The lookahead object is delivered through RBC and SCRAPE verification.
+	// At large n, the fixed 5s default can fire during startup even though the
+	// next object is already in flight, forcing the epoch-control ABA down the
+	// slow false-input path. Scale conservatively with n.
+	return 5000 * max(1, (opts.n+31)/32)
 }
 
 func setupRuntime(n int, f int, pvss string) ([]p2p.NodeID, crypto.PVSSParams, map[p2p.NodeID]crypto.KeyPair, error) {
@@ -428,7 +480,11 @@ func startReporter(ctx context.Context, nodes []*tyche.Node, stats *runStats, in
 				currentPerf := collectPerf(nodes)
 				currentBeacon := stats.beacons.Load()
 				queueTotal, queueMax := collectQueue(nodes)
-				printMetricDelta("periodic", current.sub(last), currentPerf.Sub(lastPerf), queueTotal, queueMax, now.Sub(lastAt), currentBeacon-lastBeacon)
+				beaconDelta := currentBeacon - lastBeacon
+				printMetricDelta("periodic", current.sub(last), currentPerf.Sub(lastPerf), queueTotal, queueMax, now.Sub(lastAt), beaconDelta)
+				if beaconDelta == 0 {
+					printDebugSnapshots(nodes)
+				}
 				last, lastAt = current, now
 				lastPerf = currentPerf
 				lastBeacon = currentBeacon
@@ -459,6 +515,25 @@ func collectMetrics(nodes []*tyche.Node) metricSnapshot {
 					out.abaBytes += stats.SentBytes
 				}
 			}
+		}
+		if typed, ok := node.Transport.(interface {
+			InboxStats() (int, int)
+		}); ok {
+			inboxLen, inboxCap := typed.InboxStats()
+			out.inboxLen += uint64(inboxLen)
+			out.inboxCap += uint64(inboxCap)
+		}
+		if node.Crypto != nil {
+			stats := node.Crypto.Stats()
+			out.cryptoActive += stats.Active
+			out.cryptoQueued += stats.Queued
+			out.cryptoWorkers += stats.Workers
+		}
+		if node.ObjCrypto != nil {
+			stats := node.ObjCrypto.Stats()
+			out.objActive += stats.Active
+			out.objQueued += stats.Queued
+			out.objWorkers += stats.Workers
 		}
 	}
 	return out
@@ -506,12 +581,20 @@ func collectPerf(nodes []*tyche.Node) tyche.PerfSnapshot {
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 	return metricSnapshot{
-		sentMessages: m.sentMessages - prev.sentMessages,
-		sentBytes:    m.sentBytes - prev.sentBytes,
-		recvMessages: m.recvMessages - prev.recvMessages,
-		recvBytes:    m.recvBytes - prev.recvBytes,
-		abaMessages:  m.abaMessages - prev.abaMessages,
-		abaBytes:     m.abaBytes - prev.abaBytes,
+		sentMessages:  m.sentMessages - prev.sentMessages,
+		sentBytes:     m.sentBytes - prev.sentBytes,
+		recvMessages:  m.recvMessages - prev.recvMessages,
+		recvBytes:     m.recvBytes - prev.recvBytes,
+		abaMessages:   m.abaMessages - prev.abaMessages,
+		abaBytes:      m.abaBytes - prev.abaBytes,
+		inboxLen:      m.inboxLen,
+		inboxCap:      m.inboxCap,
+		cryptoActive:  m.cryptoActive,
+		cryptoQueued:  m.cryptoQueued,
+		cryptoWorkers: m.cryptoWorkers,
+		objActive:     m.objActive,
+		objQueued:     m.objQueued,
+		objWorkers:    m.objWorkers,
 	}
 }
 
@@ -532,7 +615,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 	if delta.sentMessages > 0 {
 		abaPct = float64(delta.abaMessages) * 100 / float64(delta.sentMessages)
 	}
-	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d transport_inbox=%d transport_inbox_cap=%d crypto_active=%d crypto_queued=%d crypto_workers=%d obj_crypto_active=%d obj_crypto_queued=%d obj_crypto_workers=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label,
 		beacons,
 		elapsed.Seconds(),
@@ -544,6 +627,14 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 		float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
 		queueTotal,
 		queueMax,
+		delta.inboxLen,
+		delta.inboxCap,
+		delta.cryptoActive,
+		delta.cryptoQueued,
+		delta.cryptoWorkers,
+		delta.objActive,
+		delta.objQueued,
+		delta.objWorkers,
 		delta.abaMessages,
 		abaPct,
 		float64(delta.abaBytes)/1024,
@@ -557,6 +648,57 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 		tyche.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount),
 		tyche.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount),
 	)
+}
+
+func printDebugSnapshots(nodes []*tyche.Node) {
+	limit := len(nodes)
+	if limit > 3 {
+		limit = 3
+	}
+	for i := 0; i < limit; i++ {
+		s := nodes[i].DebugSnapshot()
+		fmt.Printf("stall_debug node=%s completed=%d next_epoch=%d source=%s seq=%d object=%t next_object=%t pending_abas=%d aba_input_sent=%t aba_input=%t aba_decided=%t aba_coin_wait=%t aba_round=%d aba_inputs=%d aba_input_true=%d aba_input_false=%d aba_finish=%d aba_bval_true=%d aba_bval_false=%d aba_bin_true=%t aba_bin_false=%t aba_aux=%d aba_conf=%d recon_sent=%t recon_done=%t recon_count=%d recon_need=%d echo_max=%d ready_max=%d certifying=%t certified=%t waiters=%d verified_cache=%d crypto_active=%d crypto_queued=%d crypto_workers=%d obj_crypto_active=%d obj_crypto_queued=%d obj_crypto_workers=%d\n",
+			s.Node,
+			s.Completed,
+			s.NextEpoch,
+			s.Source,
+			s.Seq,
+			s.Object,
+			s.NextObject,
+			s.PendingABAs,
+			s.ABAInputSent,
+			s.ABAInput,
+			s.ABADecided,
+			s.ABACoinWait,
+			s.ABARound,
+			s.ABAInputs,
+			s.ABAInputTrue,
+			s.ABAInputFalse,
+			s.ABAFinish,
+			s.ABABValTrue,
+			s.ABABValFalse,
+			s.ABABinTrue,
+			s.ABABinFalse,
+			s.ABAAux,
+			s.ABAConf,
+			s.ReconSent,
+			s.ReconDone,
+			s.ReconCount,
+			s.ReconNeed,
+			s.EchoMax,
+			s.ReadyMax,
+			s.Certifying,
+			s.Certified,
+			s.Waiters,
+			s.VerifiedCache,
+			s.CryptoActive,
+			s.CryptoQueued,
+			s.CryptoWorkers,
+			s.ObjActive,
+			s.ObjQueued,
+			s.ObjWorkers,
+		)
+	}
 }
 
 func printMessageTypeMetrics(nodes []*tyche.Node) {
