@@ -46,7 +46,6 @@ type Broadcaster struct {
 
 	mu         sync.Mutex
 	values     map[string]ValueMessage
-	hasValue   map[string]bool
 	echoes     map[string]map[p2p.NodeID]bool
 	readies    map[string]map[p2p.NodeID]bool
 	echoSent   map[string]bool
@@ -59,7 +58,7 @@ type Broadcaster struct {
 func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Broadcaster {
 	return &Broadcaster{
 		ID: id, N: n, F: f, Transport: transport,
-		values: make(map[string]ValueMessage), hasValue: make(map[string]bool), echoes: make(map[string]map[p2p.NodeID]bool),
+		values: make(map[string]ValueMessage), echoes: make(map[string]map[p2p.NodeID]bool),
 		readies: make(map[string]map[p2p.NodeID]bool), echoSent: make(map[string]bool),
 		readySent: make(map[string]bool), delivered: make(map[string]bool), requested: make(map[string]map[p2p.NodeID]bool),
 		Deliveries: make(chan Delivery, n*4),
@@ -82,9 +81,8 @@ func (b *Broadcaster) Broadcast(ctx context.Context, seq uint64, value []byte) e
 	if _, ok := b.values[k]; !ok {
 		b.values[k] = val
 	}
-	b.hasValue[k] = true
 	b.mu.Unlock()
-	msg, err := p2p.NewMessage(Protocol, "VAL", k, b.ID, "", val)
+	msg, err := p2p.NewMessage(Protocol, "VAL", k, b.ID, "", VoteMessage{Dealer: b.ID, Seq: seq, Hash: hash})
 	if err != nil {
 		return err
 	}
@@ -94,11 +92,11 @@ func (b *Broadcaster) Broadcast(ctx context.Context, seq uint64, value []byte) e
 func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
 	switch msg.Type {
 	case "VAL":
-		val, err := p2p.DecodePayload[ValueMessage](msg)
+		vote, err := p2p.DecodePayload[VoteMessage](msg)
 		if err != nil {
 			return err
 		}
-		return b.acceptValue(ctx, val)
+		return b.handleVal(ctx, vote, msg.From)
 	case "REQ":
 		req, err := p2p.DecodePayload[RequestMessage](msg)
 		if err != nil {
@@ -127,17 +125,13 @@ func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
 	return nil
 }
 
-func (b *Broadcaster) RequestValue(ctx context.Context, dealer p2p.NodeID, seq uint64, hash string, to p2p.NodeID) error {
-	return b.requestValue(ctx, dealer, seq, hash, to)
-}
-
 func (b *Broadcaster) requestValue(ctx context.Context, dealer p2p.NodeID, seq uint64, hash string, to p2p.NodeID) error {
 	if hash == "" || to == "" {
 		return nil
 	}
 	k := Instance(dealer, seq, hash)
 	b.mu.Lock()
-	if b.hasValue[k] {
+	if _, ok := b.values[k]; ok {
 		b.mu.Unlock()
 		return nil
 	}
@@ -157,11 +151,38 @@ func (b *Broadcaster) requestValue(ctx context.Context, dealer p2p.NodeID, seq u
 	return b.Transport.Send(ctx, to, msg)
 }
 
+func (b *Broadcaster) handleVal(ctx context.Context, vote VoteMessage, from p2p.NodeID) error {
+	if vote.Hash == "" || vote.Dealer == "" || from != vote.Dealer {
+		return nil
+	}
+	k := Instance(vote.Dealer, vote.Seq, vote.Hash)
+	var deliver Delivery
+	var shouldDeliver bool
+	b.mu.Lock()
+	alreadyEcho := b.echoSent[k]
+	b.echoSent[k] = true
+	_, hasValue := b.values[k]
+	deliver, shouldDeliver = b.deliveryIfReadyLocked(k)
+	b.mu.Unlock()
+
+	if !hasValue {
+		_ = b.requestValue(ctx, vote.Dealer, vote.Seq, vote.Hash, vote.Dealer)
+	}
+	if !alreadyEcho {
+		if err := b.broadcastVote(ctx, "ECHO", vote.Dealer, vote.Seq, vote.Hash); err != nil {
+			return err
+		}
+	}
+	if shouldDeliver {
+		b.Deliveries <- deliver
+	}
+	return nil
+}
+
 func (b *Broadcaster) sendValue(ctx context.Context, to p2p.NodeID, dealer p2p.NodeID, seq uint64, hash string) error {
 	k := Instance(dealer, seq, hash)
 	b.mu.Lock()
-	val := b.values[k]
-	hasValue := b.hasValue[k]
+	val, hasValue := b.values[k]
 	b.mu.Unlock()
 	if !hasValue || val.Hash != hash {
 		return nil
@@ -179,18 +200,14 @@ func (b *Broadcaster) acceptValue(ctx context.Context, val ValueMessage) error {
 	}
 	k := Instance(val.Dealer, val.Seq, val.Hash)
 	var deliver Delivery
+	var shouldDeliver bool
 	b.mu.Lock()
 	if _, ok := b.values[k]; !ok {
 		b.values[k] = val
 	}
-	b.hasValue[k] = true
 	alreadyEcho := b.echoSent[k]
 	b.echoSent[k] = true
-	shouldDeliver := !b.delivered[k] && b.hasValue[k] && len(b.readies[k]) >= 2*b.F+1
-	if shouldDeliver {
-		b.delivered[k] = true
-		deliver = Delivery{Dealer: val.Dealer, Seq: val.Seq, Value: val.Value, Hash: val.Hash}
-	}
+	deliver, shouldDeliver = b.deliveryIfReadyLocked(k)
 	b.mu.Unlock()
 
 	if !alreadyEcho {
@@ -198,10 +215,22 @@ func (b *Broadcaster) acceptValue(ctx context.Context, val ValueMessage) error {
 			return err
 		}
 	}
-	if deliver.Hash != "" {
+	if shouldDeliver {
 		b.Deliveries <- deliver
 	}
 	return nil
+}
+
+func (b *Broadcaster) deliveryIfReadyLocked(k string) (Delivery, bool) {
+	if b.delivered[k] || len(b.readies[k]) < 2*b.F+1 {
+		return Delivery{}, false
+	}
+	val, ok := b.values[k]
+	if !ok {
+		return Delivery{}, false
+	}
+	b.delivered[k] = true
+	return Delivery{Dealer: val.Dealer, Seq: val.Seq, Value: val.Value, Hash: val.Hash}, true
 }
 
 func (b *Broadcaster) broadcastVote(ctx context.Context, typ string, dealer p2p.NodeID, seq uint64, hash string) error {
@@ -232,23 +261,33 @@ func (b *Broadcaster) observe(ctx context.Context, kind string, vote VoteMessage
 	if needReady {
 		b.readySent[k] = true
 	}
-	deliver := !b.delivered[k] && readyCount >= 2*b.F+1
-	val := b.values[k]
-	if deliver && b.hasValue[k] {
-		b.delivered[k] = true
-	} else {
-		deliver = false
+	_, hasValue := b.values[k]
+	deliver, shouldDeliver := b.deliveryIfReadyLocked(k)
+	needValue := !hasValue
+	var fallback p2p.NodeID
+	if needValue && readyCount >= 2*b.F+1 {
+		if !b.requested[k][vote.Dealer] {
+			fallback = vote.Dealer
+		} else if kind == "ready" {
+			fallback = from
+		} else {
+			for id := range b.readies[k] {
+				if !b.requested[k][id] {
+					fallback = id
+					break
+				}
+			}
+		}
 	}
-	needValue := !b.hasValue[k]
 	b.mu.Unlock()
 
-	if needValue && kind == "ready" {
-		_ = b.requestValue(ctx, vote.Dealer, vote.Seq, vote.Hash, from)
+	if fallback != "" {
+		_ = b.requestValue(ctx, vote.Dealer, vote.Seq, vote.Hash, fallback)
 	}
 	if needReady {
 		_ = b.broadcastVote(ctx, "READY", vote.Dealer, vote.Seq, vote.Hash)
 	}
-	if deliver {
-		b.Deliveries <- Delivery{Dealer: val.Dealer, Seq: val.Seq, Value: val.Value, Hash: val.Hash}
+	if shouldDeliver {
+		b.Deliveries <- deliver
 	}
 }
