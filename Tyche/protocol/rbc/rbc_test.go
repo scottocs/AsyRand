@@ -47,3 +47,38 @@ func TestRBCBroadcastDeliversSameValue(t *testing.T) {
 		}
 	}
 }
+
+func TestRBCInitialCarriesValue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	net := p2p.NewMemoryNetwork()
+	transport0 := net.NewTransport("n0", 8)
+	transport1 := net.NewTransport("n1", 8)
+	b := New("n0", 2, 0, transport0)
+
+	value := []byte("large-rbc-payload")
+	if err := b.Broadcast(ctx, 7, value); err != nil {
+		t.Fatal(err)
+	}
+
+	var msg p2p.Message
+	select {
+	case msg = <-transport1.Inbox():
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for initial message")
+	}
+	if msg.Type != "VAL" {
+		t.Fatalf("unexpected message type: %s", msg.Type)
+	}
+	val, err := p2p.DecodePayload[ValueMessage](msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val.Hash != Digest(value) {
+		t.Fatalf("bad hash: %s", val.Hash)
+	}
+	if !bytes.Equal(val.Value, value) {
+		t.Fatalf("initial message did not carry raw value: %q", val.Value)
+	}
+}
