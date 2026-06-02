@@ -98,21 +98,7 @@ func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
 		if err != nil {
 			return err
 		}
-		if val.Hash == "" || val.Value == nil || Digest(val.Value) != val.Hash {
-			return nil
-		}
-		k := Instance(val.Dealer, val.Seq, val.Hash)
-		b.mu.Lock()
-		if _, ok := b.values[k]; !ok {
-			b.values[k] = val
-		}
-		b.hasValue[k] = true
-		already := b.echoSent[k]
-		b.echoSent[k] = true
-		b.mu.Unlock()
-		if !already {
-			return b.broadcastVote(ctx, "ECHO", val.Dealer, val.Seq, val.Hash)
-		}
+		return b.acceptValue(ctx, val)
 	case "REQ":
 		req, err := p2p.DecodePayload[RequestMessage](msg)
 		if err != nil {
@@ -124,7 +110,7 @@ func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
 		if err != nil {
 			return err
 		}
-		return b.handleData(ctx, val)
+		return b.acceptValue(ctx, val)
 	case "ECHO":
 		vote, err := p2p.DecodePayload[VoteMessage](msg)
 		if err != nil {
@@ -187,7 +173,7 @@ func (b *Broadcaster) sendValue(ctx context.Context, to p2p.NodeID, dealer p2p.N
 	return b.Transport.Send(ctx, to, msg)
 }
 
-func (b *Broadcaster) handleData(ctx context.Context, val ValueMessage) error {
+func (b *Broadcaster) acceptValue(ctx context.Context, val ValueMessage) error {
 	if val.Hash == "" || val.Value == nil || Digest(val.Value) != val.Hash {
 		return nil
 	}
