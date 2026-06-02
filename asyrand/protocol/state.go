@@ -10,16 +10,16 @@ import (
 )
 
 type Beacon struct {
-	Epoch      uint64                     `json:"epoch"`
-	Source     p2p.NodeID                 `json:"source"`
-	Random     []byte                     `json:"random"`
-	CommitID   string                     `json:"commit_id"`
-	Signature  asig.BLSAggregateSignature `json:"signature"`
-	Shares     []asig.DecryptedShare      `json:"shares"`
-	Skipped    bool                       `json:"skipped,omitempty"`
-	SkipStage  string                     `json:"skip_stage,omitempty"`
-	SkipReason string                     `json:"skip_reason,omitempty"`
-	SkipDiag   string                     `json:"skip_diag,omitempty"`
+	Epoch       uint64                 `json:"epoch"`
+	Source      p2p.NodeID             `json:"source"`
+	Random      []byte                 `json:"random"`
+	CommitID    string                 `json:"commit_id"`
+	Certificate asig.QuorumCertificate `json:"certificate"`
+	Shares      []asig.DecryptedShare  `json:"shares"`
+	Skipped     bool                   `json:"skipped,omitempty"`
+	SkipStage   string                 `json:"skip_stage,omitempty"`
+	SkipReason  string                 `json:"skip_reason,omitempty"`
+	SkipDiag    string                 `json:"skip_diag,omitempty"`
 }
 
 type State struct {

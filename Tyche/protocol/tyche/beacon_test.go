@@ -3,7 +3,6 @@ package tyche
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"strconv"
 	"testing"
 	"time"
@@ -64,9 +63,11 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 			if len(b.ReadySenders) < 3 {
 				t.Fatalf("weak ready certificate: %+v", b.ReadySenders)
 			}
-			msg := readyVoteBytes(b.Epoch, b.Source, b.Seq, hex.EncodeToString(b.Random), stateDigestHash(b.State))
-			if err := crypto.VerifyBLSAggregate(b.Signature, nodes[0].BLSPublic, msg, 3); err != nil {
-				t.Fatalf("invalid ready aggregate certificate: %v", err)
+			nodes[0].mu.Lock()
+			members := nodes[0].memberSetLocked()
+			nodes[0].mu.Unlock()
+			if err := crypto.VerifyQuorumCertificate(b.Signature, members, 3); err != nil {
+				t.Fatalf("invalid ready quorum certificate: %v", err)
 			}
 		case <-ctx.Done():
 			t.Fatalf("timed out waiting for certified beacon\n%s", dumpNodes(nodes))
@@ -299,7 +300,6 @@ func TestJoinCertificateActivatesMember(t *testing.T) {
 		ContextEpoch:    0,
 		Joiner:          "theta",
 		PublicKey:       "theta-pk",
-		BLSPublicKey:    defaultBLSPublicHex("theta"),
 		CandidateParams: crypto.WrapPVSSParams(candidate),
 		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
 		FirstCoinEpoch:  0,
@@ -322,9 +322,6 @@ func TestJoinCertificateActivatesMember(t *testing.T) {
 		}
 		if n.State.Seqs["theta"] != 0 || n.State.RmMark["theta"] != -1 {
 			t.Fatalf("joiner state not initialized on %s: seq=%d rm=%d", n.ID, n.State.Seqs["theta"], n.State.RmMark["theta"])
-		}
-		if n.BLSPublic["theta"] == nil {
-			t.Fatalf("joiner bls public key not installed on %s", n.ID)
 		}
 		if n.RBC.N != len(targetMembers) || n.ABA.N != len(targetMembers) || n.RBC.F != n.State.F || n.ABA.F != n.State.F {
 			t.Fatalf("protocol thresholds not updated on %s: stateF=%d rbc=(%d,%d) aba=(%d,%d)",
@@ -371,7 +368,6 @@ func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
 		ContextEpoch:    0,
 		Joiner:          "theta",
 		PublicKey:       "theta-pk",
-		BLSPublicKey:    defaultBLSPublicHex("theta"),
 		CandidateParams: crypto.WrapPVSSParams(candidate),
 		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
 		FirstCoinEpoch:  1,
@@ -470,7 +466,6 @@ func TestJoinCertificateStaleWhenRemovalHasPriority(t *testing.T) {
 		ContextEpoch:    0,
 		Joiner:          "theta",
 		PublicKey:       "theta-pk",
-		BLSPublicKey:    defaultBLSPublicHex("theta"),
 		CandidateParams: crypto.WrapPVSSParams(candidate),
 		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
 		FirstCoinEpoch:  1,
@@ -527,7 +522,6 @@ func TestPendingJoinClearsLockWhenConfigurationChanges(t *testing.T) {
 		ContextEpoch:    0,
 		Joiner:          "theta",
 		PublicKey:       "theta-pk",
-		BLSPublicKey:    defaultBLSPublicHex("theta"),
 		CandidateParams: crypto.WrapPVSSParams(candidate),
 		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
 		FirstCoinEpoch:  1,

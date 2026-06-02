@@ -190,9 +190,12 @@ write_breakdown_row() {
   recon="$(metric_value "$final" "pvss_recon_avg")"
   sign="$(metric_value "$final" "sign_avg")"
   if [[ "$sign" == "0" ]]; then
-    sign="$(metric_value "$final" "bls_sign_avg")"
+    sign="$(metric_value "$final" "cert_sign_avg")"
   fi
-  aggregate="$(metric_value "$final" "bls_agg_avg")"
+  aggregate="$(metric_value "$final" "cert_agg_avg")"
+  if [[ "$aggregate" == "0" ]]; then
+    aggregate="$(metric_value "$final" "bls_agg_avg")"
+  fi
   agreement="$(metric_value "$final" "spurt_vote_avg")"
   rbc="$(metric_value "$final" "rbc_avg")"
   aba="$(metric_value "$final" "aba_avg")"
@@ -217,14 +220,14 @@ Fields:
 - `crypto_verify_avg`: average PVSS commitment/share verification time, or signature verification time for protocols without PVSS.
 - `crypto_recon_avg`: average PVSS reconstruction or threshold-signature recovery time.
 - `crypto_sign_avg`: average signature-share generation time.
-- `crypto_aggregate_avg`: average threshold/BLS aggregation time.
+- `crypto_aggregate_avg`: average quorum-certificate or threshold-signature aggregation time.
 - `agreement_avg`: average explicit agreement-step handling time when the protocol exports one.
 - `rbc_avg`: average reliable-broadcast handling time.
 - `aba_avg`: average asynchronous-binary-agreement handling time.
 
 Interpretation guide:
 - Tyche should be read together with `message_type` lines in each log. High `aba_sent_msgs` or `aba_msg_pct` indicates ABA/RBC message amplification.
-- AsyRand is expected to show lightweight PVSS and RBC costs; remaining bottlenecks usually come from BLS verification/aggregation and scheduling.
+- AsyRand is expected to show lightweight PVSS and RBC costs; remaining bottlenecks usually come from certificate handling and scheduling.
 - GRandLine usually has low message count and bandwidth; its bottleneck is often signature verification/recovery.
 - SPURT uses pre-aggregation to move leader aggregation off the critical path, but PVSS sharing and reconstruction remain total-work bottlenecks.
 EOF

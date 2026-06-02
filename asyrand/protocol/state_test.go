@@ -131,13 +131,9 @@ func TestNodeEpochConsumesSourceCommitment(t *testing.T) {
 	}
 	pvssKeys := make(map[p2p.NodeID]asig.PVSSKeyPair)
 	pvssPublic := make(map[p2p.NodeID]kyber.Point)
-	blsKeys := make(map[p2p.NodeID]asig.BLSKeyPair)
-	blsPublic := make(map[string]kyber.Point)
 	for _, id := range ids {
 		pvssKeys[id] = asig.PVSSKeyPairFromSeed(seeds[id])
 		pvssPublic[id] = pvssKeys[id].Public
-		blsKeys[id] = asig.NewBLSKeyPairFromSeed(seeds[id])
-		blsPublic[string(id)] = blsKeys[id].Public
 	}
 
 	nodes := make([]*Node, 0, len(ids))
@@ -148,8 +144,7 @@ func TestNodeEpochConsumesSourceCommitment(t *testing.T) {
 		}
 		node, err := NewNode(NodeConfig{
 			ID: id, Members: ids, F: 1, QueueLen: 4, Keys: keys[id],
-			Public: pubs, BLS: blsKeys[id], BLSPublic: blsPublic,
-			Transport: net.NewTransport(id, 256), PVSS: pvssScheme,
+			Public: pubs, Transport: net.NewTransport(id, 256), PVSS: pvssScheme,
 		})
 		if err != nil {
 			t.Fatal(err)

@@ -11,7 +11,6 @@ import (
 	"github.com/scottocs/Tyche/asyrand/protocol/rbc"
 	"github.com/scottocs/Tyche/utils/cryptoexec"
 	"github.com/scottocs/Tyche/utils/p2p"
-	"go.dedis.ch/kyber/v3"
 	"sync"
 	"time"
 )
@@ -25,8 +24,6 @@ type Node struct {
 	ID        p2p.NodeID
 	Keys      asig.KeyPair
 	Public    map[string]ed25519.PublicKey
-	BLS       asig.BLSKeyPair
-	BLSPublic map[string]kyber.Point
 	Transport p2p.Transport
 	Perf      *PerfMetrics
 
@@ -57,8 +54,6 @@ type NodeConfig struct {
 	Seed          []byte
 	Keys          asig.KeyPair
 	Public        map[string]ed25519.PublicKey
-	BLS           asig.BLSKeyPair
-	BLSPublic     map[string]kyber.Point
 	Transport     p2p.Transport
 	PVSS          asig.Scheme
 	CryptoWorkers int
@@ -72,12 +67,12 @@ type ReconMessage struct {
 }
 
 type BeaconVoteMessage struct {
-	Epoch      uint64                 `json:"epoch"`
-	Source     p2p.NodeID             `json:"source"`
-	CommitID   string                 `json:"commit_id"`
-	Random     []byte                 `json:"random"`
-	RandomHash string                 `json:"random_hash"`
-	Signature  asig.BLSSignatureShare `json:"signature"`
+	Epoch      uint64         `json:"epoch"`
+	Source     p2p.NodeID     `json:"source"`
+	CommitID   string         `json:"commit_id"`
+	Random     []byte         `json:"random"`
+	RandomHash string         `json:"random_hash"`
+	Vote       asig.VoteShare `json:"vote"`
 }
 
 type reconState struct {
@@ -88,8 +83,8 @@ type reconState struct {
 
 	shares       map[p2p.NodeID]asig.DecryptedShare
 	randomByHash map[string][]byte
-	echo         map[string]map[p2p.NodeID]asig.BLSSignatureShare
-	ready        map[string]map[p2p.NodeID]asig.BLSSignatureShare
+	echo         map[string]map[p2p.NodeID]asig.VoteShare
+	ready        map[string]map[p2p.NodeID]asig.VoteShare
 	echoSent     map[string]bool
 	readySent    map[string]bool
 	delivered    bool
@@ -105,12 +100,9 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.PVSS == nil {
 		return nil, errors.New("real pvss scheme is required")
 	}
-	if cfg.BLS.Private == nil || len(cfg.BLSPublic) == 0 {
-		return nil, errors.New("bls signing keys are required")
-	}
 	state := NewState(cfg.Members, cfg.F, cfg.QueueLen, cfg.Seed)
 	return &Node{
-		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public, BLS: cfg.BLS, BLSPublic: cfg.BLSPublic,
+		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public,
 		Transport: cfg.Transport, Perf: &PerfMetrics{}, State: state, PVSS: cfg.PVSS,
 		Crypto: cryptoexec.New(cfg.CryptoWorkers),
 		RBC:    rbc.New(cfg.ID, state.N, state.F, cfg.Transport),
@@ -482,15 +474,14 @@ func (n *Node) handleReady(ctx context.Context, msg BeaconVoteMessage) {
 	readyCount := len(st.ready[msg.RandomHash])
 	shouldReady = readyCount >= n.State.F+1 && !st.readySent[msg.RandomHash]
 	if readyCount >= 2*n.State.F+1 && !st.delivered {
-		votes := make([]asig.BLSSignatureShare, 0, len(st.ready[msg.RandomHash]))
+		votes := make([]asig.VoteShare, 0, len(st.ready[msg.RandomHash]))
 		for _, vote := range st.ready[msg.RandomHash] {
 			votes = append(votes, vote)
 		}
-		msgBytes := voteBytes("READY", msg.Epoch, msg.Source, msg.CommitID, msg.RandomHash)
 		start := time.Now()
-		agg, err := asig.AggregateBLSTrusted(votes, n.BLSPublic, msgBytes, 2*n.State.F+1)
+		agg, err := asig.BuildQuorumCertificate(votes, n.memberSet(), 2*n.State.F+1)
 		if n.Perf != nil {
-			n.Perf.addBLSAggregate(time.Since(start))
+			n.Perf.addCertAggregate(time.Since(start))
 		}
 		if err == nil {
 			shares := make([]asig.DecryptedShare, 0, len(st.shares))
@@ -498,7 +489,7 @@ func (n *Node) handleReady(ctx context.Context, msg BeaconVoteMessage) {
 				shares = append(shares, share)
 			}
 			st.delivered = true
-			beacon = &Beacon{Epoch: msg.Epoch, Source: msg.Source, Random: append([]byte(nil), msg.Random...), CommitID: msg.CommitID, Signature: agg, Shares: shares}
+			beacon = &Beacon{Epoch: msg.Epoch, Source: msg.Source, Random: append([]byte(nil), msg.Random...), CommitID: msg.CommitID, Certificate: agg, Shares: shares}
 		}
 	}
 	n.reconMu.Unlock()
@@ -512,11 +503,10 @@ func (n *Node) handleReady(ctx context.Context, msg BeaconVoteMessage) {
 
 func (n *Node) broadcastVote(ctx context.Context, typ string, st *reconState, random []byte) error {
 	hash := randomHash(random)
-	msgBytes := voteBytes(typ, st.epoch, st.source, st.commit.SecretID, hash)
 	start := time.Now()
-	sig, err := asig.SignBLS(string(n.ID), n.BLS.Private, msgBytes)
+	vote, err := asig.NewVoteShare(string(n.ID))
 	if n.Perf != nil {
-		n.Perf.addBLSSign(time.Since(start))
+		n.Perf.addCertSign(time.Since(start))
 	}
 	if err != nil {
 		return err
@@ -538,7 +528,7 @@ func (n *Node) broadcastVote(ctx context.Context, typ string, st *reconState, ra
 	st.randomByHash[hash] = append([]byte(nil), random...)
 	n.reconMu.Unlock()
 	msg, err := p2p.NewMessage(Protocol, typ, st.instance, n.ID, "", BeaconVoteMessage{
-		Epoch: st.epoch, Source: st.source, CommitID: st.commit.SecretID, Random: random, RandomHash: hash, Signature: sig,
+		Epoch: st.epoch, Source: st.source, CommitID: st.commit.SecretID, Random: random, RandomHash: hash, Vote: vote,
 	})
 	if err != nil {
 		return err
@@ -551,18 +541,18 @@ func (n *Node) verifyVote(typ string, msg BeaconVoteMessage) bool {
 		return false
 	}
 	start := time.Now()
-	ok := asig.VerifyBLSShare(msg.Signature, n.BLSPublic, voteBytes(typ, msg.Epoch, msg.Source, msg.CommitID, msg.RandomHash))
+	ok := asig.VerifyVoteShare(msg.Vote, n.memberSet())
 	if n.Perf != nil {
-		n.Perf.addBLSVerify(time.Since(start))
+		n.Perf.addCertVerify(time.Since(start))
 	}
 	return ok
 }
 
-func (n *Node) recordVote(bucket map[string]map[p2p.NodeID]asig.BLSSignatureShare, msg BeaconVoteMessage) {
+func (n *Node) recordVote(bucket map[string]map[p2p.NodeID]asig.VoteShare, msg BeaconVoteMessage) {
 	if bucket[msg.RandomHash] == nil {
-		bucket[msg.RandomHash] = make(map[p2p.NodeID]asig.BLSSignatureShare)
+		bucket[msg.RandomHash] = make(map[p2p.NodeID]asig.VoteShare)
 	}
-	bucket[msg.RandomHash][p2p.NodeID(msg.Signature.Signer)] = msg.Signature
+	bucket[msg.RandomHash][p2p.NodeID(msg.Vote.Signer)] = msg.Vote
 }
 
 func (n *Node) epochTimeoutError(epoch uint64, source p2p.NodeID) error {
@@ -589,8 +579,8 @@ func (n *Node) ensureReconState(epoch uint64, source p2p.NodeID, commit asig.Com
 	st := &reconState{
 		epoch: epoch, source: source, commit: commit, instance: instance,
 		shares: make(map[p2p.NodeID]asig.DecryptedShare), randomByHash: make(map[string][]byte),
-		echo:     make(map[string]map[p2p.NodeID]asig.BLSSignatureShare),
-		ready:    make(map[string]map[p2p.NodeID]asig.BLSSignatureShare),
+		echo:     make(map[string]map[p2p.NodeID]asig.VoteShare),
+		ready:    make(map[string]map[p2p.NodeID]asig.VoteShare),
 		echoSent: make(map[string]bool), readySent: make(map[string]bool),
 	}
 	n.recon[key] = st
@@ -605,8 +595,14 @@ func randomHash(random []byte) string {
 	return hex.EncodeToString(asig.HashBytes(random))
 }
 
-func voteBytes(typ string, epoch uint64, source p2p.NodeID, commitID, randomHash string) []byte {
-	return []byte(fmt.Sprintf("AsyRand-v1/%s/%d/%s/%s/%s", typ, epoch, source, commitID, randomHash))
+func (n *Node) memberSet() map[string]struct{} {
+	n.State.mu.RLock()
+	defer n.State.mu.RUnlock()
+	out := make(map[string]struct{}, len(n.State.Members))
+	for _, id := range n.State.Members {
+		out[string(id)] = struct{}{}
+	}
+	return out
 }
 
 func (n *Node) producerInFlightCount() int {

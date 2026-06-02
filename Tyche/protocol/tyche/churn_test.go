@@ -13,7 +13,6 @@ import (
 	"github.com/scottocs/Tyche/Tyche/crypto"
 	"github.com/scottocs/Tyche/Tyche/protocol/aba"
 	"github.com/scottocs/Tyche/utils/p2p"
-	"go.dedis.ch/kyber/v3"
 )
 
 func TestBeaconChurnCrashAndJoin10000Epochs(t *testing.T) {
@@ -258,13 +257,12 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 		pendingJoins: make(map[p2p.NodeID]pendingChurnJoin),
 		pvss:         pvss,
 	}
-	blsPublic := defaultBLSPublic(ids)
 	for _, id := range ids {
 		scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 64, PVSS: scheme, PVSSBackend: pvss, BLSPublic: blsPublic, Transport: c.net.NewTransport(id, 32768)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 64, PVSS: scheme, PVSSBackend: pvss, Transport: c.net.NewTransport(id, 32768)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -344,7 +342,6 @@ func (c *churnCluster) closeProtocolRemovedNode(t *testing.T, id p2p.NodeID) {
 			copyRuntimeState(t, ref, node)
 		}
 		node.mu.Lock()
-		delete(node.BLSPublic, string(id))
 		node.installRemovalPVSSLocked()
 		node.resetConfigurationCachesLocked()
 		node.mu.Unlock()
@@ -509,7 +506,6 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 		ContextEpoch:    contextEpoch,
 		Joiner:          joiner,
 		PublicKey:       string(joiner) + "-pk",
-		BLSPublicKey:    defaultBLSPublicHex(joiner),
 		CandidateParams: pp,
 		Object:          Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
 		FirstCoinEpoch:  firstCoin,
@@ -571,7 +567,6 @@ func (c *churnCluster) reconcilePendingJoins(t *testing.T, parent context.Contex
 
 func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PVSSParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
 	t.Helper()
-	blsPublic := defaultBLSPublic(members)
 	for _, node := range c.activeNodes() {
 		scheme, err := crypto.NewPVSSScheme(node.ID, keys[node.ID].Private, pp)
 		if err != nil {
@@ -579,7 +574,6 @@ func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PVSSParams, keys map[
 		}
 		node.mu.Lock()
 		node.PVSS = scheme
-		node.BLSPublic = cloneBLSPublic(blsPublic)
 		node.mu.Unlock()
 	}
 }
@@ -594,7 +588,7 @@ func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2
 	ref.mu.Lock()
 	f := ref.State.F
 	ref.mu.Unlock()
-	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 64, PVSS: scheme, PVSSBackend: c.pvss, BLSPublic: defaultBLSPublic(members), Transport: c.net.NewTransport(id, 32768)})
+	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 64, PVSS: scheme, PVSSBackend: c.pvss, Transport: c.net.NewTransport(id, 32768)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -954,33 +948,9 @@ func copyComQ(in map[p2p.NodeID]map[uint64]Object) map[p2p.NodeID]map[uint64]Obj
 	return out
 }
 
-func defaultBLSPublic(ids []p2p.NodeID) map[string]kyber.Point {
-	out := make(map[string]kyber.Point, len(ids))
-	for _, id := range ids {
-		kp := crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(id)))
-		out[string(id)] = kp.Public
-	}
-	return out
-}
-
-func cloneBLSPublic(in map[string]kyber.Point) map[string]kyber.Point {
-	out := make(map[string]kyber.Point, len(in))
-	for id, pub := range in {
-		if pub != nil {
-			out[id] = pub.Clone()
-		}
-	}
-	return out
-}
-
-func defaultBLSPublicHex(id p2p.NodeID) string {
-	kp := crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(id)))
-	return crypto.EncodeBLSPublicKey(kp.Public)
-}
-
 func signedJoinAck(t *testing.T, node *Node, tau TransitionIndex, rho string) JoinAck {
 	t.Helper()
-	sig, err := crypto.SignBLS(string(node.ID), node.BLS.Private, joinAckBytes(tau, rho))
+	sig, err := crypto.NewVoteShare(string(node.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -989,7 +959,7 @@ func signedJoinAck(t *testing.T, node *Node, tau TransitionIndex, rho string) Jo
 
 func signedJoinCommit(t *testing.T, node *Node, tau TransitionIndex, rho string, activation uint64) JoinCommit {
 	t.Helper()
-	sig, err := crypto.SignBLS(string(node.ID), node.BLS.Private, joinCommitBytes(tau, rho, activation))
+	sig, err := crypto.NewVoteShare(string(node.ID))
 	if err != nil {
 		t.Fatal(err)
 	}

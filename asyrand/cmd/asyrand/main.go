@@ -24,8 +24,6 @@ type runtimeKeys struct {
 	pubs       map[string]ed25519.PublicKey
 	pvssKeys   map[p2p.NodeID]asig.PVSSKeyPair
 	pvssPublic map[p2p.NodeID]kyber.Point
-	blsKeys    map[p2p.NodeID]asig.BLSKeyPair
-	blsPublic  map[string]kyber.Point
 	seed       []byte
 }
 
@@ -238,13 +236,9 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	}
 	pvssKeys := make(map[p2p.NodeID]asig.PVSSKeyPair, len(ids))
 	pvssPublic := make(map[p2p.NodeID]kyber.Point, len(ids))
-	blsKeys := make(map[p2p.NodeID]asig.BLSKeyPair, len(ids))
-	blsPublic := make(map[string]kyber.Point, len(ids))
 	for _, id := range ids {
 		pvssKeys[id] = asig.PVSSKeyPairFromSeed(nodeSeeds[id])
 		pvssPublic[id] = pvssKeys[id].Public
-		blsKeys[id] = asig.NewBLSKeyPairFromSeed(nodeSeeds[id])
-		blsPublic[string(id)] = blsKeys[id].Public
 	}
 	seed, err := cfg.SeedBytes()
 	if err != nil {
@@ -252,7 +246,7 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	}
 	return runtimeKeys{
 		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys,
-		pvssPublic: pvssPublic, blsKeys: blsKeys, blsPublic: blsPublic, seed: seed,
+		pvssPublic: pvssPublic, seed: seed,
 	}, nil
 }
 
@@ -263,8 +257,7 @@ func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Tra
 	}
 	return asyrand.NewNode(asyrand.NodeConfig{
 		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
-		Public: rt.pubs, BLS: rt.blsKeys[id], BLSPublic: rt.blsPublic,
-		Transport: transport, PVSS: pvssScheme, CryptoWorkers: cfg.MaxPool,
+		Public: rt.pubs, Transport: transport, PVSS: pvssScheme, CryptoWorkers: cfg.MaxPool,
 	})
 }
 
@@ -378,7 +371,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s cert_sign_avg=%s cert_verify_avg=%s cert_agg_avg=%s\n",
 		label, beacons, elapsed.Seconds(), float64(beacons)*60/seconds,
 		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
@@ -386,8 +379,8 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 		asyrand.AvgDuration(perf.PVSSShareTotal, perf.PVSSShareCount), asyrand.AvgDuration(perf.PVSSVerifyTotal, perf.PVSSVerifyCount),
 		asyrand.AvgDuration(perf.PVSSPreReconTotal, perf.PVSSPreReconCount), asyrand.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
 		asyrand.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount),
-		asyrand.AvgDuration(perf.BLSSignTotal, perf.BLSSignCount),
-		asyrand.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount), asyrand.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount))
+		asyrand.AvgDuration(perf.CertSignTotal, perf.CertSignCount),
+		asyrand.AvgDuration(perf.CertVerifyTotal, perf.CertVerifyCount), asyrand.AvgDuration(perf.CertAggregateTotal, perf.CertAggregateCount))
 }
 
 func waitForTCPPeers(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string, timeout time.Duration) error {

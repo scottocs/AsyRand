@@ -603,7 +603,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 	if delta.sentMessages > 0 {
 		abaPct = float64(delta.abaMessages) * 100 / float64(delta.sentMessages)
 	}
-	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d transport_inbox=%d transport_inbox_cap=%d crypto_active=%d crypto_queued=%d crypto_workers=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d transport_inbox=%d transport_inbox_cap=%d crypto_active=%d crypto_queued=%d crypto_workers=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s cert_sign_avg=%s cert_verify_avg=%s cert_agg_avg=%s\n",
 		label,
 		beacons,
 		elapsed.Seconds(),
@@ -629,9 +629,9 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 		tyche.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
 		tyche.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount),
 		tyche.AvgDuration(perf.ABAHandleTotal, perf.ABAHandleCount),
-		tyche.AvgDuration(perf.BLSSignTotal, perf.BLSSignCount),
-		tyche.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount),
-		tyche.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount),
+		tyche.AvgDuration(perf.CertSignTotal, perf.CertSignCount),
+		tyche.AvgDuration(perf.CertVerifyTotal, perf.CertVerifyCount),
+		tyche.AvgDuration(perf.CertAggregateTotal, perf.CertAggregateCount),
 	)
 }
 

@@ -45,9 +45,9 @@ type Beacon struct {
 	// Signature is the compact READY quorum certificate. ReadySenders records
 	// who voted; Signature proves those nodes signed the canonical READY
 	// statement for this epoch/source/sequence/random hash.
-	Signature     crypto.BLSAggregateSignature `json:"signature"`
-	ConfigVersion uint64                       `json:"config_version"`
-	State         CertifiedStateDigest         `json:"state"`
+	Signature     crypto.QuorumCertificate `json:"signature"`
+	ConfigVersion uint64                   `json:"config_version"`
+	State         CertifiedStateDigest     `json:"state"`
 }
 
 type CertifiedStateDigest struct {
@@ -76,12 +76,7 @@ type Config struct {
 	PVSSBackend       string
 	PVSSKeys          map[string]kyber.Scalar
 	CryptoWorkers     int
-	// BLS and BLSPublic are only for READY certificate compression. They are
-	// independent per-node BLS keys, not the PVSS key material and not a
-	// threshold-BLS shared key.
-	BLS       crypto.BLSKeyPair
-	BLSPublic map[string]kyber.Point
-	Transport p2p.Transport
+	Transport         p2p.Transport
 }
 
 type State struct {
@@ -135,16 +130,15 @@ type ReconEchoMessage struct {
 
 type ReconReadyMessage ReconEchoMessage
 
-// signedReconReadyMessage extends the original READY payload with a BLS share.
-// The READY amplification rule is unchanged; the signature simply makes each
-// counted READY vote externally auditable and aggregatable.
+// signedReconReadyMessage carries the signer identity counted for READY quorum
+// certification. The READY amplification rule is unchanged.
 type signedReconReadyMessage struct {
-	Epoch     uint64                   `json:"epoch"`
-	Source    p2p.NodeID               `json:"source"`
-	Seq       uint64                   `json:"seq"`
-	Random    []byte                   `json:"random"`
-	State     CertifiedStateDigest     `json:"state"`
-	Signature crypto.BLSSignatureShare `json:"signature"`
+	Epoch     uint64               `json:"epoch"`
+	Source    p2p.NodeID           `json:"source"`
+	Seq       uint64               `json:"seq"`
+	Random    []byte               `json:"random"`
+	State     CertifiedStateDigest `json:"state"`
+	Signature crypto.VoteShare     `json:"signature"`
 }
 
 type Node struct {
@@ -152,11 +146,6 @@ type Node struct {
 	Transport p2p.Transport
 	PVSS      crypto.PVSSScheme
 	Perf      *PerfMetrics
-	// BLS state supports the READY aggregate certificate attached to each
-	// certified beacon. It is deliberately separate from the PVSS scheme so the
-	// randomness protocol remains the same.
-	BLS       crypto.BLSKeyPair
-	BLSPublic map[string]kyber.Point
 	RBC       *rbc.Broadcaster
 	ABA       *aba.Agreement
 	Crypto    *cryptoexec.Executor
@@ -167,10 +156,10 @@ type Node struct {
 	reconSecret map[string][]byte
 	reconDone   map[string]bool
 	echoes      map[string]map[string]map[p2p.NodeID]bool
-	// readies stores verified BLS READY shares rather than bare sender ids.
+	// readies stores verified READY votes rather than bare sender ids.
 	// This lets certification aggregate the exact votes that justified the
 	// Bracha-style READY threshold.
-	readies      map[string]map[string]map[p2p.NodeID]crypto.BLSSignatureShare
+	readies      map[string]map[string]map[p2p.NodeID]crypto.VoteShare
 	readySent    map[string]bool
 	reconSent    map[string]bool
 	certified    map[string]bool
@@ -292,25 +281,6 @@ func NewNode(cfg Config) (*Node, error) {
 	if len(seed) == 0 {
 		seed = crypto.HashBytes([]byte("Tyche-v1/genesis"), []byte(fmt.Sprint(members)))
 	}
-	// BLS keys are optional in tests and local benchmarks. If the caller does
-	// not provide them, derive deterministic per-node keys so existing fixtures
-	// keep working; production deployments should pass explicit keys.
-	blsKey := cfg.BLS
-	if blsKey.Private == nil {
-		blsKey = crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(cfg.ID)))
-	}
-	blsPublic := make(map[string]kyber.Point, len(members))
-	for id, pub := range cfg.BLSPublic {
-		if pub != nil {
-			blsPublic[id] = pub.Clone()
-		}
-	}
-	if len(blsPublic) == 0 {
-		for _, id := range members {
-			kp := crypto.NewBLSKeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/default-bls/private"), []byte(id)))
-			blsPublic[string(id)] = kp.Public
-		}
-	}
 	st := &State{
 		ConfigVersion: cfg.ConfigVersion,
 		Members:       members,
@@ -330,13 +300,13 @@ func NewNode(cfg Config) (*Node, error) {
 		st.RmMark[id] = -1
 	}
 	n := &Node{
-		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{}, BLS: blsKey, BLSPublic: blsPublic,
+		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{},
 		RBC:    rbc.New(cfg.ID, len(members), f, cfg.Transport),
 		ABA:    aba.New(cfg.ID, len(members), f, cfg.Transport),
 		Crypto: cryptoexec.New(cfg.CryptoWorkers),
 		State:  st,
 		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
-		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.BLSSignatureShare),
+		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare),
 		readySent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
 		joinRequests: make(map[string]JoinRequest), pendingJoins: make(map[string]JoinCertificate),
@@ -1179,7 +1149,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.Go(ctx, func() {
-			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, CertifiedStateDigest{}, crypto.BLSSignatureShare{})
+			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, CertifiedStateDigest{}, crypto.VoteShare{})
 		})
 	case "RECON_READY":
 		body, err := p2p.DecodePayload[signedReconReadyMessage](msg)
@@ -1307,7 +1277,7 @@ func debugf(format string, args ...any) {
 	}
 }
 
-func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, sig crypto.BLSSignatureShare) {
+func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, sig crypto.VoteShare) {
 	key := epochKey(epoch, source, seq)
 	rh := hex.EncodeToString(random)
 	stateHash := stateDigestHash(state)
@@ -1319,7 +1289,7 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		if !duplicate && n.readies[key] != nil && n.readies[key][voteKey] != nil {
 			_, duplicate = n.readies[key][voteKey][from]
 		}
-		blsPublic := n.blsPublicSnapshotLocked()
+		members := n.memberSetLocked()
 		n.mu.Unlock()
 		if duplicate {
 			return
@@ -1328,9 +1298,9 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		// READY transcript. This preserves the original threshold rule while
 		// preventing a bare sender id from becoming part of the certificate.
 		start := time.Now()
-		valid := sig.Signer == string(from) && crypto.VerifyBLSShare(sig, blsPublic, readyVoteBytes(epoch, source, seq, rh, stateHash))
+		valid := sig.Signer == string(from) && crypto.VerifyVoteShare(sig, members)
 		if n.Perf != nil {
-			n.Perf.addBLSVerify(time.Since(start))
+			n.Perf.addCertVerify(time.Since(start))
 		}
 		if !valid {
 			return
@@ -1347,13 +1317,13 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		n.echoes[key] = make(map[string]map[p2p.NodeID]bool)
 	}
 	if n.readies[key] == nil {
-		n.readies[key] = make(map[string]map[p2p.NodeID]crypto.BLSSignatureShare)
+		n.readies[key] = make(map[string]map[p2p.NodeID]crypto.VoteShare)
 	}
 	if n.echoes[key][rh] == nil {
 		n.echoes[key][rh] = make(map[p2p.NodeID]bool)
 	}
 	if n.readies[key][voteKey] == nil {
-		n.readies[key][voteKey] = make(map[p2p.NodeID]crypto.BLSSignatureShare)
+		n.readies[key][voteKey] = make(map[p2p.NodeID]crypto.VoteShare)
 	}
 	if kind == "echo" {
 		n.echoes[key][rh][from] = true
@@ -1368,10 +1338,10 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	}
 	certify := !n.certified[readyKey] && readyCount >= 2*n.State.F+1
 	var senders []p2p.NodeID
-	var votes []crypto.BLSSignatureShare
-	var blsPublic map[string]kyber.Point
+	var votes []crypto.VoteShare
+	var members map[string]struct{}
 	if certify {
-		blsPublic = n.blsPublicSnapshotLocked()
+		members = n.memberSetLocked()
 		for id := range n.readies[key][voteKey] {
 			senders = append(senders, id)
 			votes = append(votes, n.readies[key][voteKey][id])
@@ -1381,12 +1351,12 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	n.mu.Unlock()
 	if needReady {
 		// READY amplification is unchanged: once enough ECHO/READY evidence is
-		// observed, this node broadcasts READY. The added BLS share signs the
+		// observed, this node broadcasts READY. The added vote signs the
 		// same canonical statement that will later be aggregated.
 		start := time.Now()
-		sig, err := crypto.SignBLS(string(n.ID), n.BLS.Private, readyVoteBytes(epoch, source, seq, rh, stateHash))
+		sig, err := crypto.NewVoteShare(string(n.ID))
 		if n.Perf != nil {
-			n.Perf.addBLSSign(time.Since(start))
+			n.Perf.addCertSign(time.Since(start))
 		}
 		if err == nil {
 			msg, err := p2p.NewMessage(Protocol, "RECON_READY", key, n.ID, "", signedReconReadyMessage{Epoch: epoch, Source: source, Seq: seq, Random: random, State: state, Signature: sig})
@@ -1396,14 +1366,14 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		}
 	}
 	if certify {
-		// Certification now outputs a compact aggregate BLS certificate for the
+		// Certification now outputs a compact aggregate quorum certificate for the
 		// 2f+1 READY quorum. The quorum threshold and random reconstruction are
 		// unchanged; only the representation of the READY certificate is smaller
 		// and externally verifiable.
 		start := time.Now()
-		cert, err := crypto.AggregateBLSTrusted(votes, blsPublic, readyVoteBytes(epoch, source, seq, rh, stateHash), 2*n.State.F+1)
+		cert, err := crypto.BuildQuorumCertificate(votes, members, 2*n.State.F+1)
 		if n.Perf != nil {
-			n.Perf.addBLSAggregate(time.Since(start))
+			n.Perf.addCertAggregate(time.Since(start))
 		}
 		if err != nil {
 			return
@@ -1419,7 +1389,7 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	}
 }
 
-func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
+func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
@@ -1435,7 +1405,7 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 	go n.finishCertifyBeacon(epoch, source, seq, random, state, senders, cert)
 }
 
-func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.BLSAggregateSignature) {
+func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
@@ -1525,7 +1495,7 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 	}
 	obj, ok := n.State.ComQ[b.Source][b.Seq]
 	threshold := 2*n.State.F + 1
-	blsPublic := n.blsPublicSnapshotLocked()
+	members := n.memberSetLocked()
 	n.mu.Unlock()
 
 	if !ok || obj.ConfigVersion != b.ConfigVersion {
@@ -1536,9 +1506,7 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 		n.mu.Unlock()
 		return false
 	}
-	rh := hex.EncodeToString(b.Random)
-	stateHash := stateDigestHash(b.State)
-	if err := crypto.VerifyBLSAggregate(b.Signature, blsPublic, readyVoteBytes(b.Epoch, b.Source, b.Seq, rh, stateHash), threshold); err != nil {
+	if err := crypto.VerifyQuorumCertificate(b.Signature, members, threshold); err != nil {
 		return false
 	}
 	n.mu.Lock()
@@ -1700,7 +1668,6 @@ func (n *Node) removeMemberLocked(id p2p.NodeID) {
 	delete(n.State.ComQ, id)
 	delete(n.State.Seqs, id)
 	delete(n.State.RmMark, id)
-	delete(n.BLSPublic, string(id))
 	n.State.ConfigVersion++
 	n.State.F = (len(n.State.Members) - 1) / 3
 	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
@@ -1709,10 +1676,10 @@ func (n *Node) removeMemberLocked(id p2p.NodeID) {
 	n.resetConfigurationCachesLocked()
 }
 
-func (n *Node) blsPublicSnapshotLocked() map[string]kyber.Point {
-	snapshot := make(map[string]kyber.Point, len(n.BLSPublic))
-	for id, pub := range n.BLSPublic {
-		snapshot[id] = pub
+func (n *Node) memberSetLocked() map[string]struct{} {
+	snapshot := make(map[string]struct{}, len(n.State.Members))
+	for _, id := range n.State.Members {
+		snapshot[string(id)] = struct{}{}
 	}
 	return snapshot
 }
@@ -1807,7 +1774,7 @@ func (n *Node) resetConfigurationCachesLocked() {
 	n.reconSecret = make(map[string][]byte)
 	n.reconDone = make(map[string]bool)
 	n.echoes = make(map[string]map[string]map[p2p.NodeID]bool)
-	n.readies = make(map[string]map[string]map[p2p.NodeID]crypto.BLSSignatureShare)
+	n.readies = make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare)
 	n.readySent = make(map[string]bool)
 	n.reconSent = make(map[string]bool)
 	n.certified = make(map[string]bool)
@@ -1907,7 +1874,7 @@ func maxEchoCount(votes map[string]map[p2p.NodeID]bool) int {
 	return max
 }
 
-func maxReadyCount(votes map[string]map[p2p.NodeID]crypto.BLSSignatureShare) int {
+func maxReadyCount(votes map[string]map[p2p.NodeID]crypto.VoteShare) int {
 	max := 0
 	for _, bySender := range votes {
 		if len(bySender) > max {
@@ -2050,21 +2017,6 @@ func keyEpoch(key string) uint64 {
 
 func objectCacheKey(obj Object) string {
 	return fmt.Sprintf("%d/%s", obj.ConfigVersion, obj.Commitment.SecretID)
-}
-
-func readyVoteBytes(epoch uint64, source p2p.NodeID, seq uint64, randomHash string, stateHash string) []byte {
-	// Keep one canonical transcript for both individual READY signatures and
-	// aggregate certificate verification. The random hash is used instead of the
-	// full random value so signatures bind the same compact statement carried by
-	// the READY threshold logic.
-	return crypto.HashBytes(
-		[]byte("Tyche-v1/READY"),
-		[]byte(fmt.Sprintf("%d", epoch)),
-		[]byte(source),
-		[]byte(fmt.Sprintf("%d", seq)),
-		[]byte(randomHash),
-		[]byte(stateHash),
-	)
 }
 
 func normalizeMembers(in []p2p.NodeID) []p2p.NodeID {

@@ -18,7 +18,6 @@ type JoinRequest struct {
 	ContextEpoch    uint64            `json:"context_epoch"`
 	Joiner          p2p.NodeID        `json:"joiner"`
 	PublicKey       string            `json:"public_key"`
-	BLSPublicKey    string            `json:"bls_public_key"`
 	CandidateParams crypto.PVSSParams `json:"candidate_params,omitempty"`
 	Object          Object            `json:"object"`
 	FirstCoinEpoch  uint64            `json:"first_coin_epoch"`
@@ -35,18 +34,18 @@ func (t TransitionIndex) String() string {
 }
 
 type JoinAck struct {
-	Transition    TransitionIndex          `json:"transition"`
-	RequestDigest string                   `json:"request_digest"`
-	Signer        p2p.NodeID               `json:"signer"`
-	Signature     crypto.BLSSignatureShare `json:"signature"`
+	Transition    TransitionIndex  `json:"transition"`
+	RequestDigest string           `json:"request_digest"`
+	Signer        p2p.NodeID       `json:"signer"`
+	Signature     crypto.VoteShare `json:"signature"`
 }
 
 type JoinCommit struct {
-	Transition      TransitionIndex          `json:"transition"`
-	RequestDigest   string                   `json:"request_digest"`
-	ActivationEpoch uint64                   `json:"activation_epoch"`
-	Signer          p2p.NodeID               `json:"signer"`
-	Signature       crypto.BLSSignatureShare `json:"signature"`
+	Transition      TransitionIndex  `json:"transition"`
+	RequestDigest   string           `json:"request_digest"`
+	ActivationEpoch uint64           `json:"activation_epoch"`
+	Signer          p2p.NodeID       `json:"signer"`
+	Signature       crypto.VoteShare `json:"signature"`
 }
 
 type JoinArm struct {
@@ -102,7 +101,7 @@ func (n *Node) HandleJoinRequest(ctx context.Context, req JoinRequest) error {
 	n.State.PendingReconf[key] = rho
 	n.joinRequests[rho] = req
 	n.mu.Unlock()
-	sig, err := crypto.SignBLS(string(n.ID), n.BLS.Private, joinAckBytes(tau, rho))
+	sig, err := crypto.NewVoteShare(string(n.ID))
 	if err != nil {
 		return err
 	}
@@ -241,10 +240,6 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 }
 
 func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme crypto.PVSSScheme) error {
-	blsPub, err := crypto.DecodeBLSPublicKey(cert.Request.BLSPublicKey)
-	if err != nil {
-		return err
-	}
 	n.State.Members = append(n.State.Members, cert.Request.Joiner)
 	sort.Slice(n.State.Members, func(i, j int) bool { return n.State.Members[i] < n.State.Members[j] })
 	if !contains(n.State.SCL, cert.Request.Joiner) {
@@ -258,7 +253,6 @@ func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme crypto.
 		n.State.TransitionSeq = cert.Cert2[0].Transition.Seq
 	}
 	n.PVSS = scheme
-	n.BLSPublic[string(cert.Request.Joiner)] = blsPub
 	n.verified = make(map[string]verifiedObject)
 	n.State.F = (len(n.State.Members) - 1) / 3
 	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
@@ -365,7 +359,7 @@ func (n *Node) broadcastJoinCommit(ctx context.Context, req JoinRequest) error {
 	n.commitSent[key] = true
 	n.lockedFrom = req.ActivationEpoch
 	n.mu.Unlock()
-	sig, err := crypto.SignBLS(string(n.ID), n.BLS.Private, joinCommitBytes(tau, rho, req.ActivationEpoch))
+	sig, err := crypto.NewVoteShare(string(n.ID))
 	if err != nil {
 		return err
 	}
@@ -382,14 +376,11 @@ func (n *Node) verifyJoinRequest(req JoinRequest) error {
 	version := n.State.ConfigVersion
 	currentMembers := append([]p2p.NodeID(nil), n.State.Members...)
 	n.mu.Unlock()
-	if req.ConfigVersion != version || req.Joiner == "" || req.PublicKey == "" || req.BLSPublicKey == "" || req.FirstCoinEpoch >= req.ActivationEpoch {
+	if req.ConfigVersion != version || req.Joiner == "" || req.PublicKey == "" || req.FirstCoinEpoch >= req.ActivationEpoch {
 		return errors.New("invalid join request metadata")
 	}
 	if contains(currentMembers, req.Joiner) {
 		return errors.New("joiner already belongs to current configuration")
-	}
-	if _, err := crypto.DecodeBLSPublicKey(req.BLSPublicKey); err != nil {
-		return errors.New("invalid joiner bls public key")
 	}
 	targetMembers := normalizeMembers(append(currentMembers, req.Joiner))
 	targetF := (len(targetMembers) - 1) / 3
@@ -427,7 +418,7 @@ func (n *Node) validJoinAck(ack JoinAck) bool {
 	if ack.Signature.Signer != string(ack.Signer) {
 		return false
 	}
-	return crypto.VerifyBLSShare(ack.Signature, n.BLSPublic, joinAckBytes(ack.Transition, ack.RequestDigest))
+	return crypto.VerifyVoteShare(ack.Signature, n.memberSetLocked())
 }
 
 func (n *Node) validJoinCommit(c JoinCommit) bool {
@@ -439,7 +430,7 @@ func (n *Node) validJoinCommit(c JoinCommit) bool {
 	if c.Signature.Signer != string(c.Signer) {
 		return false
 	}
-	return crypto.VerifyBLSShare(c.Signature, n.BLSPublic, joinCommitBytes(c.Transition, c.RequestDigest, c.ActivationEpoch))
+	return crypto.VerifyVoteShare(c.Signature, n.memberSetLocked())
 }
 
 func (n *Node) verifyAckCert(cert []JoinAck, rho string) bool {
