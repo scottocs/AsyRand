@@ -9,9 +9,10 @@ from pathlib import Path
 
 
 RUNS_DIR = Path(__file__).parent / "runs"
-PROTOCOLS = ["tyche", "asyrand", "grandline", "spurt"]
+PROTOCOLS = ["tyche", "tyche-scrape", "asyrand", "grandline", "spurt"]
 COLORS = {
     "tyche": "#2563eb",
+    "tyche-scrape": "#8e00a7",
     "asyrand": "#059669",
     "grandline": "#d97706",
     "spurt": "#dc2626",
@@ -123,20 +124,16 @@ def nice_upper(value):
         return 1
     magnitude = 10 ** math.floor(math.log10(value))
     normalized = value / magnitude
-    if normalized <= 1:
-        nice = 1
-    elif normalized <= 2:
-        nice = 2
-    elif normalized <= 5:
-        nice = 5
-    else:
-        nice = 10
-    return nice * magnitude
+    for nice in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+        if normalized <= nice:
+            return nice * magnitude
+    return 10 * magnitude
 
 
 def build_svg(rows):
-    width = 1120
-    height = 680
+    available_nodes = sorted({row["nodes"] for row in rows})
+    width = max(760, min(940, 520 + len(available_nodes) * 64))
+    height = 640
     left = 86
     right = 32
     top = 54
@@ -145,14 +142,16 @@ def build_svg(rows):
     plot_h = height - top - bottom
 
     if not rows:
-        return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1120\" height=\"680\"></svg>"
+        return f"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"></svg>"
 
     max_y = max(row["mean"] + row["stdev"] for row in rows)
     y_max = nice_upper(max_y * 1.08)
-    x_min = min(EXPECTED_NODES)
-    x_max = max(EXPECTED_NODES)
+    x_min = min(available_nodes)
+    x_max = max(available_nodes)
 
     def x_scale(value):
+        if x_min == x_max:
+            return left + plot_w / 2
         return left + (value - x_min) / (x_max - x_min) * plot_w
 
     def y_scale(value):
@@ -180,7 +179,7 @@ def build_svg(rows):
         parts.append(f'<line x1="{left}" y1="{y:.2f}" x2="{width - right}" y2="{y:.2f}" class="grid"/>')
         parts.append(f'<text x="{left - 10}" y="{y + 4:.2f}" text-anchor="end" class="tick">{value:.0f}</text>')
 
-    for node_count in EXPECTED_NODES:
+    for node_count in available_nodes:
         x = x_scale(node_count)
         parts.append(f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{height - bottom}" class="grid"/>')
         parts.append(f'<text x="{x:.2f}" y="{height - bottom + 24}" text-anchor="middle" class="tick">{node_count}</text>')
@@ -256,7 +255,8 @@ def write_html(svg, rows):
 <title>Beacon Throughput vs Cluster Size</title>
 <style>
 body {{ font-family: Arial, Helvetica, sans-serif; margin: 28px; color: #111827; }}
-.chart {{ max-width: 1120px; }}
+.chart {{ max-width: 100%; }}
+.chart svg {{ max-width: 100%; height: auto; }}
 table {{ border-collapse: collapse; margin-top: 18px; font-size: 13px; }}
 th, td {{ border: 1px solid #d1d5db; padding: 6px 9px; text-align: right; }}
 th:first-child, td:first-child {{ text-align: left; }}
