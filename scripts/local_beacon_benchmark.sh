@@ -4,6 +4,7 @@ set -Eeuo pipefail
 N="${N:-8}"
 EPOCHS="${EPOCHS:-1000}"
 F="${F:-$(((N - 1) / 3))}"
+GRANDLINE_F="${GRANDLINE_F:-$(((N - 1) / 2))}"
 QUEUE_LEN="${QUEUE_LEN:-8}"
 PRODUCER_MS="${PRODUCER_MS:-150}"
 PREFILL_MS="${PREFILL_MS:-3000}"
@@ -24,37 +25,80 @@ split_csv() {
   IFS="$old_ifs"
 }
 
-ensure_asyrand_config() {
-  local src="$REPO_ROOT/spurt/configs/local_8_rounds_1000.json"
-  local dst="$GEN_DIR/asyrand_local_${N}_rounds_${EPOCHS}.json"
-  mkdir -p "$GEN_DIR"
-  sed \
-    -e 's/"protocol": "spurt-v1"/"protocol": "asyrand-v1"/' \
-    -e "s/\"round\": [0-9][0-9]*/\"round\": $EPOCHS/" \
-    -e "s/\"queue_len\": [0-9][0-9]*/\"queue_len\": $QUEUE_LEN/" \
-    -e "s/\"producer_interval_ms\": [0-9][0-9]*/\"producer_interval_ms\": $PRODUCER_MS/" \
-    -e "s/\"prefill_ms\": [0-9][0-9]*/\"prefill_ms\": $PREFILL_MS/" \
-    -e "s/\"epoch_timeout_ms\": [0-9][0-9]*/\"epoch_timeout_ms\": $EPOCH_TIMEOUT_MS/" \
-    -e "s/\"report_interval_ms\": [0-9][0-9]*/\"report_interval_ms\": $REPORT_MS/" \
-    -e "s/\"aggregation_lookahead\": [0-9][0-9]*/\"aggregation_lookahead\": $AGGREGATION_LOOKAHEAD/" \
-    -e "s/\"max_pool\": [0-9][0-9]*/\"max_pool\": $MAX_POOL/" \
-    "$src" > "$dst"
-  printf '%s\n' "$dst"
+seed_for_node() {
+  local node="$1"
+  printf 'tyche-node-%04d' "$node" | shasum -a 256 | awk '{print $1}'
 }
 
-config_from_template() {
-  local proto="$1" src="$2" dst="$GEN_DIR/${proto}_local_${N}_rounds_${EPOCHS}.json"
+protocol_f() {
+  local proto="$1"
+  case "$proto" in
+    grandline)
+      printf '%d' "$GRANDLINE_F"
+      ;;
+    tyche|tyche-scrape|tyche-reconfig|tyche-scrape-reconfig|asyrand|spurt)
+      printf '%d' "$F"
+      ;;
+    *)
+      printf '%d' "$F"
+      ;;
+  esac
+}
+
+generate_json_config() {
+  local proto="$1" protocol="$2" dst="$GEN_DIR/${proto}_local_${N}_rounds_${EPOCHS}.json"
+  local node comma f
   mkdir -p "$GEN_DIR"
-  sed \
-    -e "s/\"round\": [0-9][0-9]*/\"round\": $EPOCHS/" \
-    -e "s/\"queue_len\": [0-9][0-9]*/\"queue_len\": $QUEUE_LEN/" \
-    -e "s/\"producer_interval_ms\": [0-9][0-9]*/\"producer_interval_ms\": $PRODUCER_MS/" \
-    -e "s/\"prefill_ms\": [0-9][0-9]*/\"prefill_ms\": $PREFILL_MS/" \
-    -e "s/\"epoch_timeout_ms\": [0-9][0-9]*/\"epoch_timeout_ms\": $EPOCH_TIMEOUT_MS/" \
-    -e "s/\"report_interval_ms\": [0-9][0-9]*/\"report_interval_ms\": $REPORT_MS/" \
-    -e "s/\"aggregation_lookahead\": [0-9][0-9]*/\"aggregation_lookahead\": $AGGREGATION_LOOKAHEAD/" \
-    -e "s/\"max_pool\": [0-9][0-9]*/\"max_pool\": $MAX_POOL/" \
-    "$src" > "$dst"
+  f="$(protocol_f "$proto")"
+  {
+    printf '{\n'
+    printf '  "name": "local-%d-%d",\n' "$N" "$EPOCHS"
+    printf '  "protocol": "%s",\n' "$protocol"
+    printf '  "transport": "memory",\n'
+    printf '  "f": %d,\n' "$f"
+    printf '  "round": %d,\n' "$EPOCHS"
+    printf '  "queue_len": %d,\n' "$QUEUE_LEN"
+    printf '  "listen_ip": "0.0.0.0",\n'
+    printf '  "producer_interval_ms": %d,\n' "$PRODUCER_MS"
+    printf '  "prefill_ms": %d,\n' "$PREFILL_MS"
+    printf '  "epoch_timeout_ms": %d,\n' "$EPOCH_TIMEOUT_MS"
+    printf '  "report_interval_ms": %d,\n' "$REPORT_MS"
+    printf '  "linger_ms": 15000,\n'
+    printf '  "aggregation_lookahead": %d,\n' "$AGGREGATION_LOOKAHEAD"
+    printf '  "batch_size": 1,\n'
+    printf '  "max_pool": %d,\n' "$MAX_POOL"
+    printf '  "log_level": 1,\n'
+    printf '  "seed": "%s",\n' "$(printf '%s-local-%s-%s' "$proto" "$N" "$EPOCHS" | shasum -a 256 | awk '{print $1}')"
+    printf '  "cluster_index": {\n'
+    for node in $(seq 0 $((N - 1))); do
+      comma=','
+      [[ "$node" -eq $((N - 1)) ]] && comma=''
+      printf '    "node%d": %d%s\n' "$node" "$node" "$comma"
+    done
+    printf '  },\n'
+    printf '  "cluster_ips": {\n'
+    for node in $(seq 0 $((N - 1))); do
+      comma=','
+      [[ "$node" -eq $((N - 1)) ]] && comma=''
+      printf '    "node%d": "127.0.0.1"%s\n' "$node" "$comma"
+    done
+    printf '  },\n'
+    printf '  "peers_p2p_port": {\n'
+    for node in $(seq 0 $((N - 1))); do
+      comma=','
+      [[ "$node" -eq $((N - 1)) ]] && comma=''
+      printf '    "node%d": %d%s\n' "$node" "$((9000 + node))" "$comma"
+    done
+    printf '  },\n'
+    printf '  "node_key_seed": {\n'
+    for node in $(seq 0 $((N - 1))); do
+      comma=','
+      [[ "$node" -eq $((N - 1)) ]] && comma=''
+      printf '    "node%d": "%s"%s\n' "$node" "$(seed_for_node "$node")" "$comma"
+    done
+    printf '  }\n'
+    printf '}\n'
+  } > "$dst"
   printf '%s\n' "$dst"
 }
 
@@ -75,15 +119,15 @@ run_protocol() {
       (cd "$REPO_ROOT/Tyche" && TYCHE_RECONFIG_BENCH_TEST=1 TYCHE_CHURN_PVSS=scrape TYCHE_CHURN_INITIAL_N="$N" TYCHE_CHURN_INITIAL_F="$F" TYCHE_CHURN_EPOCHS="$EPOCHS" TYCHE_CHURN_RECONFIG_EVENTS="${TYCHE_RECONFIG_EVENTS:-$((EPOCHS / 20))}" TYCHE_CHURN_PREFILL_MS="$PREFILL_MS" TYCHE_CHURN_MIN_N="${TYCHE_RECONFIG_MIN_N:-$((N - F))}" TYCHE_CHURN_MAX_N="${TYCHE_RECONFIG_MAX_N:-$((N + F))}" TYCHE_CHURN_EPOCH_TIMEOUT_MS="$EPOCH_TIMEOUT_MS" TYCHE_CHURN_SEED="${TYCHE_RECONFIG_SEED:-20260521}" GOCACHE="$BENCH_TMP/tyche-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go test ./protocol/tyche -run TestBeaconReconfigurationBenchmark200Epochs -count=1 -timeout "${timeout:-${GO_TEST_TIMEOUT:-10m}}" -v) > "$logf" 2>&1
       ;;
     asyrand)
-      cfg="$(ensure_asyrand_config)"
+      cfg="$(generate_json_config asyrand asyrand-v1)"
       (cd "$REPO_ROOT/asyrand" && GOCACHE="$BENCH_TMP/asyrand-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/asyrand -config "$cfg" -transport memory) > "$logf" 2>&1
       ;;
     grandline)
-      cfg="$(config_from_template grandline "$REPO_ROOT/grandline/configs/local_8_rounds_1000.json")"
+      cfg="$(generate_json_config grandline grandline)"
       (cd "$REPO_ROOT/grandline" && GOCACHE="$BENCH_TMP/grandline-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/grandline -config "$cfg" -transport memory) > "$logf" 2>&1
       ;;
     spurt)
-      cfg="$(config_from_template spurt "$REPO_ROOT/spurt/configs/local_8_rounds_1000.json")"
+      cfg="$(generate_json_config spurt spurt-v1)"
       (cd "$REPO_ROOT/spurt" && GOCACHE="$BENCH_TMP/spurt-go-cache" GOSUMDB=off GOMAXPROCS="$GOMAXPROCS_LOCAL" /usr/bin/time -p go run ./cmd/spurt -config "$cfg" -transport memory) > "$logf" 2>&1
       ;;
     *)
