@@ -1358,7 +1358,12 @@ def _aws_result_row(options, hosts, protocol, node):
     protocol_elapsed = _protocol_elapsed_seconds(final) or elapsed
     user = float(_line_value(lines, "User time (seconds)") or 0)
     sys_time = float(_line_value(lines, "System time (seconds)") or 0)
-    cpu_pct = ((user + sys_time) / protocol_elapsed * 100) if protocol_elapsed > 0 else 0
+    raw_cpu = _line_value(lines, "Percent of CPU this job got")
+    cpu_match = re.search(r"([0-9.]+)", raw_cpu)
+    if cpu_match:
+        cpu_pct = float(cpu_match.group(1))
+    else:
+        cpu_pct = ((user + sys_time) / elapsed * 100) if elapsed > 0 else 0
     skipped_epochs, last_skip_stage, last_skip_reason, last_skip_diag = _skip_summary(lines)
     return {
         "protocol": protocol,
