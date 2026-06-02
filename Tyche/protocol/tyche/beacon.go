@@ -160,7 +160,6 @@ type Node struct {
 	RBC       *rbc.Broadcaster
 	ABA       *aba.Agreement
 	Crypto    *cryptoexec.Executor
-	ObjCrypto *cryptoexec.Executor
 
 	mu          sync.Mutex
 	State       *State
@@ -247,9 +246,6 @@ type DebugSnapshot struct {
 	CryptoWorkers int
 	CryptoActive  int64
 	CryptoQueued  int64
-	ObjWorkers    int
-	ObjActive     int64
-	ObjQueued     int64
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -270,13 +266,13 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	low, high := cfg.ProducerLow, cfg.ProducerHigh
 	if high <= 0 {
-		high = 5
+		high = 4
 	}
 	if high <= 0 || high > queueLen {
 		high = queueLen
 	}
 	if low <= 0 {
-		low = 3
+		low = 2
 	}
 	if low > high {
 		low = high
@@ -335,12 +331,11 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n := &Node{
 		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{}, BLS: blsKey, BLSPublic: blsPublic,
-		RBC:       rbc.New(cfg.ID, len(members), f, cfg.Transport),
-		ABA:       aba.New(cfg.ID, len(members), f, cfg.Transport),
-		Crypto:    cryptoexec.New(criticalCryptoWorkers(cfg.CryptoWorkers)),
-		ObjCrypto: cryptoexec.New(objectCryptoWorkers(cfg.CryptoWorkers)),
-		State:     st,
-		recon:     make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
+		RBC:    rbc.New(cfg.ID, len(members), f, cfg.Transport),
+		ABA:    aba.New(cfg.ID, len(members), f, cfg.Transport),
+		Crypto: cryptoexec.New(cfg.CryptoWorkers),
+		State:  st,
+		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
 		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.BLSSignatureShare),
 		readySent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
@@ -373,27 +368,6 @@ func NewNode(cfg Config) (*Node, error) {
 		n.pvssKeys[epoch] = cfg.PVSS.PrivateKey()
 	}
 	return n, nil
-}
-
-func criticalCryptoWorkers(total int) int {
-	if total <= 0 {
-		return 0
-	}
-	if total < 4 {
-		return 1
-	}
-	return total / 4
-}
-
-func objectCryptoWorkers(total int) int {
-	if total <= 0 {
-		return 0
-	}
-	critical := criticalCryptoWorkers(total)
-	if total-critical < 1 {
-		return 1
-	}
-	return total - critical
 }
 
 func (n *Node) Start(ctx context.Context) {
@@ -1097,7 +1071,7 @@ func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
 			return nil
 		}
 		obj := *env.Object
-		n.ObjCrypto.Go(ctx, func() { _ = n.storeObject(obj) })
+		n.Crypto.Go(ctx, func() { _ = n.storeObject(obj) })
 		return nil
 	case "join":
 		if env.Join == nil {
@@ -1133,7 +1107,7 @@ func (n *Node) storeObject(obj Object) error {
 		debugf("node=%s drop object producer=%s seq=%d reason=window next=%d max=%d", n.ID, obj.Producer, obj.Seq, nextSeq, maxSeq)
 		return nil
 	}
-	if _, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists {
+	if existing, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists && existing.ConfigVersion == obj.ConfigVersion {
 		n.mu.Unlock()
 		return nil
 	}
@@ -1156,7 +1130,7 @@ func (n *Node) storeObject(obj Object) error {
 		debugf("node=%s drop object producer=%s seq=%d reason=window next=%d max=%d", n.ID, obj.Producer, obj.Seq, nextSeq, maxSeq)
 		return nil
 	}
-	if _, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists {
+	if existing, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists && existing.ConfigVersion == obj.ConfigVersion {
 		return nil
 	}
 	n.State.ComQ[obj.Producer][obj.Seq] = obj
@@ -1919,12 +1893,6 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 		s.CryptoWorkers = stats.Workers
 		s.CryptoActive = stats.Active
 		s.CryptoQueued = stats.Queued
-	}
-	if n.ObjCrypto != nil {
-		stats := n.ObjCrypto.Stats()
-		s.ObjWorkers = stats.Workers
-		s.ObjActive = stats.Active
-		s.ObjQueued = stats.Queued
 	}
 	return s
 }

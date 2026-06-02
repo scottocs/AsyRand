@@ -618,10 +618,10 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	if c.stopped[source] && !c.isMarkedForRemoval(source) {
 		c.applyABAFalse(t, parent, epoch, source, seq)
 	}
-	c.ensureStored(t, parent, sourceNode, source, seq, epoch)
+	c.ensureStored(t, parent, sourceNode, source, seq, epoch, timeout)
 	c.waitStoredCurrent(t, parent, source, seq)
 	if !c.stopped[source] {
-		c.ensureStored(t, parent, sourceNode, source, seq+1, epoch)
+		c.ensureStored(t, parent, sourceNode, source, seq+1, epoch, timeout)
 		c.waitStoredCurrent(t, parent, source, seq+1)
 	}
 
@@ -710,7 +710,7 @@ func (c *churnCluster) applyABAFalse(t *testing.T, ctx context.Context, epoch ui
 	}
 }
 
-func (c *churnCluster) ensureStored(t *testing.T, ctx context.Context, producer *Node, source p2p.NodeID, seq uint64, epoch uint64) {
+func (c *churnCluster) ensureStored(t *testing.T, ctx context.Context, producer *Node, source p2p.NodeID, seq uint64, epoch uint64, timeout time.Duration) {
 	t.Helper()
 	if c.allActiveStored(source, seq) {
 		return
@@ -718,14 +718,20 @@ func (c *churnCluster) ensureStored(t *testing.T, ctx context.Context, producer 
 	if c.copyStoredObjectToMissing(source, seq) && c.allActiveStored(source, seq) {
 		return
 	}
+	storeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	producer.mu.Lock()
 	version := producer.State.ConfigVersion
 	if producer.State.ProducerSeq < seq {
 		producer.State.ProducerSeq = seq
 	}
 	producer.mu.Unlock()
-	if _, err := producer.produceSeq(ctx, seq, version); err != nil {
+	obj, err := producer.produceSeq(storeCtx, seq, version)
+	if err != nil {
 		t.Fatalf("produce source=%s seq=%d epoch=%d: %v", source, seq, epoch, err)
+	}
+	if err := producer.storeObject(obj); err != nil {
+		t.Logf("store produced object source=%s seq=%d epoch=%d on producer=%s failed: %v", source, seq, epoch, producer.ID, err)
 	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -735,10 +741,29 @@ func (c *churnCluster) ensureStored(t *testing.T, ctx context.Context, producer 
 		}
 		select {
 		case <-ticker.C:
-		case <-ctx.Done():
-			t.Fatalf("object source=%s seq=%d epoch=%d was not stored on all active nodes", source, seq, epoch)
+		case <-storeCtx.Done():
+			t.Fatalf("object source=%s seq=%d epoch=%d was not stored on all active nodes\n%s", source, seq, epoch, c.dumpObjectState(source, seq))
 		}
 	}
+}
+
+func (c *churnCluster) dumpObjectState(source p2p.NodeID, seq uint64) string {
+	out := ""
+	for _, node := range c.activeNodes() {
+		node.mu.Lock()
+		q := node.State.ComQ[source]
+		obj, ok := q[seq]
+		version := node.State.ConfigVersion
+		consumed := node.State.Seqs[source]
+		members := append([]p2p.NodeID(nil), node.State.Members...)
+		node.mu.Unlock()
+		if ok {
+			out += fmt.Sprintf("node=%s version=%d consumed=%d has=true obj_version=%d members=%v\n", node.ID, version, consumed, obj.ConfigVersion, members)
+		} else {
+			out += fmt.Sprintf("node=%s version=%d consumed=%d has=false queue_nil=%t members=%v\n", node.ID, version, consumed, q == nil, members)
+		}
+	}
+	return out
 }
 
 func (c *churnCluster) copyStoredObjectToMissing(source p2p.NodeID, seq uint64) bool {
@@ -763,7 +788,8 @@ func (c *churnCluster) copyStoredObjectToMissing(source p2p.NodeID, seq uint64) 
 		if node.State.ComQ[source] == nil {
 			node.State.ComQ[source] = make(map[uint64]Object)
 		}
-		if _, ok := node.State.ComQ[source][seq]; !ok && obj.ConfigVersion == node.State.ConfigVersion {
+		existing, ok := node.State.ComQ[source][seq]
+		if (!ok || existing.ConfigVersion != obj.ConfigVersion) && obj.ConfigVersion == node.State.ConfigVersion {
 			node.State.ComQ[source][seq] = obj
 		}
 		node.mu.Unlock()

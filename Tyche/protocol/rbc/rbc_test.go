@@ -48,7 +48,7 @@ func TestRBCBroadcastDeliversSameValue(t *testing.T) {
 	}
 }
 
-func TestRBCInitialCarriesHashOnly(t *testing.T) {
+func TestRBCInitialCarriesValue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -71,19 +71,19 @@ func TestRBCInitialCarriesHashOnly(t *testing.T) {
 	if msg.Type != "VAL" {
 		t.Fatalf("unexpected message type: %s", msg.Type)
 	}
-	val, err := p2p.DecodePayload[VoteMessage](msg)
+	val, err := p2p.DecodePayload[ValueMessage](msg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if val.Hash != Digest(value) {
 		t.Fatalf("bad hash: %s", val.Hash)
 	}
-	if val.Dealer != "n0" || val.Seq != 7 {
-		t.Fatalf("bad initial vote: %+v", val)
+	if val.Dealer != "n0" || val.Seq != 7 || !bytes.Equal(val.Value, value) {
+		t.Fatalf("bad initial value: %+v", val)
 	}
 }
 
-func TestRBCDataAfterReadyQuorumDelivers(t *testing.T) {
+func TestRBCValAfterReadyQuorumDelivers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -91,7 +91,7 @@ func TestRBCDataAfterReadyQuorumDelivers(t *testing.T) {
 	transport := net.NewTransport("n0", 16)
 	b := New("n0", 4, 1, transport)
 
-	value := []byte("late-rbc-value")
+	value := []byte("late-val-rbc-value")
 	hash := Digest(value)
 	for _, from := range []p2p.NodeID{"n1", "n2", "n3"} {
 		msg, err := p2p.NewMessage(Protocol, "READY", Instance("dealer", 9, hash), from, "n0", VoteMessage{
@@ -107,7 +107,13 @@ func TestRBCDataAfterReadyQuorumDelivers(t *testing.T) {
 		}
 	}
 
-	data, err := p2p.NewMessage(Protocol, "DATA", Instance("dealer", 9, hash), "dealer", "n0", ValueMessage{
+	select {
+	case d := <-b.Deliveries:
+		t.Fatalf("delivered without VAL: %+v", d)
+	default:
+	}
+
+	val, err := p2p.NewMessage(Protocol, "VAL", Instance("dealer", 9, hash), "dealer", "n0", ValueMessage{
 		Dealer: "dealer",
 		Seq:    9,
 		Value:  value,
@@ -116,7 +122,7 @@ func TestRBCDataAfterReadyQuorumDelivers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Handle(ctx, data); err != nil {
+	if err := b.Handle(ctx, val); err != nil {
 		t.Fatal(err)
 	}
 
@@ -126,51 +132,6 @@ func TestRBCDataAfterReadyQuorumDelivers(t *testing.T) {
 			t.Fatalf("bad delivery: %+v", d)
 		}
 	case <-ctx.Done():
-		t.Fatal("timed out waiting for delivery after DATA")
-	}
-}
-
-func TestRBCReadyQuorumRequestsDealerFirst(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	net := p2p.NewMemoryNetwork()
-	transport := net.NewTransport("n0", 16)
-	dealerTransport := net.NewTransport("dealer", 16)
-	b := New("n0", 4, 1, transport)
-
-	value := []byte("dealer-request-value")
-	hash := Digest(value)
-	for _, from := range []p2p.NodeID{"n1", "n2", "n3"} {
-		msg, err := p2p.NewMessage(Protocol, "READY", Instance("dealer", 12, hash), from, "n0", VoteMessage{
-			Dealer: "dealer",
-			Seq:    12,
-			Hash:   hash,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := b.Handle(ctx, msg); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for {
-		select {
-		case msg := <-dealerTransport.Inbox():
-			if msg.Type != "REQ" {
-				continue
-			}
-			req, err := p2p.DecodePayload[RequestMessage](msg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if req.Dealer != "dealer" || req.Seq != 12 || req.Hash != hash || msg.To != "dealer" {
-				t.Fatalf("bad dealer request: msg=%+v req=%+v", msg, req)
-			}
-			return
-		case <-ctx.Done():
-			t.Fatal("timed out waiting for dealer-first value request")
-		}
+		t.Fatal("timed out waiting for delivery after VAL")
 	}
 }

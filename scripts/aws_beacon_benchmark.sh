@@ -34,6 +34,7 @@ EPOCH_TIMEOUT_MS="${EPOCH_TIMEOUT_MS:-60000}"
 REPORT_MS="${REPORT_MS:-5000}"
 QUEUE_LEN="${QUEUE_LEN:-8}"
 LINGER_MS="${LINGER_MS:-120000}"
+MAX_POOL="${MAX_POOL:-8}"
 GOMAXPROCS_REMOTE="${GOMAXPROCS_REMOTE:-4}"
 STARTUP_WAIT_SEC="${STARTUP_WAIT_SEC:-}"
 RUN_COMMANDS_VIA_BASTION="${RUN_COMMANDS_VIA_BASTION:-0}"
@@ -687,7 +688,7 @@ generate_json_config() {
     printf '  "report_interval_ms": %d,\n' "$REPORT_MS"
     printf '  "linger_ms": %d,\n' "$LINGER_MS"
     printf '  "batch_size": 1,\n'
-    printf '  "max_pool": 16,\n'
+    printf '  "max_pool": %d,\n' "$MAX_POOL"
     printf '  "log_level": 1,\n'
     printf '  "seed": "%s",\n' "$(printf '%s-%s-%s' "$proto" "$M" "$N" | shasum -a 256 | awk '{print $1}')"
     printf '  "cluster_index": {\n'
@@ -823,8 +824,8 @@ remote_command_for_node() {
     tyche)
       local peers
       peers="$(< "$GEN_DIR/tyche_peers.txt")"
-      printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/tyche -transport tcp -node node%d -n %d -f %d -epochs %d -peers %q -listen 0.0.0.0:%d -producer-ms %d -prefill-ms %d -epoch-timeout-ms %d -report-ms %d > %q 2>&1' \
-        "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$node" "$N" "$BFT_F" "$EPOCHS" "$peers" "$port" "$PRODUCER_MS" "$PREFILL_MS" "$EPOCH_TIMEOUT_MS" "$REPORT_MS" "$log_file"
+      printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/tyche -transport tcp -node node%d -n %d -f %d -epochs %d -peers %q -listen 0.0.0.0:%d -producer-ms %d -prefill-ms %d -epoch-timeout-ms %d -report-ms %d -max-pool %d > %q 2>&1' \
+        "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$node" "$N" "$BFT_F" "$EPOCHS" "$peers" "$port" "$PRODUCER_MS" "$PREFILL_MS" "$EPOCH_TIMEOUT_MS" "$REPORT_MS" "$MAX_POOL" "$log_file"
       ;;
     asyrand|grandline|spurt)
       printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/%s -config benchmark/generated/aws_m%dn%d/%s.json -transport tcp -node node%d > %q 2>&1' \

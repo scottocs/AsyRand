@@ -34,9 +34,6 @@ type metricSnapshot struct {
 	cryptoActive  int64
 	cryptoQueued  int64
 	cryptoWorkers int
-	objActive     int64
-	objQueued     int64
-	objWorkers    int
 }
 
 const transportBuffer = 262144
@@ -529,12 +526,6 @@ func collectMetrics(nodes []*tyche.Node) metricSnapshot {
 			out.cryptoQueued += stats.Queued
 			out.cryptoWorkers += stats.Workers
 		}
-		if node.ObjCrypto != nil {
-			stats := node.ObjCrypto.Stats()
-			out.objActive += stats.Active
-			out.objQueued += stats.Queued
-			out.objWorkers += stats.Workers
-		}
 	}
 	return out
 }
@@ -592,9 +583,6 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 		cryptoActive:  m.cryptoActive,
 		cryptoQueued:  m.cryptoQueued,
 		cryptoWorkers: m.cryptoWorkers,
-		objActive:     m.objActive,
-		objQueued:     m.objQueued,
-		objWorkers:    m.objWorkers,
 	}
 }
 
@@ -615,7 +603,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 	if delta.sentMessages > 0 {
 		abaPct = float64(delta.abaMessages) * 100 / float64(delta.sentMessages)
 	}
-	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d transport_inbox=%d transport_inbox_cap=%d crypto_active=%d crypto_queued=%d crypto_workers=%d obj_crypto_active=%d obj_crypto_queued=%d obj_crypto_workers=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d transport_inbox=%d transport_inbox_cap=%d crypto_active=%d crypto_queued=%d crypto_workers=%d aba_sent_msgs=%d aba_msg_pct=%.2f aba_sent=%.2fKB pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s rbc_avg=%s aba_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
 		label,
 		beacons,
 		elapsed.Seconds(),
@@ -632,9 +620,6 @@ func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapsho
 		delta.cryptoActive,
 		delta.cryptoQueued,
 		delta.cryptoWorkers,
-		delta.objActive,
-		delta.objQueued,
-		delta.objWorkers,
 		delta.abaMessages,
 		abaPct,
 		float64(delta.abaBytes)/1024,
@@ -657,7 +642,7 @@ func printDebugSnapshots(nodes []*tyche.Node) {
 	}
 	for i := 0; i < limit; i++ {
 		s := nodes[i].DebugSnapshot()
-		fmt.Printf("stall_debug node=%s completed=%d next_epoch=%d source=%s seq=%d object=%t next_object=%t pending_abas=%d aba_input_sent=%t aba_input=%t aba_decided=%t aba_coin_wait=%t aba_round=%d aba_inputs=%d aba_input_true=%d aba_input_false=%d aba_finish=%d aba_bval_true=%d aba_bval_false=%d aba_bin_true=%t aba_bin_false=%t aba_aux=%d aba_conf=%d recon_sent=%t recon_done=%t recon_count=%d recon_need=%d echo_max=%d ready_max=%d certifying=%t certified=%t waiters=%d verified_cache=%d crypto_active=%d crypto_queued=%d crypto_workers=%d obj_crypto_active=%d obj_crypto_queued=%d obj_crypto_workers=%d\n",
+		fmt.Printf("stall_debug node=%s completed=%d next_epoch=%d source=%s seq=%d object=%t next_object=%t pending_abas=%d aba_input_sent=%t aba_input=%t aba_decided=%t aba_coin_wait=%t aba_round=%d aba_inputs=%d aba_input_true=%d aba_input_false=%d aba_finish=%d aba_bval_true=%d aba_bval_false=%d aba_bin_true=%t aba_bin_false=%t aba_aux=%d aba_conf=%d recon_sent=%t recon_done=%t recon_count=%d recon_need=%d echo_max=%d ready_max=%d certifying=%t certified=%t waiters=%d verified_cache=%d crypto_active=%d crypto_queued=%d crypto_workers=%d\n",
 			s.Node,
 			s.Completed,
 			s.NextEpoch,
@@ -694,9 +679,6 @@ func printDebugSnapshots(nodes []*tyche.Node) {
 			s.CryptoActive,
 			s.CryptoQueued,
 			s.CryptoWorkers,
-			s.ObjActive,
-			s.ObjQueued,
-			s.ObjWorkers,
 		)
 	}
 }
