@@ -35,11 +35,11 @@ class LocalOptions:
     prefill_ms: int = 3000
     epoch_timeout_ms: int = 15000
     report_ms: int = 5000
-    max_pool: int = 4
+    max_pool: int = 2
     transport_buffer: int = 0
     removal_expiration_ms: int = 0
     aggregation_lookahead: int = 8
-    gomaxprocs: int = 4
+    gomaxprocs: int = 8
 
 
 @dataclass(frozen=True)
@@ -71,11 +71,11 @@ class AwsOptions:
     epoch_timeout_ms: int = 60000
     report_ms: int = 5000
     linger_ms: int = 5000
-    max_pool: int = 16
+    max_pool: int = 2
     transport_buffer: int = 0
     removal_expiration_ms: int = 0
     aggregation_lookahead: int = 8
-    gomaxprocs: int = 4
+    gomaxprocs: int = 2
     startup_wait_sec: int | None = None
     ssh_connect_timeout: int = 6
     ssh_probe_retries: int = 1
@@ -752,11 +752,11 @@ def _local_run_config(n, epochs, protocol_list, fault_threshold):
         "prefill_ms": int(os.environ.get("PREFILL_MS", "3000")),
         "epoch_timeout_ms": int(os.environ.get("EPOCH_TIMEOUT_MS", "15000")),
         "report_ms": int(os.environ.get("REPORT_MS", "5000")),
-        "max_pool": int(os.environ.get("MAX_POOL", "4")),
+        "max_pool": int(os.environ.get("MAX_POOL", "2")),
         "transport_buffer": int(os.environ.get("TYCHE_TRANSPORT_BUFFER", "0")),
         "removal_expiration_ms": int(os.environ.get("TYCHE_REMOVAL_EXPIRATION_MS", "0")),
         "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
-        "gomaxprocs": int(os.environ.get("GOMAXPROCS_LOCAL", "4")),
+        "gomaxprocs": int(os.environ.get("GOMAXPROCS_LOCAL", "8")),
         "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
         "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", ""),
         "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", ""),
@@ -1565,11 +1565,11 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "epoch_timeout_ms": epoch_timeout_ms,
         "report_ms": int(os.environ.get("REPORT_MS", "5000")),
         "linger_ms": int(os.environ.get("LINGER_MS", "5000")),
-        "max_pool": int(os.environ.get("MAX_POOL", "16")),
+        "max_pool": int(os.environ.get("MAX_POOL", "2")),
         "transport_buffer": int(os.environ.get("TYCHE_TRANSPORT_BUFFER", "0")),
         "removal_expiration_ms": int(os.environ.get("TYCHE_REMOVAL_EXPIRATION_MS", "0")),
         "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
-        "gomaxprocs": int(os.environ.get("GOMAXPROCS_REMOTE", "4")),
+        "gomaxprocs": int(os.environ.get("GOMAXPROCS_REMOTE", "2")),
         "startup_wait_sec": int(os.environ["STARTUP_WAIT_SEC"]) if os.environ.get("STARTUP_WAIT_SEC") else None,
         "ssh_connect_timeout": int(os.environ.get("SSH_CONNECT_TIMEOUT", "6")),
         "ssh_probe_retries": int(os.environ.get("SSH_PROBE_RETRIES", "1")),
