@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/scottocs/Tyche/Tyche/crypto"
@@ -60,6 +62,67 @@ func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Broadcaster {
 
 func Instance(dealer p2p.NodeID, seq uint64, hash string) string {
 	return fmt.Sprintf("%s/%d/%s", dealer, seq, hash)
+}
+
+func parseInstance(instance string) (p2p.NodeID, uint64, bool) {
+	last := strings.LastIndex(instance, "/")
+	if last <= 0 {
+		return "", 0, false
+	}
+	prev := strings.LastIndex(instance[:last], "/")
+	if prev <= 0 {
+		return "", 0, false
+	}
+	seq, err := strconv.ParseUint(instance[prev+1:last], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return p2p.NodeID(instance[:prev]), seq, true
+}
+
+func (b *Broadcaster) PruneThrough(consumed map[p2p.NodeID]uint64) {
+	if len(consumed) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	shouldPrune := func(instance string) bool {
+		dealer, seq, ok := parseInstance(instance)
+		if !ok {
+			return false
+		}
+		return seq <= consumed[dealer]
+	}
+	for instance := range b.values {
+		if shouldPrune(instance) {
+			delete(b.values, instance)
+		}
+	}
+	for instance := range b.echoes {
+		if shouldPrune(instance) {
+			delete(b.echoes, instance)
+		}
+	}
+	for instance := range b.readies {
+		if shouldPrune(instance) {
+			delete(b.readies, instance)
+		}
+	}
+	for instance := range b.echoSent {
+		if shouldPrune(instance) {
+			delete(b.echoSent, instance)
+		}
+	}
+	for instance := range b.readySent {
+		if shouldPrune(instance) {
+			delete(b.readySent, instance)
+		}
+	}
+	for instance := range b.delivered {
+		if shouldPrune(instance) {
+			delete(b.delivered, instance)
+		}
+	}
 }
 
 func Digest(value []byte) string {

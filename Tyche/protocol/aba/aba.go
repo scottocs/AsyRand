@@ -74,6 +74,7 @@ type Agreement struct {
 
 	mu           sync.Mutex
 	state        map[string]*instanceState
+	pruned       map[string]bool
 	Decisions    chan Decision
 	CoinRequests chan CoinRequest
 }
@@ -111,6 +112,7 @@ func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Agreement {
 	return &Agreement{
 		ID: id, N: n, F: f, Transport: transport,
 		state:        make(map[string]*instanceState),
+		pruned:       make(map[string]bool),
 		Decisions:    make(chan Decision, n*4),
 		CoinRequests: make(chan CoinRequest, n*8),
 	}
@@ -118,7 +120,15 @@ func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Agreement {
 
 func (a *Agreement) Propose(ctx context.Context, instance string, value bool) error {
 	a.mu.Lock()
+	if _, ok := a.pruned[instance]; ok {
+		a.mu.Unlock()
+		return nil
+	}
 	st := a.get(instance)
+	if st.decided {
+		a.mu.Unlock()
+		return nil
+	}
 	first := !st.proposed
 	if !st.proposed {
 		st.proposed = true
@@ -174,6 +184,10 @@ func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
 
 func (a *Agreement) FeedCoin(ctx context.Context, instance string, round uint64, bit bool) {
 	a.mu.Lock()
+	if _, ok := a.pruned[instance]; ok {
+		a.mu.Unlock()
+		return
+	}
 	st := a.get(instance)
 	if st.decided {
 		a.mu.Unlock()
@@ -193,6 +207,9 @@ func (a *Agreement) FeedSeed(ctx context.Context, instance string, round uint64,
 func (a *Agreement) Status(instance string) Status {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if decision, ok := a.pruned[instance]; ok {
+		return Status{Instance: instance, Decided: true, Value: decision}
+	}
 	st := a.get(instance)
 	round := st.round
 	a.ensureRound(st, round)
@@ -215,10 +232,24 @@ func (a *Agreement) Status(instance string) Status {
 	}
 }
 
+func (a *Agreement) Prune(instance string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	st := a.state[instance]
+	if st == nil || !st.decided {
+		return
+	}
+	delete(a.state, instance)
+	a.pruned[instance] = st.decision
+}
+
 func (a *Agreement) get(instance string) *instanceState {
 	st := a.state[instance]
 	if st != nil {
 		return st
+	}
+	if decision, ok := a.pruned[instance]; ok {
+		return &instanceState{decided: true, decision: decision}
 	}
 	st = &instanceState{
 		inputs: make(map[p2p.NodeID]bool), inputCount: make(map[bool]int), finish: make(map[p2p.NodeID]bool),
@@ -502,7 +533,15 @@ func (a *Agreement) tryAdvanceWithCoin(ctx context.Context, instance string, rou
 
 func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round uint64, value bool) error {
 	a.mu.Lock()
+	if _, ok := a.pruned[instance]; ok {
+		a.mu.Unlock()
+		return nil
+	}
 	st := a.get(instance)
+	if st.decided {
+		a.mu.Unlock()
+		return nil
+	}
 	a.ensureRound(st, round)
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()
@@ -511,7 +550,15 @@ func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round ui
 
 func (a *Agreement) broadcastBValAsync(instance string, round uint64, value bool) {
 	a.mu.Lock()
+	if _, ok := a.pruned[instance]; ok {
+		a.mu.Unlock()
+		return
+	}
 	st := a.get(instance)
+	if st.decided {
+		a.mu.Unlock()
+		return
+	}
 	a.ensureRound(st, round)
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()

@@ -135,3 +135,33 @@ func TestRBCValAfterReadyQuorumDelivers(t *testing.T) {
 		t.Fatal("timed out waiting for delivery after VAL")
 	}
 }
+
+func TestPruneThroughKeepsFutureInstances(t *testing.T) {
+	b := New("n0", 4, 1, nil)
+	oldHash := Digest([]byte("old"))
+	futureHash := Digest([]byte("future"))
+	old := Instance("dealer", 3, oldHash)
+	future := Instance("dealer", 4, futureHash)
+
+	b.values[old] = ValueMessage{Dealer: "dealer", Seq: 3, Value: []byte("old"), Hash: oldHash}
+	b.echoes[old] = map[p2p.NodeID]bool{"n1": true}
+	b.readies[old] = map[p2p.NodeID]bool{"n2": true}
+	b.echoSent[old] = true
+	b.readySent[old] = true
+	b.delivered[old] = true
+
+	b.values[future] = ValueMessage{Dealer: "dealer", Seq: 4, Value: []byte("future"), Hash: futureHash}
+	b.echoes[future] = map[p2p.NodeID]bool{"n1": true}
+	b.readies[future] = map[p2p.NodeID]bool{"n2": true}
+	b.echoSent[future] = true
+	b.readySent[future] = true
+	b.delivered[future] = true
+
+	b.PruneThrough(map[p2p.NodeID]uint64{"dealer": 3})
+	if b.values[old].Value != nil || b.echoes[old] != nil || b.readies[old] != nil || b.echoSent[old] || b.readySent[old] || b.delivered[old] {
+		t.Fatal("old RBC instance was retained")
+	}
+	if b.values[future].Value == nil || b.echoes[future] == nil || b.readies[future] == nil || !b.echoSent[future] || !b.readySent[future] || !b.delivered[future] {
+		t.Fatal("future RBC instance was pruned")
+	}
+}
