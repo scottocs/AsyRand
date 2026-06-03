@@ -22,6 +22,14 @@ type runStats struct {
 	beacons atomic.Uint64
 }
 
+type finalMetricWindow struct {
+	started bool
+	start   time.Time
+	metrics metricSnapshot
+	perf    tyche.PerfSnapshot
+	beacons uint64
+}
+
 type metricSnapshot struct {
 	sentMessages  uint64
 	sentBytes     uint64
@@ -173,9 +181,7 @@ func runMemory(opts runOptions) error {
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
-	benchStart := time.Now()
-	benchMetrics := collectMetrics(nodes)
-	benchPerf := collectPerf(nodes)
+	var finalWindow finalMetricWindow
 
 	for epoch := 1; epoch <= opts.epochs; epoch++ {
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
@@ -201,10 +207,11 @@ func runMemory(opts runOptions) error {
 		cancelEpoch()
 		stats.beacons.Add(1)
 		fmt.Printf("epoch=%d source=%s seq=%d random=%x\n", sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
+		finalWindow.recordBeacon(nodes)
 	}
 
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	finalWindow.print(nodes, queueTotal, queueMax)
 	printMessageTypeMetrics(nodes)
 	return nil
 }
@@ -274,9 +281,7 @@ func runTCP(opts runOptions) error {
 	if completed := node.CompletedEpoch(); completed > 0 {
 		fmt.Printf("node=%s prefilled_epochs=%d counted=0\n", opts.nodeID, completed)
 	}
-	benchStart := time.Now()
-	benchMetrics := collectMetrics(nodes)
-	benchPerf := collectPerf(nodes)
+	var finalWindow finalMetricWindow
 
 	for counted := 0; counted < opts.epochs; counted++ {
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
@@ -288,9 +293,10 @@ func runTCP(opts runOptions) error {
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
+		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	finalWindow.print(nodes, queueTotal, queueMax)
 	printMessageTypeMetrics(nodes)
 	return nil
 }
@@ -568,6 +574,25 @@ func collectPerf(nodes []*tyche.Node) tyche.PerfSnapshot {
 		}
 	}
 	return out
+}
+
+func (w *finalMetricWindow) recordBeacon(nodes []*tyche.Node) {
+	if !w.started {
+		w.started = true
+		w.start = time.Now()
+		w.metrics = collectMetrics(nodes)
+		w.perf = collectPerf(nodes)
+		return
+	}
+	w.beacons++
+}
+
+func (w *finalMetricWindow) print(nodes []*tyche.Node, queueTotal int, queueMax int) {
+	if !w.started {
+		printMetricDelta("final", metricSnapshot{}, tyche.PerfSnapshot{}, queueTotal, queueMax, 0, 0)
+		return
+	}
+	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {

@@ -31,6 +31,14 @@ type runStats struct {
 	beacons atomic.Uint64
 }
 
+type finalMetricWindow struct {
+	started bool
+	start   time.Time
+	metrics metricSnapshot
+	perf    asyrand.PerfSnapshot
+	beacons uint64
+}
+
 func main() {
 	configPath := flag.String("config", "", "cluster configuration file")
 	nodeID := flag.String("node", "", "node id for single-process TCP deployment; empty starts an in-memory local cluster")
@@ -88,9 +96,7 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
-	benchStart := time.Now()
-	benchMetrics := collectMetrics(nodes)
-	benchPerf := collectPerf(nodes)
+	var finalWindow finalMetricWindow
 
 	removedRetries := 0
 	maxRemovedRetries := cfg.F + 1
@@ -145,9 +151,10 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("epoch=%d source=%s consumed=%d/%d commit=%s random=%x\n", sample.Epoch, sample.Source, consumedCount, len(nodes), sample.CommitID, sample.Random[:8])
+		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	finalWindow.print(nodes, queueTotal, queueMax)
 	return nil
 }
 
@@ -182,9 +189,7 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
-	benchStart := time.Now()
-	benchMetrics := collectMetrics(nodes)
-	benchPerf := collectPerf(nodes)
+	var finalWindow finalMetricWindow
 
 	removedRetries := 0
 	maxRemovedRetries := cfg.F + 1
@@ -212,9 +217,10 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("node=%s epoch=%d source=%s consumed=%t commit=%s random=%x\n", node.ID, beacon.Epoch, beacon.Source, consumed, beacon.CommitID, beacon.Random[:8])
+		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	finalWindow.print(nodes, queueTotal, queueMax)
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -350,6 +356,25 @@ func collectQueue(nodes []*asyrand.Node) (total int, max int) {
 		}
 	}
 	return total, max
+}
+
+func (w *finalMetricWindow) recordBeacon(nodes []*asyrand.Node) {
+	if !w.started {
+		w.started = true
+		w.start = time.Now()
+		w.metrics = collectMetrics(nodes)
+		w.perf = collectPerf(nodes)
+		return
+	}
+	w.beacons++
+}
+
+func (w *finalMetricWindow) print(nodes []*asyrand.Node, queueTotal int, queueMax int) {
+	if !w.started {
+		printMetricDelta("final", metricSnapshot{}, asyrand.PerfSnapshot{}, queueTotal, queueMax, 0, 0)
+		return
+	}
+	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {

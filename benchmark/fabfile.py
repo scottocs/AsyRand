@@ -28,7 +28,7 @@ def local(
     ctx,
     nodes=8,
     epochs=1000,
-    protocols="tyche,tyche-reconfig,asyrand,grandline,spurt",
+    protocols="tyche,tyche-scrape,asyrand,grandline,spurt",
     out="",
     fault_threshold="",
 ):
