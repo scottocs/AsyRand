@@ -25,6 +25,9 @@ FIELDS = [
     "last_skip_reason",
     "last_skip_diag",
     "log",
+    "run_id",
+    "run_time",
+    "source_run",
 ]
 
 
@@ -201,6 +204,12 @@ def parse_log(protocol, log_file, regions):
     }
 
 
+def format_mtime(timestamp):
+    from datetime import datetime
+
+    return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
 def configured_protocols(run_dir):
     config_path = run_dir / "run_config.json"
     if not config_path.exists():
@@ -260,12 +269,36 @@ def protocol_dirs(run_dir, source):
     return [(protocol, path) for protocol, (_, path) in latest.items()]
 
 
+def stamp_rows(rows, source):
+    if not rows:
+        return rows
+    latest_mtime = 0.0
+    for row in rows:
+        try:
+            latest_mtime = max(latest_mtime, Path(row["log"]).stat().st_mtime)
+        except OSError:
+            pass
+    run_time = format_mtime(latest_mtime) if latest_mtime else ""
+    return [
+        {
+            **row,
+            "run_id": source,
+            "run_time": run_time,
+            "source_run": source,
+        }
+        for row in rows
+    ]
+
+
 def write_protocol_run_log(rows, out_path):
     stats = {}
     for row in rows:
         protocol = row["protocol"]
         log_file = Path(row["log"])
-        entry = stats.setdefault(protocol, {"rows": 0, "latest_mtime": 0.0, "latest_log": ""})
+        entry = stats.setdefault(
+            protocol,
+            {"rows": 0, "latest_mtime": 0.0, "latest_log": "", "source_run": row.get("source_run", "")},
+        )
         entry["rows"] += 1
         try:
             mtime = log_file.stat().st_mtime
@@ -274,56 +307,59 @@ def write_protocol_run_log(rows, out_path):
         if mtime >= entry["latest_mtime"]:
             entry["latest_mtime"] = mtime
             entry["latest_log"] = row["log"]
+            entry["source_run"] = row.get("source_run", entry["source_run"])
 
     with out_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["protocol", "rows", "latest_log"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["protocol", "latest_run_time", "rows", "source_run", "latest_log"],
+        )
         writer.writeheader()
         for protocol in sorted(stats):
             writer.writerow(
                 {
                     "protocol": protocol,
+                    "latest_run_time": format_mtime(stats[protocol]["latest_mtime"])
+                    if stats[protocol]["latest_mtime"]
+                    else "",
                     "rows": stats[protocol]["rows"],
+                    "source_run": stats[protocol]["source_run"],
                     "latest_log": stats[protocol]["latest_log"],
                 }
             )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Recalculate benchmark results.csv from node logs.")
-    parser.add_argument("run_dir", nargs="?", default=str(SCRIPT_DIR / "runs" / "aws_n96_e100"))
-    parser.add_argument("--output", default="", help="Output CSV path. Defaults to <run_dir>/results.csv.")
-    parser.add_argument(
-        "--source",
-        choices=["root", "attempts", "latest"],
-        default="root",
-        help=(
-            "Log source. root uses <run>/<protocol> only, which is the normal latest published layout; "
-            "attempts uses every attempts/*/<protocol>; latest picks the newest protocol directory across both."
-        ),
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Print rows and do not write files.")
-    args = parser.parse_args()
-
-    run_dir = Path(args.run_dir)
+def resolve_run_dir(raw):
+    run_dir = Path(raw)
     if not run_dir.is_absolute():
         run_dir = (Path.cwd() / run_dir).resolve()
     else:
         run_dir = run_dir.resolve()
     if not run_dir.exists():
         raise SystemExit(f"run directory does not exist: {run_dir}")
-    out_path = Path(args.output).resolve() if args.output else run_dir / "results.csv"
+    return run_dir
+
+
+def default_run_dirs():
+    runs_dir = SCRIPT_DIR / "runs"
+    return sorted(path.resolve() for path in runs_dir.glob("aws_n*") if path.is_dir())
+
+
+def recalc_run(run_dir, output, source, dry_run):
+    out_path = Path(output).resolve() if output else run_dir / "results.csv"
     rows = []
     errors = []
     regions = settings_regions(run_dir)
 
-    for protocol, path in protocol_dirs(run_dir, args.source):
+    for protocol, path in protocol_dirs(run_dir, source):
         for log_file in sorted(path.glob("node*.log"), key=node_index_from_path):
             try:
                 rows.append(parse_log(protocol, log_file, regions))
             except ValueError as exc:
                 errors.append((protocol, log_file, str(exc)))
+    rows = stamp_rows(rows, source)
 
-    if args.dry_run:
+    if dry_run:
         writer = csv.DictWriter(sys.stdout, fieldnames=FIELDS)
         writer.writeheader()
         writer.writerows(rows)
@@ -336,12 +372,54 @@ def main():
         if out_path == run_dir / "results.csv":
             write_protocol_run_log(rows, run_dir / "protocol_run_log.csv")
 
-    print(f"parsed rows: {len(rows)}")
-    print(f"output: {out_path}")
-    if errors:
-        print(f"parse errors: {len(errors)}")
-        for protocol, log_file, error in errors[:20]:
-            print(f"{protocol} {log_file}: {error}")
+    return rows, out_path, errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Recalculate benchmark results.csv from node logs.")
+    parser.add_argument(
+        "run_dirs",
+        nargs="*",
+        help="Run directories to recalculate. Defaults to every benchmark/runs/aws_n* directory.",
+    )
+    parser.add_argument("--output", default="", help="Output CSV path. Only valid with one run directory.")
+    parser.add_argument(
+        "--source",
+        choices=["root", "attempts", "latest"],
+        default="root",
+        help=(
+            "Log source. root uses <run>/<protocol> only, which is the normal latest published layout; "
+            "attempts uses every attempts/*/<protocol>; latest picks the newest protocol directory across both."
+        ),
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print rows and do not write files.")
+    args = parser.parse_args()
+
+    run_dirs = [resolve_run_dir(raw) for raw in args.run_dirs] if args.run_dirs else default_run_dirs()
+    if not run_dirs:
+        raise SystemExit(f"no run directories found under {SCRIPT_DIR / 'runs'}")
+    if args.output and len(run_dirs) != 1:
+        raise SystemExit("--output is only valid when recalculating one run directory")
+    if args.dry_run and len(run_dirs) != 1:
+        raise SystemExit("--dry-run is only valid when recalculating one run directory")
+
+    total_rows = 0
+    total_errors = 0
+    for run_dir in run_dirs:
+        rows, out_path, errors = recalc_run(run_dir, args.output, args.source, args.dry_run)
+        total_rows += len(rows)
+        total_errors += len(errors)
+        print(f"parsed rows: {len(rows)}")
+        print(f"output: {out_path}")
+        if errors:
+            print(f"parse errors: {len(errors)}")
+            for protocol, log_file, error in errors[:20]:
+                print(f"{protocol} {log_file}: {error}")
+    if len(run_dirs) > 1:
+        print(f"recalculated runs: {len(run_dirs)}")
+        print(f"total parsed rows: {total_rows}")
+        if total_errors:
+            print(f"total parse errors: {total_errors}")
 
 
 if __name__ == "__main__":

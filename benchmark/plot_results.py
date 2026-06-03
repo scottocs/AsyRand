@@ -18,11 +18,33 @@ COLORS = {
     "spurt": "#dc2626",
 }
 EXPECTED_NODES = list(range(8, 97, 8))
+METRICS = {
+    "throughput": {
+        "column": "throughput_beacon_min",
+        "summary": "throughput_summary",
+        "title": "Beacon Throughput vs Cluster Size",
+        "ylabel": "Avg Throughput (beacons/min per node)",
+        "precision": 4,
+    },
+    "cpu": {
+        "column": "cpu_percent",
+        "summary": "cpu_summary",
+        "title": "CPU Utilization vs Cluster Size",
+        "ylabel": "Avg CPU utilization (%)",
+        "precision": 2,
+    },
+    "bandwidth": {
+        "column": "bandwidth_kbps",
+        "summary": "bandwidth_summary",
+        "title": "Bandwidth vs Cluster Size",
+        "ylabel": "Avg Bandwidth (KB/s per node)",
+        "precision": 2,
+    },
+}
 
 
 def read_results():
-    data = defaultdict(lambda: defaultdict(list))
-    run_counts = defaultdict(lambda: defaultdict(int))
+    data = {metric: defaultdict(lambda: defaultdict(list)) for metric in METRICS}
 
     for run_dir in sorted(RUNS_DIR.glob("aws_n*")):
         config_path = run_dir / "run_config.json"
@@ -63,16 +85,16 @@ def read_results():
             run_time = row.get("run_time") or ""
             if (run_time, run_key) != latest_key_by_protocol.get(protocol):
                 continue
-            try:
-                throughput = float(row.get("throughput_beacon_min") or 0)
-            except ValueError:
-                continue
-            if throughput <= 0:
-                continue
-            data[protocol][node_count].append(throughput)
-            run_counts[protocol][node_count] += 1
+            for metric, config in METRICS.items():
+                try:
+                    value = float(row.get(config["column"]) or 0)
+                except ValueError:
+                    continue
+                if value <= 0:
+                    continue
+                data[metric][protocol][node_count].append(value)
 
-    return data, run_counts
+    return data
 
 
 def summarize(data):
@@ -96,8 +118,9 @@ def summarize(data):
     return rows
 
 
-def write_summary_csv(rows):
-    out_path = RUNS_DIR / "throughput_summary.csv"
+def write_summary_csv(rows, config):
+    out_path = RUNS_DIR / f"{config['summary']}.csv"
+    precision = config["precision"]
     with out_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
@@ -110,10 +133,10 @@ def write_summary_csv(rows):
                     "protocol": row["protocol"],
                     "nodes": row["nodes"],
                     "samples": row["samples"],
-                    "mean": f"{row['mean']:.6f}",
-                    "stdev": f"{row['stdev']:.6f}",
-                    "min": f"{row['min']:.6f}",
-                    "max": f"{row['max']:.6f}",
+                    "mean": f"{row['mean']:.{precision}f}",
+                    "stdev": f"{row['stdev']:.{precision}f}",
+                    "min": f"{row['min']:.{precision}f}",
+                    "max": f"{row['max']:.{precision}f}",
                 }
             )
     return out_path
@@ -130,7 +153,7 @@ def nice_upper(value):
     return 10 * magnitude
 
 
-def build_svg(rows):
+def build_svg(rows, config):
     available_nodes = sorted({row["nodes"] for row in rows})
     width = max(760, min(940, 520 + len(available_nodes) * 64))
     height = 640
@@ -169,7 +192,7 @@ def build_svg(rows):
         ".legend{font-size:14px}",
         "</style>",
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="{width / 2}" y="30" text-anchor="middle" class="title">Beacon Throughput vs Cluster Size</text>',
+        f'<text x="{width / 2}" y="30" text-anchor="middle" class="title">{html.escape(config["title"])}</text>',
     ]
 
     y_ticks = 6
@@ -189,7 +212,7 @@ def build_svg(rows):
     parts.append(f'<text x="{left + plot_w / 2}" y="{height - 30}" text-anchor="middle" class="label">Number of Nodes</text>')
     parts.append(
         f'<text transform="translate(24 {top + plot_h / 2}) rotate(-90)" text-anchor="middle" class="label">'
-        "Avg Throughput (beacons/min per node)</text>"
+        f"{html.escape(config['ylabel'])}</text>"
     )
 
     by_protocol = defaultdict(list)
@@ -233,38 +256,24 @@ def build_svg(rows):
     return "\n".join(parts)
 
 
-def write_html(svg, rows):
-    out_path = RUNS_DIR / "throughput_summary.html"
+def metric_table(rows, config):
     table_rows = []
+    precision = config["precision"]
     for row in rows:
         table_rows.append(
             "<tr>"
             f"<td>{html.escape(row['protocol'])}</td>"
             f"<td>{row['nodes']}</td>"
             f"<td>{row['samples']}</td>"
-            f"<td>{row['mean']:.4f}</td>"
-            f"<td>{row['stdev']:.4f}</td>"
-            f"<td>{row['min']:.4f}</td>"
-            f"<td>{row['max']:.4f}</td>"
+            f"<td>{row['mean']:.{precision}f}</td>"
+            f"<td>{row['stdev']:.{precision}f}</td>"
+            f"<td>{row['min']:.{precision}f}</td>"
+            f"<td>{row['max']:.{precision}f}</td>"
             "</tr>"
         )
-    page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Beacon Throughput vs Cluster Size</title>
-<style>
-body {{ font-family: Arial, Helvetica, sans-serif; margin: 28px; color: #111827; }}
-.chart {{ max-width: 100%; }}
-.chart svg {{ max-width: 100%; height: auto; }}
-table {{ border-collapse: collapse; margin-top: 18px; font-size: 13px; }}
-th, td {{ border: 1px solid #d1d5db; padding: 6px 9px; text-align: right; }}
-th:first-child, td:first-child {{ text-align: left; }}
-th {{ background: #f3f4f6; }}
-</style>
-</head>
-<body>
-<div class="chart">{svg}</div>
+    return f"""
+<section>
+<h2>{html.escape(config['title'])}</h2>
 <table>
 <thead>
 <tr><th>protocol</th><th>nodes</th><th>samples</th><th>mean</th><th>stdev</th><th>min</th><th>max</th></tr>
@@ -273,6 +282,38 @@ th {{ background: #f3f4f6; }}
 {''.join(table_rows)}
 </tbody>
 </table>
+</section>"""
+
+
+def write_html(charts, summaries):
+    out_path = RUNS_DIR / "throughput_summary.html"
+    chart_blocks = []
+    table_blocks = []
+    for metric, svg in charts.items():
+        config = METRICS[metric]
+        chart_blocks.append(f'<section class="chart"><h2>{html.escape(config["title"])}</h2>{svg}</section>')
+        table_blocks.append(metric_table(summaries[metric], config))
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Benchmark Comparisons</title>
+<style>
+body {{ font-family: Arial, Helvetica, sans-serif; margin: 28px; color: #111827; }}
+.chart {{ max-width: 100%; margin-bottom: 34px; }}
+.chart svg {{ max-width: 100%; height: auto; }}
+h1 {{ font-size: 26px; margin: 0 0 22px; }}
+h2 {{ font-size: 18px; margin: 22px 0 10px; }}
+table {{ border-collapse: collapse; margin-top: 18px; font-size: 13px; }}
+th, td {{ border: 1px solid #d1d5db; padding: 6px 9px; text-align: right; }}
+th:first-child, td:first-child {{ text-align: left; }}
+th {{ background: #f3f4f6; }}
+</style>
+</head>
+<body>
+<h1>Benchmark Comparisons</h1>
+{''.join(chart_blocks)}
+{''.join(table_blocks)}
 </body>
 </html>"""
     out_path.write_text(page, encoding="utf-8")
@@ -280,18 +321,26 @@ th {{ background: #f3f4f6; }}
 
 
 def main():
-    data, _ = read_results()
-    rows = summarize(data)
-    csv_path = write_summary_csv(rows)
-    svg = build_svg(rows)
-    svg_path = RUNS_DIR / "throughput_summary.svg"
-    svg_path.write_text(svg, encoding="utf-8")
-    html_path = write_html(svg, rows)
+    data = read_results()
+    summaries = {metric: summarize(metric_data) for metric, metric_data in data.items()}
+    csv_paths = {}
+    svg_paths = {}
+    charts = {}
+    for metric, rows in summaries.items():
+        config = METRICS[metric]
+        csv_paths[metric] = write_summary_csv(rows, config)
+        svg = build_svg(rows, config)
+        charts[metric] = svg
+        svg_path = RUNS_DIR / f"{config['summary']}.svg"
+        svg_path.write_text(svg, encoding="utf-8")
+        svg_paths[metric] = svg_path
+    html_path = write_html(charts, summaries)
 
-    available_nodes = sorted({row["nodes"] for row in rows})
+    available_nodes = sorted({row["nodes"] for rows in summaries.values() for row in rows})
     print(f"Loaded node counts: {available_nodes}")
-    print(f"Saved CSV:  {csv_path}")
-    print(f"Saved SVG:  {svg_path}")
+    for metric in METRICS:
+        print(f"Saved {metric} CSV: {csv_paths[metric]}")
+        print(f"Saved {metric} SVG: {svg_paths[metric]}")
     print(f"Saved HTML: {html_path}")
 
 
