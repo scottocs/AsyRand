@@ -355,7 +355,7 @@ func (a *Agreement) handleBVal(ctx context.Context, instance string, from p2p.No
 	if count >= a.quorum() {
 		st.bin[round][value] = true
 	}
-	sendAux := len(st.bin[round]) > 0
+	sendAux := len(st.bin[round]) > 0 && !st.auxSent[round]
 	auxValue := value
 	if sendAux {
 		if st.bin[round][st.est] {
@@ -452,6 +452,9 @@ func (a *Agreement) processPendingAuxLocked(st *instanceState, round uint64) (bo
 		delete(st.auxPending[round], from)
 	}
 	if len(st.aux[round]) < a.quorum() {
+		return false, nil
+	}
+	if st.confSent[round] {
 		return false, nil
 	}
 	values := make([]bool, 0, len(st.auxVal[round]))

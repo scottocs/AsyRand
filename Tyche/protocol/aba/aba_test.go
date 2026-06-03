@@ -106,6 +106,45 @@ func TestPruneDropsDecidedStateAndIgnoresLateMessages(t *testing.T) {
 	}
 }
 
+func TestProcessPendingAuxSendsConfOnce(t *testing.T) {
+	a := New("n0", 4, 1, nil)
+	st := a.get(EpochInstance(8, "n0"))
+	a.ensureRound(st, 0)
+	st.bin[0][true] = true
+	st.auxPending[0]["n0"] = true
+	st.auxPending[0]["n1"] = true
+	st.auxPending[0]["n2"] = true
+
+	send, values := a.processPendingAuxLocked(st, 0)
+	if !send || len(values) != 1 || !values[0] {
+		t.Fatalf("expected one true CONF trigger, send=%v values=%v", send, values)
+	}
+	send, values = a.processPendingAuxLocked(st, 0)
+	if send || values != nil {
+		t.Fatalf("CONF trigger repeated, send=%v values=%v", send, values)
+	}
+}
+
+func TestBValSendsAuxOncePerRound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	net := p2p.NewMemoryNetwork()
+	transport := net.NewTransport("n0", 64)
+	a := New("n0", 4, 1, transport)
+	instance := EpochInstance(9, "n0")
+
+	a.handleBVal(ctx, instance, "n0", 0, true)
+	a.handleBVal(ctx, instance, "n1", 0, true)
+	a.handleBVal(ctx, instance, "n2", 0, true)
+	a.handleBVal(ctx, instance, "n3", 0, true)
+
+	stats := transport.MessageTypeMetrics()["aba/AUX"]
+	if stats.SentMessages != 1 {
+		t.Fatalf("AUX broadcast count = %d, want 1", stats.SentMessages)
+	}
+}
+
 func newTestAgreements(ctx context.Context, t *testing.T) ([]*Agreement, []p2p.Transport) {
 	t.Helper()
 	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
