@@ -32,6 +32,14 @@ type runStats struct {
 	beacons atomic.Uint64
 }
 
+type finalMetricWindow struct {
+	started bool
+	start   time.Time
+	metrics metricSnapshot
+	perf    grandline.PerfSnapshot
+	beacons uint64
+}
+
 func main() {
 	configPath := flag.String("config", "configs/local_8.json", "cluster configuration file")
 	nodeID := flag.String("node", "", "node id for single-process TCP deployment; empty starts an in-memory cluster")
@@ -90,9 +98,8 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
-	benchStart := time.Now()
-	benchMetrics := collectMetrics(nodes)
-	benchPerf := collectPerf(nodes)
+	runStart := time.Now()
+	var finalWindow finalMetricWindow
 
 	limit := uint64(cfg.Round)
 	if duration > 0 {
@@ -126,20 +133,21 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 			}
 		}
 		if sample != nil && sample.Skipped {
-			fmt.Printf("epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+			fmt.Printf("ts=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
 			continue
 		}
 		stats.beacons.Add(1)
 		if sample != nil {
-			fmt.Printf("epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n",
-				sample.Epoch, sample.Commit, sample.Shares, sample.SigHex[:16], sample.Random[:8])
+			fmt.Printf("ts=%s epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n",
+				logTimestamp(), sample.Epoch, sample.Commit, sample.Shares, sample.SigHex[:16], sample.Random[:8])
 		}
-		if duration > 0 && time.Since(benchStart) >= duration {
+		finalWindow.recordBeacon(nodes)
+		if duration > 0 && time.Since(runStart) >= duration {
 			break
 		}
 	}
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	finalWindow.print(nodes, queueTotal, queueMax)
 	return nil
 }
 
@@ -179,11 +187,10 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
 	count := uint64(0)
 	nodes := []*grandline.Node{node}
-	benchStart := time.Now()
-	benchMetrics := collectMetrics(nodes)
-	benchPerf := collectPerf(nodes)
+	runStart := time.Now()
+	var finalWindow finalMetricWindow
 	for {
-		if duration > 0 && time.Since(benchStart) >= duration {
+		if duration > 0 && time.Since(runStart) >= duration {
 			break
 		}
 		if uint64(cfg.Round) > 0 && count >= uint64(cfg.Round) {
@@ -194,15 +201,20 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 			return err
 		}
 		if b != nil && b.Skipped {
-			fmt.Printf("node=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", node.ID, b.Epoch, b.SkipStage, b.SkipReason, b.Random[:8], b.SkipDiag)
+			fmt.Printf("ts=%s node=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), node.ID, b.Epoch, b.SkipStage, b.SkipReason, b.Random[:8], b.SkipDiag)
 			count++
 			continue
 		}
 		count++
 		stats.beacons.Add(1)
+		if b != nil {
+			fmt.Printf("ts=%s node=%s epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n",
+				logTimestamp(), node.ID, b.Epoch, b.Commit, b.Shares, b.SigHex[:16], b.Random[:8])
+		}
+		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta("final", collectMetrics(nodes).sub(benchMetrics), collectPerf(nodes).Sub(benchPerf), queueTotal, queueMax, time.Since(benchStart), stats.beacons.Load())
+	finalWindow.print(nodes, queueTotal, queueMax)
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -367,6 +379,25 @@ func collectQueue(nodes []*grandline.Node) (total int, max int) {
 	return total, max
 }
 
+func (w *finalMetricWindow) recordBeacon(nodes []*grandline.Node) {
+	if !w.started {
+		w.started = true
+		w.start = time.Now()
+		w.metrics = collectMetrics(nodes)
+		w.perf = collectPerf(nodes)
+		return
+	}
+	w.beacons++
+}
+
+func (w *finalMetricWindow) print(nodes []*grandline.Node, queueTotal int, queueMax int) {
+	if !w.started {
+		printMetricDelta("final", metricSnapshot{}, grandline.PerfSnapshot{}, queueTotal, queueMax, 0, 0)
+		return
+	}
+	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
+}
+
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 	return metricSnapshot{
 		sentMessages: m.sentMessages - prev.sentMessages,
@@ -379,6 +410,10 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 func printMetrics(label string, nodes []*grandline.Node, elapsed time.Duration, beacons uint64) {
 	queueTotal, queueMax := collectQueue(nodes)
 	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), queueTotal, queueMax, elapsed, beacons)
+}
+
+func logTimestamp() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func printMetricDelta(label string, delta metricSnapshot, perf grandline.PerfSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {

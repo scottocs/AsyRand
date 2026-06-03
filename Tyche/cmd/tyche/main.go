@@ -206,7 +206,7 @@ func runMemory(opts runOptions) error {
 		}
 		cancelEpoch()
 		stats.beacons.Add(1)
-		fmt.Printf("epoch=%d source=%s seq=%d random=%x\n", sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
+		fmt.Printf("ts=%s epoch=%d source=%s seq=%d random=%x\n", logTimestamp(), sample.Epoch, sample.Source, sample.Seq, sample.Random[:8])
 		finalWindow.recordBeacon(nodes)
 	}
 
@@ -292,7 +292,7 @@ func runTCP(opts runOptions) error {
 			return fmt.Errorf("epoch %d: %w", counted+1, err)
 		}
 		stats.beacons.Add(1)
-		fmt.Printf("node=%s epoch=%d source=%s seq=%d random=%x\n", opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
+		fmt.Printf("ts=%s node=%s epoch=%d source=%s seq=%d random=%x\n", logTimestamp(), opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
 		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
@@ -617,6 +617,10 @@ func printMetrics(label string, nodes []*tyche.Node, elapsed time.Duration, beac
 	if label == "final" {
 		printMessageTypeMetrics(nodes)
 	}
+}
+
+func logTimestamp() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func printMetricDelta(label string, delta metricSnapshot, perf tyche.PerfSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {

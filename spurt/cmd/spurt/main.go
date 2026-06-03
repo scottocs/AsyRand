@@ -133,13 +133,13 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 			return fmt.Errorf("epoch %d produced no beacon", epoch)
 		}
 		if sample.Skipped {
-			fmt.Printf("epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
-				sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+			fmt.Printf("ts=%s epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
+				logTimestamp(), sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
 			continue
 		}
 		stats.beacons.Add(1)
-		fmt.Printf("epoch=%d leader=%s digest=%s selected=%d random=%x\n",
-			sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.Digest, sample.Committeds, sample.Random[:8])
+		fmt.Printf("ts=%s epoch=%d leader=%s digest=%s selected=%d random=%x\n",
+			logTimestamp(), sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.Digest, sample.Committeds, sample.Random[:8])
 		finalWindow.recordBeacon(nodes)
 	}
 	cacheTotal, cacheMax := collectCachedCommitments(nodes)
@@ -192,13 +192,13 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		}
 		count++
 		if b.Skipped {
-			fmt.Printf("node=%s epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
-				node.ID, b.Epoch, node.State.Leader(b.Epoch), b.SkipStage, b.SkipReason, b.Random[:8], b.SkipDiag)
+			fmt.Printf("ts=%s node=%s epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
+				logTimestamp(), node.ID, b.Epoch, node.State.Leader(b.Epoch), b.SkipStage, b.SkipReason, b.Random[:8], b.SkipDiag)
 			continue
 		}
 		stats.beacons.Add(1)
-		fmt.Printf("node=%s epoch=%d leader=%s digest=%s random=%x\n",
-			node.ID, b.Epoch, node.State.Leader(b.Epoch), b.Digest, b.Random[:8])
+		fmt.Printf("ts=%s node=%s epoch=%d leader=%s digest=%s random=%x\n",
+			logTimestamp(), node.ID, b.Epoch, node.State.Leader(b.Epoch), b.Digest, b.Random[:8])
 		finalWindow.recordBeacon([]*spurt.Node{node})
 	}
 	nodes := []*spurt.Node{node}
@@ -393,6 +393,10 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 func printMetrics(label string, nodes []*spurt.Node, elapsed time.Duration, beacons uint64) {
 	cacheTotal, cacheMax := collectCachedCommitments(nodes)
 	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), cacheTotal, cacheMax, elapsed, beacons)
+}
+
+func logTimestamp() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func printMetricDelta(label string, delta metricSnapshot, perf spurt.PerfSnapshot, cacheTotal int, cacheMax int, elapsed time.Duration, beacons uint64) {

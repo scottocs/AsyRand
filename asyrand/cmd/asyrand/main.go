@@ -137,7 +137,7 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 				for _, node := range nodes {
 					sample = node.SkipCurrentEpoch("", "source_unavailable")
 				}
-				fmt.Printf("epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+				fmt.Printf("ts=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
 				removedRetries = 0
 				continue
 			}
@@ -146,11 +146,11 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 		}
 		removedRetries = 0
 		if sample.Skipped {
-			fmt.Printf("epoch=%d source=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n", sample.Epoch, sample.Source, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
+			fmt.Printf("ts=%s epoch=%d source=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), sample.Epoch, sample.Source, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
 			continue
 		}
 		stats.beacons.Add(1)
-		fmt.Printf("epoch=%d source=%s consumed=%d/%d commit=%s random=%x\n", sample.Epoch, sample.Source, consumedCount, len(nodes), sample.CommitID, sample.Random[:8])
+		fmt.Printf("ts=%s epoch=%d source=%s consumed=%d/%d commit=%s random=%x\n", logTimestamp(), sample.Epoch, sample.Source, consumedCount, len(nodes), sample.CommitID, sample.Random[:8])
 		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
@@ -203,7 +203,7 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 			removedRetries++
 			if removedRetries > maxRemovedRetries {
 				beacon = node.SkipCurrentEpoch("", "source_unavailable")
-				fmt.Printf("node=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", node.ID, beacon.Epoch, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
+				fmt.Printf("ts=%s node=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), node.ID, beacon.Epoch, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
 				removedRetries = 0
 				produced++
 			}
@@ -212,11 +212,11 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		removedRetries = 0
 		produced++
 		if beacon.Skipped {
-			fmt.Printf("node=%s epoch=%d source=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n", node.ID, beacon.Epoch, beacon.Source, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
+			fmt.Printf("ts=%s node=%s epoch=%d source=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), node.ID, beacon.Epoch, beacon.Source, beacon.SkipStage, beacon.SkipReason, beacon.Random[:8], beacon.SkipDiag)
 			continue
 		}
 		stats.beacons.Add(1)
-		fmt.Printf("node=%s epoch=%d source=%s consumed=%t commit=%s random=%x\n", node.ID, beacon.Epoch, beacon.Source, consumed, beacon.CommitID, beacon.Random[:8])
+		fmt.Printf("ts=%s node=%s epoch=%d source=%s consumed=%t commit=%s random=%x\n", logTimestamp(), node.ID, beacon.Epoch, beacon.Source, consumed, beacon.CommitID, beacon.Random[:8])
 		finalWindow.recordBeacon(nodes)
 	}
 	queueTotal, queueMax := collectQueue(nodes)
@@ -389,6 +389,10 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 func printMetrics(label string, nodes []*asyrand.Node, elapsed time.Duration, beacons uint64) {
 	queueTotal, queueMax := collectQueue(nodes)
 	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), queueTotal, queueMax, elapsed, beacons)
+}
+
+func logTimestamp() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {
