@@ -150,12 +150,13 @@ type Node struct {
 	ABA       *aba.Agreement
 	Crypto    *cryptoexec.Executor
 
-	mu          sync.Mutex
-	State       *State
-	recon       map[string]map[p2p.NodeID]crypto.DecryptedShare
-	reconSecret map[string][]byte
-	reconDone   map[string]bool
-	echoes      map[string]map[string]map[p2p.NodeID]bool
+	mu           sync.Mutex
+	State        *State
+	recon        map[string]map[p2p.NodeID]crypto.DecryptedShare
+	reconSecret  map[string][]byte
+	reconDone    map[string]bool
+	reconClosing map[string]bool
+	echoes       map[string]map[string]map[p2p.NodeID]bool
 	// readies stores verified READY votes rather than bare sender ids.
 	// This lets certification aggregate the exact votes that justified the
 	// Bracha-style READY threshold.
@@ -306,7 +307,7 @@ func NewNode(cfg Config) (*Node, error) {
 		ABA:    aba.New(cfg.ID, len(members), f, cfg.Transport),
 		Crypto: cryptoexec.New(cfg.CryptoWorkers),
 		State:  st,
-		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool),
+		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool), reconClosing: make(map[string]bool),
 		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare),
 		readySent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
@@ -1208,7 +1209,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	}
 	key := epochKey(body.Epoch, body.Source, body.Seq)
 	n.mu.Lock()
-	if n.reconDone[key] || body.Share.CommitmentID != obj.Commitment.SecretID {
+	if n.reconDone[key] || n.reconClosing[key] || body.Share.CommitmentID != obj.Commitment.SecretID {
 		n.mu.Unlock()
 		return nil
 	}
@@ -1241,6 +1242,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 		n.mu.Unlock()
 		return nil
 	}
+	n.reconClosing[key] = true
 	shares := make([]crypto.DecryptedShare, 0, len(n.recon[key]))
 	for _, sh := range n.recon[key] {
 		shares = append(shares, sh)
@@ -1248,6 +1250,9 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	prev := append([]byte(nil), n.State.RPrev...)
 	n.mu.Unlock()
 	if err := n.ensureVerified(obj); err != nil {
+		n.mu.Lock()
+		delete(n.reconClosing, key)
+		n.mu.Unlock()
 		return err
 	}
 	// These shares were inserted into n.recon only after this node verified
@@ -1259,6 +1264,9 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 		n.Perf.addPVSSRecon(time.Since(start))
 	}
 	if err != nil {
+		n.mu.Lock()
+		delete(n.reconClosing, key)
+		n.mu.Unlock()
 		return err
 	}
 	random := crypto.HashBytes(prev, secret)
@@ -1639,6 +1647,7 @@ func (n *Node) cleanupCertifiedStateLocked(epoch uint64) {
 			delete(n.recon, key)
 			delete(n.reconSecret, key)
 			delete(n.reconDone, key)
+			delete(n.reconClosing, key)
 			delete(n.reconSent, key)
 			delete(n.echoes, key)
 			delete(n.readies, key)
@@ -1785,6 +1794,7 @@ func (n *Node) resetConfigurationCachesLocked() {
 	n.recon = make(map[string]map[p2p.NodeID]crypto.DecryptedShare)
 	n.reconSecret = make(map[string][]byte)
 	n.reconDone = make(map[string]bool)
+	n.reconClosing = make(map[string]bool)
 	n.echoes = make(map[string]map[string]map[p2p.NodeID]bool)
 	n.readies = make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare)
 	n.readySent = make(map[string]bool)

@@ -87,6 +87,7 @@ type reconState struct {
 	ready        map[string]map[p2p.NodeID]asig.VoteShare
 	echoSent     map[string]bool
 	readySent    map[string]bool
+	reconClosing bool
 	delivered    bool
 }
 
@@ -408,6 +409,12 @@ func (n *Node) handleRecon(ctx context.Context, msg ReconMessage) {
 	if st == nil {
 		return
 	}
+	n.reconMu.Lock()
+	if st.delivered || st.reconClosing || st.shares[msg.Share.Holder].CommitmentID != "" {
+		n.reconMu.Unlock()
+		return
+	}
+	n.reconMu.Unlock()
 	start := time.Now()
 	ok := n.PVSS.VerifyShare(st.commit, msg.Share)
 	if n.Perf != nil {
@@ -427,6 +434,9 @@ func (n *Node) handleRecon(ctx context.Context, msg ReconMessage) {
 		shares = append(shares, share)
 	}
 	alreadyEchoed := len(st.echoSent) > 0
+	if len(shares) >= n.State.F+1 && !alreadyEchoed {
+		st.reconClosing = true
+	}
 	n.reconMu.Unlock()
 	if len(shares) < n.State.F+1 || alreadyEchoed {
 		return
@@ -437,10 +447,17 @@ func (n *Node) handleRecon(ctx context.Context, msg ReconMessage) {
 		n.Perf.addRecon(time.Since(start))
 	}
 	if err != nil {
+		n.reconMu.Lock()
+		st.reconClosing = false
+		n.reconMu.Unlock()
 		return
 	}
 	random := asig.HashBytes(n.State.RPrevBytes(), secret, []byte(st.commit.SecretID))
-	_ = n.broadcastVote(ctx, "ECHO", st, random)
+	if err := n.broadcastVote(ctx, "ECHO", st, random); err != nil {
+		n.reconMu.Lock()
+		st.reconClosing = false
+		n.reconMu.Unlock()
+	}
 }
 
 func (n *Node) handleEcho(ctx context.Context, msg BeaconVoteMessage) {

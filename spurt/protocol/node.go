@@ -1017,6 +1017,11 @@ func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
 		n.mu.Unlock()
 		return
 	}
+	t := n.State.Threshold()
+	if es.secret != nil || es.random != nil || es.reconstructing || len(es.reconShares) >= t || es.reconShares[from].CommitmentID != "" {
+		n.mu.Unlock()
+		return
+	}
 	aggregate := *es.aggregate
 	n.mu.Unlock()
 
@@ -1029,6 +1034,10 @@ func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
 		return
 	}
 	n.mu.Lock()
+	if es.secret != nil || es.random != nil || es.reconstructing || len(es.reconShares) >= t || es.reconShares[from].CommitmentID != "" {
+		n.mu.Unlock()
+		return
+	}
 	es.reconShares[from] = msg.Share
 	pending := es.pendingRecon
 	if len(pending) > 0 {
@@ -1039,11 +1048,17 @@ func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
 		if extra.Digest != msg.Digest || extra.Epoch != msg.Epoch {
 			continue
 		}
+		n.mu.Lock()
+		if es.secret != nil || es.random != nil || es.reconstructing || len(es.reconShares) >= t || es.reconShares[extra.Share.Holder].CommitmentID != "" {
+			n.mu.Unlock()
+			continue
+		}
+		n.mu.Unlock()
 		if !n.PVSS.VerifyShare(aggregate, extra.Share) {
 			continue
 		}
 		n.mu.Lock()
-		if es.aggregate != nil && es.digest == msg.Digest {
+		if es.aggregate != nil && es.digest == msg.Digest && es.secret == nil && es.random == nil && !es.reconstructing && len(es.reconShares) < t {
 			es.reconShares[extra.Share.Holder] = extra.Share
 		}
 		n.mu.Unlock()

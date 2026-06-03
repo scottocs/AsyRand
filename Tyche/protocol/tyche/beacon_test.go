@@ -17,6 +17,16 @@ type beaconTestResult struct {
 	err    error
 }
 
+type countingPVSSScheme struct {
+	crypto.PVSSScheme
+	verifyShareCount int
+}
+
+func (s *countingPVSSScheme) VerifyShare(c crypto.Commitment, sh crypto.DecryptedShare) bool {
+	s.verifyShareCount++
+	return s.PVSSScheme.VerifyShare(c, sh)
+}
+
 func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -75,6 +85,46 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 	}
 	if first.Epoch != 1 || first.Source != source || first.Seq != 1 {
 		t.Fatalf("bad beacon tuple: %+v", first)
+	}
+}
+
+func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	source := nextSource(nodes[0])
+	var producer *Node
+	for _, n := range nodes {
+		if n.ID == source {
+			producer = n
+			break
+		}
+	}
+	if producer == nil {
+		t.Fatalf("missing producer %s", source)
+	}
+	obj, err := producer.Produce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStored(t, ctx, nodes, source, obj.Seq)
+
+	target := nodes[0]
+	counter := &countingPVSSScheme{PVSSScheme: target.PVSS}
+	target.PVSS = counter
+	for i := 0; i < obj.Commitment.Threshold+1; i++ {
+		holder := nodes[i]
+		share, err := holder.PVSS.PreReconVerified(obj.Commitment, holder.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := target.handleRecon(ctx, holder.ID, ReconMessage{Epoch: 1, Source: source, Seq: obj.Seq, Share: share}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if counter.verifyShareCount != obj.Commitment.Threshold {
+		t.Fatalf("VerifyShare count = %d, want threshold %d", counter.verifyShareCount, obj.Commitment.Threshold)
 	}
 }
 
