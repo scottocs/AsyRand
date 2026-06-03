@@ -192,9 +192,10 @@ type Node struct {
 }
 
 type verifiedObject struct {
-	version uint64
-	object  Object
-	valid   bool
+	version  uint64
+	producer p2p.NodeID
+	seq      uint64
+	valid    bool
 }
 
 type DebugSnapshot struct {
@@ -994,8 +995,8 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 	}
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	var feeds []seedFeed
+	var pruned []string
 	blocked := false
 	for _, inst := range instances {
 		p := n.State.PendingABAs[inst]
@@ -1012,6 +1013,7 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 			delete(n.State.PendingABAs, inst)
 			delete(n.abaInputSent, inst)
 			delete(n.abaInputs, inst)
+			pruned = append(pruned, inst)
 			continue
 		}
 		p.Round = st.Round
@@ -1026,6 +1028,10 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 		if inst != current && !p.Decided && !p.CoinWait {
 			blocked = true
 		}
+	}
+	n.mu.Unlock()
+	for _, inst := range pruned {
+		n.ABA.Prune(inst)
 	}
 	return blocked, feeds
 }
@@ -1125,7 +1131,7 @@ func (n *Node) ensureVerified(obj Object) error {
 		n.Perf.addPVSSVerify(time.Since(start))
 	}
 	n.mu.Lock()
-	n.verified[key] = verifiedObject{version: obj.ConfigVersion, object: obj, valid: valid}
+	n.verified[key] = verifiedObject{version: obj.ConfigVersion, producer: obj.Producer, seq: obj.Seq, valid: valid}
 	n.mu.Unlock()
 	if !valid {
 		return errors.New("invalid pvss object")
@@ -1562,6 +1568,7 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 			delete(n.abaInputSent, feed.instance)
 			delete(n.abaInputs, feed.instance)
 			n.mu.Unlock()
+			n.ABA.Prune(feed.instance)
 			return
 		}
 		p.Round = st.Round
@@ -1655,10 +1662,15 @@ func (n *Node) cleanupCertifiedStateLocked(epoch uint64) {
 		}
 	}
 	for key, cached := range n.verified {
-		if cached.version != n.State.ConfigVersion || cached.object.Seq <= n.State.Seqs[cached.object.Producer] {
+		if cached.version != n.State.ConfigVersion || cached.seq <= n.State.Seqs[cached.producer] {
 			delete(n.verified, key)
 		}
 	}
+	consumed := make(map[p2p.NodeID]uint64, len(n.State.Seqs))
+	for id, seq := range n.State.Seqs {
+		consumed[id] = seq
+	}
+	n.RBC.PruneThrough(consumed)
 }
 
 func (n *Node) removeMemberLocked(id p2p.NodeID) {
@@ -1901,6 +1913,7 @@ func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 		delete(n.joinCoinWait, dec.Instance)
 	}
 	n.mu.Unlock()
+	n.ABA.Prune(dec.Instance)
 	if ok && dec.Value {
 		_ = n.broadcastJoinCommit(ctx, req)
 	}

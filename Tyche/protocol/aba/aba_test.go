@@ -75,6 +75,37 @@ func TestPessimisticPathUsesExternalCoin(t *testing.T) {
 	}
 }
 
+func TestPruneDropsDecidedStateAndIgnoresLateMessages(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	a := New("n0", 4, 1, nil)
+	instance := EpochInstance(7, "n1")
+	st := a.get(instance)
+	st.decided = true
+	st.decision = false
+
+	a.Prune(instance)
+	if a.state[instance] != nil {
+		t.Fatal("pruned ABA state was retained")
+	}
+	status := a.Status(instance)
+	if !status.Decided || status.Value {
+		t.Fatalf("bad pruned status: %+v", status)
+	}
+
+	msg, err := p2p.NewMessage(Protocol, "INPUT", instance, "n1", "n0", InputMessage{Value: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Handle(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+	if a.state[instance] != nil {
+		t.Fatal("late message recreated pruned ABA state")
+	}
+}
+
 func newTestAgreements(ctx context.Context, t *testing.T) ([]*Agreement, []p2p.Transport) {
 	t.Helper()
 	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
