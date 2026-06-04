@@ -13,3 +13,4 @@ __pycache__/
 go-cache/
 build/
 bin/
+*.zip

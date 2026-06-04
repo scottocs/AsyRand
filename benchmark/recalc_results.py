@@ -236,8 +236,8 @@ def settings_regions(run_dir):
 def protocol_dirs(run_dir, source):
     candidates = []
     protocols = configured_protocols(run_dir)
-    if not protocols:
-        protocols = sorted(path.name for path in run_dir.iterdir() if path.is_dir() and path.name in KNOWN_PROTOCOLS)
+    discovered = sorted(path.name for path in run_dir.iterdir() if path.is_dir() and path.name in KNOWN_PROTOCOLS)
+    protocols = sorted(set(protocols) | set(discovered))
 
     for protocol in protocols:
         direct = run_dir / protocol

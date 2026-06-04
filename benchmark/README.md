@@ -45,6 +45,17 @@ cd benchmark
 ```
 
 AWS per-epoch timeout defaults to `60s * ceil(nodes / 4)`, so larger deployments do not fail on the old fixed 60s timeout. Override with `EPOCH_TIMEOUT_MS` when you need a specific value.
+Large AWS runs can put enough CPU pressure on remote nodes that `sshd` is slow to send its SSH banner. If Paramiko reports `Error reading SSH protocol banner`, increase the SSH control-plane timeouts before running the benchmark:
+
+```powershell
+$env:SSH_CONNECT_TIMEOUT = "20"
+$env:SSH_BANNER_TIMEOUT = "90"
+$env:SSH_AUTH_TIMEOUT = "60"
+$env:AWS_REMOTE_PROGRESS_POLL = "0"
+.\.venv\Scripts\fab aws --nodes=96 --epochs=100 --protocols=tyche-scrape
+```
+
+For CPU-heavy SCRAPE runs, also keep remote worker settings below the instance's vCPU count, leaving headroom for `sshd` and kernel networking. For example, use lower `MAX_POOL`/`GOMAXPROCS_REMOTE` or a larger instance type if the remote logs show sustained crypto queues and high CPU. Set `AWS_REMOTE_PROGRESS_POLL=0` on small instances to avoid opening extra SSH sessions while the protocol is running.
 
 ## AWS Nodes
 
@@ -59,7 +70,23 @@ cd benchmark
 .\.venv\Scripts\fab destroy
 
 
-fab create --nodes=4;fab aws --nodes=8 --epochs=200 --protocols=tyche-scrape;fab aws --nodes=16 --epochs=200 --protocols=tyche-scrape;fab create --nodes=7;fab aws --nodes=32 --epochs=200 --protocols=tyche-scrape;fab aws --nodes=64 --epochs=100 --protocols=tyche-scrape;fab create --nodes=4;fab aws --nodes=96 --epochs=100 --protocols=tyche-scrape;fab destroy;
+fab create --nodes=7;fab aws --nodes=8 --epochs=400 --protocols=tyche-scrape;fab aws --nodes=16 --epochs=300 --protocols=tyche-scrape;fab aws --nodes=32 --epochs=200 --protocols=tyche-scrape;fab aws --nodes=64 --epochs=100 --protocols=tyche-scrape;fab create --nodes=4;fab aws --nodes=96 --epochs=100 --protocols=tyche-scrape;fab destroy;
+
+
+fab create --nodes=7;fab aws --nodes=8 --epochs=400;fab aws --nodes=16 --epochs=300;fab aws --nodes=32 --epochs=200;fab destroy;
+
+fab create --nodes=16;fab aws --nodes=64 --epochs=100;fab aws --nodes=96 --epochs=100;fab destroy;
+
+fab create --nodes=7;fab aws --nodes=8 --epochs=400;fab aws --nodes=16 --epochs=300;fab aws --nodes=32 --epochs=200;fab create --nodes=9;fab aws --nodes=64 --epochs=100;fab aws --nodes=96 --epochs=100;fab destroy;  
+
+# n=96 tyche-scrape config.
+$env:TYCHE_REMOVAL_EXPIRATION_MS = "120000"
+$env:TYCHE_TRANSPORT_BUFFER = "32768"
+$env:PRODUCER_MS = "1000"
+$env:PREFILL_MS = "3000"
+$env:MAX_POOL = "2"
+$env:GOMAXPROCS_REMOTE = "2"
+$env:QUEUE_LEN = "2"
 ```
 
 `create --nodes=1` means one EC2 instance per region listed in `settings.json`. It waits for the instances to reach `running` and pass AWS status checks. The AWS `KeyName` must already exist in every configured region, and `key.path` must point to its local private key.

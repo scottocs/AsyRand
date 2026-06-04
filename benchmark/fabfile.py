@@ -48,7 +48,7 @@ def aws(
     ctx,
     nodes=8,
     epochs=200,
-    protocols="tyche,tyche-scrape,tyche-reconfig,asyrand,grandline,spurt",
+    protocols="tyche,tyche-scrape,asyrand,grandline,spurt",
     out="",
     key_path="",
     remote_dir="TycheBench",
