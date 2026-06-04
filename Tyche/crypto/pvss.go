@@ -5,9 +5,12 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
+	"sync"
 
 	"github.com/scottocs/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
@@ -19,7 +22,27 @@ const (
 	matrixCols = 8
 	sa1Cols    = 2
 	sa2Cols    = 6
+
+	reconPlanCacheLimit = 64
 )
+
+// reconAggregationPlan is the setup/public part of the silent-setup Decrypt
+// aggregation for a fixed qualified holder set. It corresponds to the B, Q0,
+// Bhat, aggregated-public-key, and sumcheck commitments in Appendix E of the
+// constant-online PVSS construction; ciphertext-dependent sigma and pairings
+// are still computed for every reconstruction.
+type reconAggregationPlan struct {
+	bEvals []kyber.Scalar
+	bG2    kyber.Point
+	q0G1   kyber.Point
+	bhatG1 kyber.Point
+	apk    kyber.Point
+	qx     kyber.Point
+	qz     kyber.Point
+	qhatx  kyber.Point
+}
+
+var setupVrfCache sync.Map
 
 type PublicParams struct {
 	Epoch      string                  `json:"epoch"`
@@ -95,6 +118,13 @@ type SilentSetupScheme struct {
 	aggHints    map[p2p.NodeID]kyber.Point
 	hintX       map[p2p.NodeID]kyber.Point
 	hintMinus0  map[p2p.NodeID]kyber.Point
+	slotIndex   map[p2p.NodeID]int
+	slotPoints  []kyber.Scalar
+	lagrange0   map[p2p.NodeID]kyber.Scalar
+	g1Powers    []kyber.Point
+	g2Powers    []kyber.Point
+	reconPlanMu sync.Mutex
+	reconPlans  map[string]*reconAggregationPlan
 }
 
 func Setup(epoch string, threshold int, members []p2p.NodeID) (PublicParams, map[p2p.NodeID]KeyPair, error) {
@@ -144,6 +174,7 @@ func Setup(epoch string, threshold int, members []p2p.NodeID) (PublicParams, map
 		KeyShares: keyShares, RealKeys: realKeys, DummyKey: dummy,
 		EK: ek, AK: ak, MatrixA: matrixA, PowerOfTau: pot,
 	}
+	markSetupVrf(pp)
 	return pp, keys, nil
 }
 
@@ -162,6 +193,9 @@ func NewScheme(id p2p.NodeID, private kyber.Scalar, pp PublicParams) (*SilentSet
 	hintX := make(map[p2p.NodeID]kyber.Point, len(pp.Slots))
 	hintMinus0 := make(map[p2p.NodeID]kyber.Point, len(pp.Slots))
 	aggHints := make(map[p2p.NodeID]kyber.Point, len(pp.Slots))
+	slotIdx := make(map[p2p.NodeID]int, len(pp.Slots))
+	slotPoints := make([]kyber.Scalar, len(pp.Slots))
+	lagrange0 := make(map[p2p.NodeID]kyber.Scalar, len(pp.Slots))
 	for id, raw := range pp.KeyShares {
 		p, err := pointG2FromHex(raw)
 		if err != nil {
@@ -201,6 +235,27 @@ func NewScheme(id p2p.NodeID, private kyber.Scalar, pp PublicParams) (*SilentSet
 		hintX[id], hintMinus0[id], aggHints[id] = h2, h4, a
 	}
 	group := suite()
+	for i, id := range pp.Slots {
+		slotIdx[id] = i
+		slotPoints[i] = slotPoint(group, i)
+		lagrange0[id] = lagrangeBasisAt(group.G1(), i, group.G1().Scalar().Zero(), len(pp.Slots))
+	}
+	g1Powers := make([]kyber.Point, len(pp.PowerOfTau.G1Powers))
+	for i, raw := range pp.PowerOfTau.G1Powers {
+		p, err := pointG1FromHex(raw)
+		if err != nil {
+			return nil, err
+		}
+		g1Powers[i] = p
+	}
+	g2Powers := make([]kyber.Point, len(pp.PowerOfTau.G2Powers))
+	for i, raw := range pp.PowerOfTau.G2Powers {
+		p, err := pointG2FromHex(raw)
+		if err != nil {
+			return nil, err
+		}
+		g2Powers[i] = p
+	}
 	gtp, err := pointGTFromHex(pp.GTPrime)
 	if err != nil {
 		return nil, err
@@ -218,6 +273,9 @@ func NewScheme(id p2p.NodeID, private kyber.Scalar, pp PublicParams) (*SilentSet
 		gtPrime: gtp, pairingBase: group.Pair(baseG1(group), baseG2(group)),
 		ask: ask, zG2: zG2, hMinus1: group.G2().Point().Neg(baseG2(group)),
 		aggHints: aggHints, hintX: hintX, hintMinus0: hintMinus0,
+		slotIndex: slotIdx, slotPoints: slotPoints,
+		lagrange0: lagrange0, g1Powers: g1Powers, g2Powers: g2Powers,
+		reconPlans: make(map[string]*reconAggregationPlan),
 	}, nil
 }
 
@@ -246,10 +304,24 @@ func SetupVrf(pp PublicParams) bool {
 	if pp.Epoch == "" || pp.Threshold <= 0 || len(pp.Members) < pp.Threshold || len(pp.Slots) != len(pp.Members)+1 {
 		return false
 	}
+	cacheKey := setupVrfCacheKey(pp)
+	if cacheKey != "" {
+		if cached, ok := setupVrfCache.Load(cacheKey); ok && cached == true {
+			return true
+		}
+	}
 	if !VerifyPowerOfTau(pp.PowerOfTau) || len(pp.MatrixA) != matrixRows {
 		return false
 	}
 	group := suite()
+	expectedSlots := append([]p2p.NodeID{dummyID()}, normalizeMembers(pp.Members)...)
+	if !reflect.DeepEqual(pp.Slots, expectedSlots) {
+		return false
+	}
+	polys, err := setupVerificationPolys(group, pp.PowerOfTau, pp.Slots)
+	if err != nil {
+		return false
+	}
 	for _, row := range pp.MatrixA {
 		if len(row) != matrixCols {
 			return false
@@ -262,14 +334,21 @@ func SetupVrf(pp PublicParams) bool {
 	}
 	for _, id := range pp.Members {
 		k, ok := pp.RealKeys[id]
-		if !ok || !verifySetupKey(group, pp.Slots, id, k) {
+		if !ok || !verifySetupKey(group, pp.Slots, polys, id, k) {
 			return false
 		}
 		if pp.KeyShares[id] != k.PK2 {
 			return false
 		}
 	}
-	if !verifySetupKey(group, pp.Slots, dummyID(), pp.DummyKey) {
+	if !verifySetupKey(group, pp.Slots, polys, dummyID(), pp.DummyKey) {
+		return false
+	}
+	expectedEK, expectedAK := deriveSilentKeys(group, pp.Slots, pp.RealKeys, pp.DummyKey)
+	if pp.EK != expectedEK || pp.MasterG1 != expectedEK.X || !reflect.DeepEqual(pp.AK, expectedAK) {
+		return false
+	}
+	if !reflect.DeepEqual(pp.MatrixA, deriveMatrixA(group, pp.Epoch, pp.Threshold, pp.PowerOfTau, pp.EK, pp.AK)) {
 		return false
 	}
 	for _, raw := range []string{pp.EK.X, pp.EK.Z, pp.MasterG1} {
@@ -280,7 +359,22 @@ func SetupVrf(pp PublicParams) bool {
 	if _, err := pointGTFromHex(pp.GTPrime); err != nil {
 		return false
 	}
+	markSetupVrf(pp)
 	return true
+}
+
+func setupVrfCacheKey(pp PublicParams) string {
+	raw, err := json.Marshal(pp)
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(HashBytes([]byte("Tyche-v1/silent-pvss/setup-vrf-cache"), raw))
+}
+
+func markSetupVrf(pp PublicParams) {
+	if key := setupVrfCacheKey(pp); key != "" {
+		setupVrfCache.Store(key, true)
+	}
 }
 
 func (s *SilentSetupScheme) Share(dealer p2p.NodeID, seq uint64, secret kyber.Scalar) (Commitment, []byte, error) {
@@ -591,23 +685,114 @@ func deriveSetupKey(group *bn256.Suite, slots []p2p.NodeID, id p2p.NodeID, idx i
 	}
 }
 
-func verifySetupKey(group *bn256.Suite, slots []p2p.NodeID, id p2p.NodeID, k SetupKey) bool {
+type setupVrfPolys struct {
+	liG2        []kyber.Point
+	liMinus0G2  []kyber.Point
+	liOverXG2   []kyber.Point
+	liLjOverZG2 [][]kyber.Point
+}
+
+func verifySetupKey(group *bn256.Suite, slots []p2p.NodeID, polys setupVrfPolys, id p2p.NodeID, k SetupKey) bool {
 	pk1, err1 := pointG1FromHex(k.PK1)
 	pk2, err2 := pointG2FromHex(k.PK2)
 	if err1 != nil || err2 != nil || !group.Pair(pk1, baseG2(group)).Equal(group.Pair(baseG1(group), pk2)) {
 		return false
 	}
-	for _, raw := range []string{k.H1, k.H2, k.H3, k.H4} {
-		if _, err := pointG1FromHex(raw); err != nil {
+	idx, ok := slotIndexOf(slots, id)
+	if !ok {
+		return false
+	}
+	h1, err1 := pointG1FromHex(k.H1)
+	h2, err2 := pointG1FromHex(k.H2)
+	h3, err3 := pointG1FromHex(k.H3)
+	h4, err4 := pointG1FromHex(k.H4)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return false
+	}
+	if !pairingEq(group, h1, baseG2(group), pk1, polys.liG2[idx]) ||
+		!pairingEq(group, h2, baseG2(group), pk1, polys.liOverXG2[idx]) ||
+		!pairingEq(group, h3, baseG2(group), pk1, polys.liLjOverZG2[idx][idx]) ||
+		!pairingEq(group, h4, baseG2(group), pk1, polys.liMinus0G2[idx]) {
+		return false
+	}
+	if len(k.H5) != len(slots) {
+		return false
+	}
+	for j, other := range slots {
+		h5, err := pointG1FromHex(k.H5[other])
+		if err != nil {
 			return false
 		}
-	}
-	for _, other := range slots {
-		if _, err := pointG1FromHex(k.H5[other]); err != nil {
+		if !pairingEq(group, h5, baseG2(group), pk1, polys.liLjOverZG2[idx][j]) {
 			return false
 		}
 	}
 	return true
+}
+
+func setupVerificationPolys(group *bn256.Suite, pot PowerOfTauCRS, slots []p2p.NodeID) (setupVrfPolys, error) {
+	n := len(slots)
+	out := setupVrfPolys{
+		liG2:        make([]kyber.Point, n),
+		liMinus0G2:  make([]kyber.Point, n),
+		liOverXG2:   make([]kyber.Point, n),
+		liLjOverZG2: make([][]kyber.Point, n),
+	}
+	lagrange := make([][]kyber.Scalar, n)
+	vanish := vanishingPoly(group.G1(), n)
+	for i := 0; i < n; i++ {
+		li := lagrangeBasisPoly(group.G1(), i, n)
+		lagrange[i] = li
+		li0 := evalPoly(group.G1(), li, group.G1().Scalar().Zero())
+		liMinus0 := polySubConst(group.G1(), li, li0)
+		liOverX, err := divByLinear(group.G1(), liMinus0, group.G1().Scalar().Zero())
+		if err != nil {
+			return setupVrfPolys{}, err
+		}
+		out.liG2[i], err = commitPolyG2(group, pot, li)
+		if err != nil {
+			return setupVrfPolys{}, err
+		}
+		out.liMinus0G2[i], err = commitPolyG2(group, pot, liMinus0)
+		if err != nil {
+			return setupVrfPolys{}, err
+		}
+		out.liOverXG2[i], err = commitPolyG2(group, pot, liOverX)
+		if err != nil {
+			return setupVrfPolys{}, err
+		}
+		out.liLjOverZG2[i] = make([]kyber.Point, n)
+	}
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			numerator := polyMul(group.G1(), lagrange[i], lagrange[j])
+			if i == j {
+				numerator = polySub(group.G1(), numerator, lagrange[i])
+			}
+			quotient, remainder, err := divPolyMonic(group.G1(), numerator, vanish)
+			if err != nil || !polyIsZero(group.G1(), remainder) {
+				return setupVrfPolys{}, errors.New("invalid setup verification polynomial")
+			}
+			out.liLjOverZG2[i][j], err = commitPolyG2(group, pot, quotient)
+			if err != nil {
+				return setupVrfPolys{}, err
+			}
+		}
+	}
+	return out, nil
+}
+
+func pairingEq(group *bn256.Suite, a1, a2, b1, b2 kyber.Point) bool {
+	return group.Pair(a1, a2).Equal(group.Pair(b1, b2))
+}
+
+func slotIndexOf(slots []p2p.NodeID, id p2p.NodeID) (int, bool) {
+	for i, candidate := range slots {
+		if candidate == id {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 func deriveSilentKeys(group *bn256.Suite, slots []p2p.NodeID, real map[p2p.NodeID]SetupKey, dummy SetupKey) (EncryptionKey, AuditKey) {
@@ -712,30 +897,78 @@ func (s *SilentSetupScheme) encryptBody(group *bn256.Suite, gammaG2 kyber.Point,
 }
 
 func (s *SilentSetupScheme) aggregateDecryptKey(group *bn256.Suite, c Commitment, c0 kyber.Point, sa1, sa2 []kyber.Point, selected map[p2p.NodeID]kyber.Point) (kyber.Point, error) {
-	points := make([]kyber.Scalar, 0, len(c.Members)+1-len(selected))
-	points = append(points, slotPoint(group, 0))
+	plan, err := s.reconAggregationPlan(group, selected)
+	if err != nil {
+		return nil, err
+	}
+	sigma := group.G2().Point().Null()
+	for _, id := range s.pp.Slots {
+		partySelected := id == dummyID()
+		if id != dummyID() {
+			_, partySelected = selected[id]
+		}
+		if !partySelected {
+			continue
+		}
+		slotIdx := s.slotIndex[id]
+		shareWeight := group.G1().Scalar().Mul(plan.bEvals[slotIdx], s.lagrange0[id])
+		if id == dummyID() {
+			sigma.Add(sigma, group.G2().Point().Mul(shareWeight, c0))
+		} else {
+			sigma.Add(sigma, group.G2().Point().Mul(shareWeight, selected[id]))
+		}
+	}
+	w1 := []kyber.Point{
+		group.G1().Point().Neg(plan.apk),
+		group.G1().Point().Neg(plan.qz),
+		group.G1().Point().Neg(plan.qx),
+		plan.qhatx,
+		group.G1().Point().Neg(plan.bhatG1),
+		group.G1().Point().Neg(plan.q0G1),
+		sa1[0],
+		sa1[1],
+	}
+	w2 := []kyber.Point{sa2[0], sa2[1], sa2[2], sa2[3], sa2[4], sa2[5], plan.bG2, sigma}
+	out := group.GT().Point().Null()
+	for i := range w1 {
+		out.Add(out, group.Pair(w1[i], w2[i]))
+	}
+	return out, nil
+}
+
+func (s *SilentSetupScheme) reconAggregationPlan(group *bn256.Suite, selected map[p2p.NodeID]kyber.Point) (*reconAggregationPlan, error) {
+	key := s.reconPlanKey(selected)
+	s.reconPlanMu.Lock()
+	if plan := s.reconPlans[key]; plan != nil {
+		s.reconPlanMu.Unlock()
+		return plan, nil
+	}
+	s.reconPlanMu.Unlock()
+
+	points := make([]kyber.Scalar, 0, len(s.pp.Members)+1-len(selected))
+	points = append(points, s.slotPoints[0])
 	for i, id := range s.pp.Slots {
 		if id == dummyID() {
 			continue
 		}
 		if _, ok := selected[id]; !ok {
-			points = append(points, slotPoint(group, i))
+			points = append(points, s.slotPoints[i])
 		}
 	}
 	b := interpolateMostlyZero(group.G1(), group.G1().Scalar().One(), points)
-	bEvals := make(map[p2p.NodeID]kyber.Scalar, len(s.pp.Slots))
-	for i, id := range s.pp.Slots {
-		bEvals[id] = evalPoly(group.G1(), b, slotPoint(group, i))
+	bEvals := make([]kyber.Scalar, len(s.pp.Slots))
+	for i := range s.pp.Slots {
+		bEvals[i] = evalPoly(group.G1(), b, s.slotPoints[i])
 	}
-	bG2, err := commitPolyG2(group, s.pp.PowerOfTau, b)
+	bG2, err := s.commitPolyG2(group, b)
 	if err != nil {
 		return nil, err
 	}
-	q0, err := divByLinear(group.G1(), polySubConst(group.G1(), b, group.G1().Scalar().One()), slotPoint(group, 0))
+	q0, err := divByLinear(group.G1(), polySubConst(group.G1(), b, group.G1().Scalar().One()), s.slotPoints[0])
 	if err != nil {
 		return nil, err
 	}
-	q0G1, err := commitPolyG1(group, s.pp.PowerOfTau, q0)
+	q0G1, err := s.commitPolyG1(group, q0)
 	if err != nil {
 		return nil, err
 	}
@@ -743,12 +976,11 @@ func (s *SilentSetupScheme) aggregateDecryptKey(group *bn256.Suite, c Commitment
 	for i := range b {
 		bhat[s.pp.Threshold+1+i] = b[i]
 	}
-	bhatG1, err := commitPolyG1(group, s.pp.PowerOfTau, bhat)
+	bhatG1, err := s.commitPolyG1(group, bhat)
 	if err != nil {
 		return nil, err
 	}
 	apk := group.G1().Point().Null()
-	sigma := group.G2().Point().Null()
 	qx := group.G1().Point().Null()
 	qz := group.G1().Point().Null()
 	qhatx := group.G1().Point().Null()
@@ -760,15 +992,10 @@ func (s *SilentSetupScheme) aggregateDecryptKey(group *bn256.Suite, c Commitment
 		if !partySelected {
 			continue
 		}
-		w := bEvals[id]
-		slotIdx := slotIndex(s.pp.Slots, id)
-		shareWeight := group.G1().Scalar().Mul(w, lagrangeBasisAt(group.G1(), slotIdx, group.G1().Scalar().Zero(), len(s.pp.Slots)))
+		slotIdx := s.slotIndex[id]
+		w := bEvals[slotIdx]
+		shareWeight := group.G1().Scalar().Mul(w, s.lagrange0[id])
 		apk.Add(apk, group.G1().Point().Mul(shareWeight, s.publicG1[id]))
-		if id == dummyID() {
-			sigma.Add(sigma, group.G2().Point().Mul(shareWeight, c0))
-		} else {
-			sigma.Add(sigma, group.G2().Point().Mul(shareWeight, selected[id]))
-		}
 		if hx := s.hintX[id]; hx != nil {
 			qx.Add(qx, group.G1().Point().Mul(w, hx))
 		}
@@ -779,22 +1006,41 @@ func (s *SilentSetupScheme) aggregateDecryptKey(group *bn256.Suite, c Commitment
 			qhatx.Add(qhatx, group.G1().Point().Mul(w, hm))
 		}
 	}
-	w1 := []kyber.Point{
-		group.G1().Point().Neg(apk),
-		group.G1().Point().Neg(qz),
-		group.G1().Point().Neg(qx),
-		qhatx,
-		group.G1().Point().Neg(bhatG1),
-		group.G1().Point().Neg(q0G1),
-		sa1[0],
-		sa1[1],
+	plan := &reconAggregationPlan{
+		bEvals: bEvals,
+		bG2:    bG2,
+		q0G1:   q0G1,
+		bhatG1: bhatG1,
+		apk:    apk,
+		qx:     qx,
+		qz:     qz,
+		qhatx:  qhatx,
 	}
-	w2 := []kyber.Point{sa2[0], sa2[1], sa2[2], sa2[3], sa2[4], sa2[5], bG2, sigma}
-	out := group.GT().Point().Null()
-	for i := range w1 {
-		out.Add(out, group.Pair(w1[i], w2[i]))
+	s.reconPlanMu.Lock()
+	if existing := s.reconPlans[key]; existing != nil {
+		s.reconPlanMu.Unlock()
+		return existing, nil
 	}
-	return out, nil
+	if len(s.reconPlans) < reconPlanCacheLimit {
+		s.reconPlans[key] = plan
+	}
+	s.reconPlanMu.Unlock()
+	return plan, nil
+}
+
+func (s *SilentSetupScheme) reconPlanKey(selected map[p2p.NodeID]kyber.Point) string {
+	indices := make([]int, 0, len(selected))
+	for id := range selected {
+		if idx, ok := s.slotIndex[id]; ok {
+			indices = append(indices, idx)
+		}
+	}
+	sort.Ints(indices)
+	var buf bytes.Buffer
+	for _, idx := range indices {
+		fmt.Fprintf(&buf, "%d,", idx)
+	}
+	return buf.String()
 }
 
 func (s *SilentSetupScheme) encProof(group *bn256.Suite, c Commitment, gamma kyber.Scalar, v []kyber.Scalar, secret kyber.Scalar) Proof {
@@ -1130,6 +1376,34 @@ func commitPolyG2(group *bn256.Suite, pot PowerOfTauCRS, coeffs []kyber.Scalar) 
 	return out, nil
 }
 
+func (s *SilentSetupScheme) commitPolyG1(group *bn256.Suite, coeffs []kyber.Scalar) (kyber.Point, error) {
+	if len(coeffs) > len(s.g1Powers) {
+		return nil, errors.New("polynomial degree exceeds G1 power-of-tau")
+	}
+	out := group.G1().Point().Null()
+	for i, coeff := range coeffs {
+		if coeff == nil {
+			continue
+		}
+		out.Add(out, group.G1().Point().Mul(coeff, s.g1Powers[i]))
+	}
+	return out, nil
+}
+
+func (s *SilentSetupScheme) commitPolyG2(group *bn256.Suite, coeffs []kyber.Scalar) (kyber.Point, error) {
+	if len(coeffs) > len(s.g2Powers) {
+		return nil, errors.New("polynomial degree exceeds G2 power-of-tau")
+	}
+	out := group.G2().Point().Null()
+	for i, coeff := range coeffs {
+		if coeff == nil {
+			continue
+		}
+		out.Add(out, group.G2().Point().Mul(coeff, s.g2Powers[i]))
+	}
+	return out, nil
+}
+
 func vanishingCommitG2(group *bn256.Suite, pot PowerOfTauCRS, n int) (kyber.Point, error) {
 	z := []kyber.Scalar{group.G1().Scalar().One()}
 	for i := 0; i < n; i++ {
@@ -1140,6 +1414,33 @@ func vanishingCommitG2(group *bn256.Suite, pot PowerOfTauCRS, n int) (kyber.Poin
 
 func slotPoint(group *bn256.Suite, i int) kyber.Scalar {
 	return group.G1().Scalar().SetInt64(int64(i + 1))
+}
+
+func lagrangeBasisPoly(group kyber.Group, i int, n int) []kyber.Scalar {
+	xi := group.Scalar().SetInt64(int64(i + 1))
+	out := []kyber.Scalar{group.Scalar().One()}
+	den := group.Scalar().One()
+	for j := 0; j < n; j++ {
+		if j == i {
+			continue
+		}
+		xj := group.Scalar().SetInt64(int64(j + 1))
+		out = mulPolyLinear(group, out, group.Scalar().Neg(xj))
+		den.Mul(den, group.Scalar().Sub(xi, xj))
+	}
+	factor := group.Scalar().Div(group.Scalar().One(), den)
+	for k := range out {
+		out[k] = group.Scalar().Mul(out[k], factor)
+	}
+	return out
+}
+
+func vanishingPoly(group kyber.Group, n int) []kyber.Scalar {
+	out := []kyber.Scalar{group.Scalar().One()}
+	for i := 0; i < n; i++ {
+		out = mulPolyLinear(group, out, group.Scalar().Neg(group.Scalar().SetInt64(int64(i+1))))
+	}
+	return out
 }
 
 func interpolateMostlyZero(group kyber.Group, eval kyber.Scalar, points []kyber.Scalar) []kyber.Scalar {
@@ -1168,6 +1469,96 @@ func mulPolyLinear(group kyber.Group, coeffs []kyber.Scalar, constant kyber.Scal
 		out[i+1].Add(out[i+1], coeff)
 	}
 	return out
+}
+
+func polyMul(group kyber.Group, a, b []kyber.Scalar) []kyber.Scalar {
+	if len(a) == 0 || len(b) == 0 {
+		return []kyber.Scalar{group.Scalar().Zero()}
+	}
+	out := make([]kyber.Scalar, len(a)+len(b)-1)
+	for i := range out {
+		out[i] = group.Scalar().Zero()
+	}
+	for i, ai := range a {
+		for j, bj := range b {
+			out[i+j].Add(out[i+j], group.Scalar().Mul(ai, bj))
+		}
+	}
+	return trimPoly(group, out)
+}
+
+func polySub(group kyber.Group, a, b []kyber.Scalar) []kyber.Scalar {
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	out := make([]kyber.Scalar, n)
+	for i := range out {
+		out[i] = group.Scalar().Zero()
+		if i < len(a) {
+			out[i].Add(out[i], a[i])
+		}
+		if i < len(b) {
+			out[i].Sub(out[i], b[i])
+		}
+	}
+	return trimPoly(group, out)
+}
+
+func divPolyMonic(group kyber.Group, numerator, denominator []kyber.Scalar) ([]kyber.Scalar, []kyber.Scalar, error) {
+	numerator = trimPoly(group, numerator)
+	denominator = trimPoly(group, denominator)
+	if len(denominator) == 0 || polyIsZero(group, denominator) {
+		return nil, nil, errors.New("division by zero polynomial")
+	}
+	if len(numerator) < len(denominator) {
+		return []kyber.Scalar{group.Scalar().Zero()}, numerator, nil
+	}
+	lead := denominator[len(denominator)-1]
+	if !lead.Equal(group.Scalar().One()) {
+		return nil, nil, errors.New("non-monic polynomial divisor")
+	}
+	rem := make([]kyber.Scalar, len(numerator))
+	for i, coeff := range numerator {
+		rem[i] = coeff.Clone()
+	}
+	quot := make([]kyber.Scalar, len(numerator)-len(denominator)+1)
+	for i := range quot {
+		quot[i] = group.Scalar().Zero()
+	}
+	for deg := len(numerator) - 1; deg >= len(denominator)-1; deg-- {
+		factor := rem[deg].Clone()
+		qIdx := deg - len(denominator) + 1
+		quot[qIdx] = factor.Clone()
+		if factor.Equal(group.Scalar().Zero()) {
+			continue
+		}
+		for j := 0; j < len(denominator); j++ {
+			rem[qIdx+j].Sub(rem[qIdx+j], group.Scalar().Mul(factor, denominator[j]))
+		}
+	}
+	return trimPoly(group, quot), trimPoly(group, rem[:len(denominator)-1]), nil
+}
+
+func trimPoly(group kyber.Group, coeffs []kyber.Scalar) []kyber.Scalar {
+	last := len(coeffs) - 1
+	for last > 0 && coeffs[last].Equal(group.Scalar().Zero()) {
+		last--
+	}
+	out := make([]kyber.Scalar, last+1)
+	for i := range out {
+		out[i] = coeffs[i].Clone()
+	}
+	return out
+}
+
+func polyIsZero(group kyber.Group, coeffs []kyber.Scalar) bool {
+	for _, coeff := range coeffs {
+		if coeff != nil && !coeff.Equal(group.Scalar().Zero()) {
+			return false
+		}
+	}
+	return true
 }
 
 func evalPoly(group kyber.Group, coeffs []kyber.Scalar, x kyber.Scalar) kyber.Scalar {

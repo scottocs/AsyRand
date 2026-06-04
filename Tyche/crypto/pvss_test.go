@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 
 	"github.com/scottocs/Tyche/utils/p2p"
@@ -13,6 +14,7 @@ func TestSilentSetupPVSSVerifyPreReconAndRecon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setupVrfCache = sync.Map{}
 	if !SetupVrf(pp) {
 		t.Fatal("valid silent setup did not verify")
 	}
@@ -78,6 +80,20 @@ func TestSilentSetupRejectsBadSetupAndShares(t *testing.T) {
 	bad.KeyShares["n3"] = bad.KeyShares["n0"]
 	if SetupVrf(bad) {
 		t.Fatal("malformed setup verified")
+	}
+	bad = cloneParams(pp)
+	k := bad.RealKeys["n2"]
+	k.H2 = bad.RealKeys["n1"].H2
+	bad.RealKeys["n2"] = k
+	if SetupVrf(bad) {
+		t.Fatal("malformed setup hint H2 verified")
+	}
+	bad = cloneParams(pp)
+	k = bad.RealKeys["n2"]
+	k.H5["n4"] = bad.RealKeys["n1"].H5["n4"]
+	bad.RealKeys["n2"] = k
+	if SetupVrf(bad) {
+		t.Fatal("malformed setup hint H5 verified")
 	}
 
 	dealer, err := NewScheme("n0", keys["n0"].Private, pp)
