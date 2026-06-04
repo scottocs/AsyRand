@@ -1,3 +1,6 @@
+import os
+from contextlib import contextmanager
+
 from fabric import task
 
 from tychebench.results import print_latest_summary
@@ -10,6 +13,27 @@ from tychebench.aws import (
     start_instances,
     stop_instances,
 )
+
+
+DEFAULT_PROTOCOLS = "tyche,tyche-scrape,tyche-reconfig,tyche-scrape-reconfig,asyrand,grandline,spurt"
+
+
+@contextmanager
+def _temporary_env(**values):
+    previous = {}
+    for key, value in values.items():
+        if value is None or str(value).strip() == "":
+            continue
+        previous[key] = os.environ.get(key)
+        os.environ[key] = str(value)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _run_or_exit(fn, *args, **kwargs):
@@ -28,19 +52,31 @@ def local(
     ctx,
     nodes=8,
     epochs=1000,
-    protocols="tyche,tyche-scrape,asyrand,grandline,spurt",
+    protocols=DEFAULT_PROTOCOLS,
     out="",
     fault_threshold="",
+    reconfig_events="",
+    reconfig_min_n="",
+    reconfig_max_n="",
+    reconfig_seed="",
+    reconfig_queue_len="",
 ):
     """Run the local in-memory beacon benchmark."""
-    _run_or_exit(
-        run_local,
-        n=int(nodes),
-        epochs=int(epochs),
-        protocols=protocols,
-        out_root=out or None,
-        fault_threshold=int(fault_threshold) if str(fault_threshold).strip() else None,
-    )
+    with _temporary_env(
+        TYCHE_RECONFIG_EVENTS=reconfig_events,
+        TYCHE_RECONFIG_MIN_N=reconfig_min_n,
+        TYCHE_RECONFIG_MAX_N=reconfig_max_n,
+        TYCHE_RECONFIG_SEED=reconfig_seed,
+        TYCHE_RECONFIG_QUEUE_LEN=reconfig_queue_len,
+    ):
+        _run_or_exit(
+            run_local,
+            n=int(nodes),
+            epochs=int(epochs),
+            protocols=protocols,
+            out_root=out or None,
+            fault_threshold=int(fault_threshold) if str(fault_threshold).strip() else None,
+        )
 
 
 @task
@@ -48,23 +84,35 @@ def aws(
     ctx,
     nodes=8,
     epochs=200,
-    protocols="tyche,tyche-scrape,asyrand,grandline,spurt",
+    protocols=DEFAULT_PROTOCOLS,
     out="",
     key_path="",
     remote_dir="TycheBench",
     ssh_user="",
+    reconfig_events="",
+    reconfig_min_n="",
+    reconfig_max_n="",
+    reconfig_seed="",
+    reconfig_queue_len="",
 ):
     """Run the AWS TCP beacon benchmark."""
-    _run_or_exit(
-        run_aws,
-        nodes=int(nodes),
-        epochs=int(epochs),
-        protocols=protocols,
-        out_root=out or None,
-        key_path=key_path or None,
-        remote_dir=remote_dir,
-        ssh_user=ssh_user or None,
-    )
+    with _temporary_env(
+        TYCHE_RECONFIG_EVENTS=reconfig_events,
+        TYCHE_RECONFIG_MIN_N=reconfig_min_n,
+        TYCHE_RECONFIG_MAX_N=reconfig_max_n,
+        TYCHE_RECONFIG_SEED=reconfig_seed,
+        TYCHE_RECONFIG_QUEUE_LEN=reconfig_queue_len,
+    ):
+        _run_or_exit(
+            run_aws,
+            nodes=int(nodes),
+            epochs=int(epochs),
+            protocols=protocols,
+            out_root=out or None,
+            key_path=key_path or None,
+            remote_dir=remote_dir,
+            ssh_user=ssh_user or None,
+        )
 
 
 @task(positional=["nodes"])

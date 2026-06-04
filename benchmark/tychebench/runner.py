@@ -466,14 +466,10 @@ def _protocol_fault_threshold(protocol, options):
 
 
 def _protocol_success_threshold(protocol, options):
-    if protocol == "tyche-reconfig":
-        return 1
     return options.n - _protocol_fault_threshold(protocol, options)
 
 
 def _default_protocol_success_threshold(protocol, nodes):
-    if protocol == "tyche-reconfig":
-        return 1
     if protocol == "grandline":
         fault_threshold = (nodes - 1) // 2
     else:
@@ -482,9 +478,33 @@ def _default_protocol_success_threshold(protocol, nodes):
 
 
 def _aws_protocol_node_indices(protocol, options):
-    if protocol == "tyche-reconfig":
-        return [0]
     return list(range(options.n))
+
+
+def _tyche_queue_len_for_protocol(protocol, options):
+    if protocol in {"tyche-reconfig", "tyche-scrape-reconfig"}:
+        return int(os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "1"))
+    return options.queue_len
+
+
+def _default_reconfig_events(epochs):
+    return max(1, epochs // 20)
+
+
+def _reconfig_events_value(options):
+    return os.environ.get("TYCHE_RECONFIG_EVENTS", str(_default_reconfig_events(options.epochs)))
+
+
+def _reconfig_min_n_value(options):
+    return os.environ.get("TYCHE_RECONFIG_MIN_N", str(options.n - options.fault_threshold))
+
+
+def _reconfig_max_n_value(options):
+    return os.environ.get("TYCHE_RECONFIG_MAX_N", str(options.n + options.fault_threshold))
+
+
+def _reconfig_seed_value():
+    return os.environ.get("TYCHE_RECONFIG_SEED", "20260521")
 
 
 def _protocol_config(protocol, options):
@@ -579,18 +599,12 @@ def _run_protocol(protocol, options):
                 "TYCHE_CHURN_EPOCHS": str(options.epochs),
                 "TYCHE_CHURN_INITIAL_N": str(options.n),
                 "TYCHE_CHURN_INITIAL_F": str(options.fault_threshold),
-                "TYCHE_CHURN_RECONFIG_EVENTS": os.environ.get(
-                    "TYCHE_RECONFIG_EVENTS", str(options.epochs // 20)
-                ),
+                "TYCHE_CHURN_RECONFIG_EVENTS": _reconfig_events_value(options),
                 "TYCHE_CHURN_PREFILL_MS": str(options.prefill_ms),
-                "TYCHE_CHURN_MIN_N": os.environ.get(
-                    "TYCHE_RECONFIG_MIN_N", str(options.n - options.fault_threshold)
-                ),
-                "TYCHE_CHURN_MAX_N": os.environ.get(
-                    "TYCHE_RECONFIG_MAX_N", str(options.n + options.fault_threshold)
-                ),
+                "TYCHE_CHURN_MIN_N": _reconfig_min_n_value(options),
+                "TYCHE_CHURN_MAX_N": _reconfig_max_n_value(options),
                 "TYCHE_CHURN_EPOCH_TIMEOUT_MS": str(options.epoch_timeout_ms),
-                "TYCHE_CHURN_SEED": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+                "TYCHE_CHURN_SEED": _reconfig_seed_value(),
             }
         )
         command = [
@@ -726,7 +740,20 @@ def _parse_results(options, elapsed_by_protocol):
             _write_breakdown_row(breakdown, protocol, final, log_file)
 
             for line in log_file.read_text(errors="replace").splitlines():
-                if any(token in line for token in ("bench_result", "final metrics", "compare", "message_type")):
+                if any(
+                    token in line
+                    for token in (
+                        "bench_result",
+                        "final metrics",
+                        "compare",
+                        "message_type",
+                        "reconfig_schedule",
+                        "reconfig_stop_producing",
+                        "reconfig_removed",
+                        "reconfig_membership_change",
+                        "reconfig_final",
+                    )
+                ):
                     final_handle.write(
                         f"protocol={protocol} node=local host=host0 region=local ip=127.0.0.1 {line}\n"
                     )
@@ -740,12 +767,13 @@ def _parse_results(options, elapsed_by_protocol):
 
 
 def _local_run_config(n, epochs, protocol_list, fault_threshold):
+    bft_f = (n - 1) // 3 if fault_threshold is None else fault_threshold
     return {
         "kind": "local",
         "nodes": n,
         "epochs": epochs,
         "protocols": protocol_list,
-        "fault_threshold": (n - 1) // 3 if fault_threshold is None else fault_threshold,
+        "fault_threshold": bft_f,
         "grandline_fault_threshold": int(os.environ.get("GRANDLINE_F", str((n - 1) // 2))),
         "queue_len": int(os.environ.get("QUEUE_LEN", "8")),
         "producer_ms": int(os.environ.get("PRODUCER_MS", "250")),
@@ -757,10 +785,11 @@ def _local_run_config(n, epochs, protocol_list, fault_threshold):
         "removal_expiration_ms": int(os.environ.get("TYCHE_REMOVAL_EXPIRATION_MS", "0")),
         "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
         "gomaxprocs": int(os.environ.get("GOMAXPROCS_LOCAL", "8")),
-        "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
-        "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", ""),
-        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", ""),
+        "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", str(_default_reconfig_events(epochs))),
+        "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", str(n - bft_f)),
+        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(n + bft_f)),
         "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+        "tyche_reconfig_queue_len": os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "1"),
     }
 
 
@@ -967,7 +996,8 @@ def _aws_binary_targets(protocols):
     targets = {
         "tyche": ("Tyche", "./cmd/tyche", "tyche"),
         "tyche-scrape": ("Tyche", "./cmd/tyche", "tyche"),
-        "tyche-reconfig": ("Tyche", "./protocol/tyche", "tyche-reconfig.test"),
+        "tyche-reconfig": ("Tyche", "./cmd/tyche", "tyche"),
+        "tyche-scrape-reconfig": ("Tyche", "./cmd/tyche", "tyche"),
         "asyrand": ("asyrand", "./cmd/asyrand", "asyrand"),
         "grandline": ("grandline", "./cmd/grandline", "grandline"),
         "spurt": ("spurt", "./cmd/spurt", "spurt"),
@@ -1089,7 +1119,7 @@ def _write_aws_configs(options, hosts):
     peers_file.write_text(",".join(peer_items), encoding="utf-8")
 
     for protocol in options.protocols:
-        if protocol in {"tyche", "tyche-scrape", "tyche-reconfig"}:
+        if protocol in {"tyche", "tyche-scrape", "tyche-reconfig", "tyche-scrape-reconfig"}:
             continue
         if protocol not in {"asyrand", "grandline", "spurt"}:
             raise BenchError(f"unknown AWS protocol: {protocol}")
@@ -1117,57 +1147,45 @@ def _upload_payload_to_host(host, options):
 def _remote_command_for_node(protocol, node, options):
     port = options.base_port + node
     log_file = f"runlogs/{protocol}/node{node}.log"
-    if protocol in {"tyche", "tyche-scrape"}:
+    if protocol in {"tyche", "tyche-scrape", "tyche-reconfig", "tyche-scrape-reconfig"}:
         peers = (options.generated_dir / "tyche_peers.txt").read_text(encoding="utf-8")
         tyche_env = f"GOMAXPROCS={options.gomaxprocs}"
         if os.environ.get("TYCHE_EPOCH_ATTEMPT_MS"):
             tyche_env += f" TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(os.environ['TYCHE_EPOCH_ATTEMPT_MS'])}"
         if os.environ.get("TYCHE_DEBUG"):
             tyche_env += f" TYCHE_DEBUG={_remote_quote(os.environ['TYCHE_DEBUG'])}"
-        pvss_arg = " -pvss scrape" if protocol == "tyche-scrape" else ""
+        pvss_arg = " -pvss scrape" if protocol in {"tyche-scrape", "tyche-scrape-reconfig"} else ""
+        reconfig_arg = ""
+        if protocol in {"tyche-reconfig", "tyche-scrape-reconfig"}:
+            reconfig_events = _reconfig_events_value(options)
+            reconfig_min_n = _reconfig_min_n_value(options)
+            reconfig_seed = _reconfig_seed_value()
+            reconfig_arg = (
+                f" -reconfig-events {_remote_quote(reconfig_events)}"
+                f" -reconfig-min-n {_remote_quote(reconfig_min_n)}"
+                f" -reconfig-seed {_remote_quote(reconfig_seed)}"
+            )
+        queue_len = _tyche_queue_len_for_protocol(protocol, options)
         return (
             f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
-            "export PATH=/usr/local/go/bin:$PATH "
+            "export PATH=/usr/local/go/bin:$PATH && "
             f"export {tyche_env} && "
             f"/usr/bin/time -v ./bin/tyche -transport tcp -node node{node} "
             f"-n {options.n} -f {options.fault_threshold} -epochs {options.epochs} "
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
-            f"-queue-len {options.queue_len} -max-pool {options.max_pool} "
+            f"-queue-len {queue_len} -max-pool {options.max_pool} "
             f"-transport-buffer {options.transport_buffer} "
             f"-removal-expiration-ms {options.removal_expiration_ms} "
             f"-producer-ms {options.producer_ms} -prefill-ms {options.prefill_ms} "
             f"-epoch-timeout-ms {options.epoch_timeout_ms} -report-ms {options.report_ms} "
-            f"{pvss_arg} > {_remote_quote(log_file)} 2>&1"
-        )
-    if protocol == "tyche-reconfig":
-        reconfig_events = os.environ.get("TYCHE_RECONFIG_EVENTS", str(options.epochs // 20))
-        reconfig_min_n = os.environ.get("TYCHE_RECONFIG_MIN_N", str(options.n - options.fault_threshold))
-        reconfig_max_n = os.environ.get("TYCHE_RECONFIG_MAX_N", str(options.n + options.fault_threshold))
-        reconfig_seed = os.environ.get("TYCHE_RECONFIG_SEED", "20260521")
-        return (
-            f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
-            "export PATH=/usr/local/go/bin:$PATH "
-            f"GOMAXPROCS={options.gomaxprocs} "
-            "TYCHE_RECONFIG_BENCH_TEST=1 "
-            "TYCHE_CHURN_PVSS=o1 "
-            f"TYCHE_CHURN_EPOCHS={options.epochs} "
-            f"TYCHE_CHURN_INITIAL_N={options.n} "
-            f"TYCHE_CHURN_INITIAL_F={options.fault_threshold} "
-            f"TYCHE_CHURN_RECONFIG_EVENTS={_remote_quote(reconfig_events)} "
-            f"TYCHE_CHURN_PREFILL_MS={options.prefill_ms} "
-            f"TYCHE_CHURN_MIN_N={_remote_quote(reconfig_min_n)} "
-            f"TYCHE_CHURN_MAX_N={_remote_quote(reconfig_max_n)} "
-            f"TYCHE_CHURN_EPOCH_TIMEOUT_MS={options.epoch_timeout_ms} "
-            f"TYCHE_CHURN_SEED={_remote_quote(reconfig_seed)} "
-            f"/usr/bin/time -v ./bin/tyche-reconfig.test "
-            "-test.run TestBeaconReconfigurationBenchmark200Epochs -test.v "
+            f"{pvss_arg}{reconfig_arg} "
             f"> {_remote_quote(log_file)} 2>&1"
         )
     if protocol in {"asyrand", "grandline", "spurt"}:
         config_path = f"benchmark/generated/aws_n{options.n}/{protocol}.json"
         return (
             f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
-            "export PATH=/usr/local/go/bin:$PATH "
+            "export PATH=/usr/local/go/bin:$PATH && "
             f"GOMAXPROCS={options.gomaxprocs} && "
             f"/usr/bin/time -v ./bin/{protocol} -config {_remote_quote(config_path)} "
             f"-transport tcp -node node{node} > {_remote_quote(log_file)} 2>&1"
@@ -1323,6 +1341,46 @@ def _skip_summary(lines):
     return len(skipped), _line_token(last, "stage"), _line_token(last, "reason"), _line_token(last, "diag")
 
 
+def _reconfig_summary(lines):
+    final = ""
+    schedule_count = 0
+    stop_count = 0
+    for line in lines:
+        if line.startswith("reconfig_schedule "):
+            schedule_count += 1
+        if " reconfig_stop_producing " in f" {line} ":
+            stop_count += 1
+        if line.startswith("reconfig_final "):
+            final = line
+    if not final:
+        return {
+            "reconfig_scheduled_events": str(schedule_count),
+            "reconfig_local_stop_events": str(stop_count),
+            "reconfig_membership_changes": "0",
+            "reconfig_removed": "",
+            "reconfig_completed_epochs": "",
+            "reconfig_final_n": "",
+            "reconfig_final_f": "",
+            "reconfig_config_version": "",
+            "reconfig_min_n": "",
+            "reconfig_seed": "",
+        }
+    scheduled = _line_token(final, "scheduled_events") or str(schedule_count)
+    local_stops = _line_token(final, "local_stop_events") or str(stop_count)
+    return {
+        "reconfig_scheduled_events": scheduled,
+        "reconfig_local_stop_events": local_stops,
+        "reconfig_membership_changes": _line_token(final, "membership_changes"),
+        "reconfig_removed": _line_token(final, "removed"),
+        "reconfig_completed_epochs": _line_token(final, "completed_epochs"),
+        "reconfig_final_n": _line_token(final, "final_n"),
+        "reconfig_final_f": _line_token(final, "final_f"),
+        "reconfig_config_version": _line_token(final, "config_version"),
+        "reconfig_min_n": _line_token(final, "min_n"),
+        "reconfig_seed": _line_token(final, "seed"),
+    }
+
+
 AWS_RESULT_FIELDS = [
     "protocol",
     "node",
@@ -1341,6 +1399,16 @@ AWS_RESULT_FIELDS = [
     "last_skip_stage",
     "last_skip_reason",
     "last_skip_diag",
+    "reconfig_scheduled_events",
+    "reconfig_local_stop_events",
+    "reconfig_membership_changes",
+    "reconfig_removed",
+    "reconfig_completed_epochs",
+    "reconfig_final_n",
+    "reconfig_final_f",
+    "reconfig_config_version",
+    "reconfig_min_n",
+    "reconfig_seed",
     "log",
 ]
 
@@ -1365,7 +1433,7 @@ def _aws_result_row(options, hosts, protocol, node):
     else:
         cpu_pct = ((user + sys_time) / elapsed * 100) if elapsed > 0 else 0
     skipped_epochs, last_skip_stage, last_skip_reason, last_skip_diag = _skip_summary(lines)
-    return {
+    row = {
         "protocol": protocol,
         "node": f"node{node}",
         "host": f"host{host.index}",
@@ -1383,8 +1451,10 @@ def _aws_result_row(options, hosts, protocol, node):
         "last_skip_stage": last_skip_stage,
         "last_skip_reason": last_skip_reason,
         "last_skip_diag": last_skip_diag,
-        "log": str(log_file),
     }
+    row.update(_reconfig_summary(lines))
+    row["log"] = str(log_file)
+    return row
 
 
 def _write_aws_failures(options, protocol_failures, parse_errors):
@@ -1551,12 +1621,13 @@ def _parallel(label, items, fn, max_workers=None):
 
 
 def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
+    bft_f = int(os.environ.get("F", str((nodes - 1) // 3)))
     return {
         "kind": "aws",
         "nodes": nodes,
         "epochs": epochs,
         "protocols": protocol_list,
-        "fault_threshold": int(os.environ.get("F", str((nodes - 1) // 3))),
+        "fault_threshold": bft_f,
         "grandline_fault_threshold": int(os.environ.get("GRANDLINE_F", str((nodes - 1) // 2))),
         "base_port": int(os.environ.get("BASE_PORT", "9000")),
         "queue_len": int(os.environ.get("QUEUE_LEN", "8")),
@@ -1579,10 +1650,11 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "aws_cgo_enabled": os.environ.get("AWS_CGO_ENABLED", "0"),
         "tyche_epoch_attempt_ms": os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", ""),
         "tyche_debug": os.environ.get("TYCHE_DEBUG", ""),
-        "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", ""),
-        "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", ""),
-        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", ""),
+        "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", str(_default_reconfig_events(epochs))),
+        "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", str(nodes - bft_f)),
+        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(nodes + bft_f)),
         "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+        "tyche_reconfig_queue_len": os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "1"),
     }
 
 
