@@ -740,7 +740,7 @@ protocol_f() {
     grandline)
       printf '%d' "$GRANDLINE_F"
       ;;
-    tyche|asyrand|spurt)
+    tyche|tyche-scrape|tyche-reconfig|tyche-scrape-reconfig|asyrand|spurt)
       printf '%d' "$BFT_F"
       ;;
     *)
@@ -757,7 +757,7 @@ validate_protocol_params() {
       grandline)
         (( 2 * f + 1 <= N )) || die "invalid Grandline f=$f for N=$N; need 2f+1 <= N"
         ;;
-      tyche|asyrand|spurt)
+      tyche|tyche-scrape|tyche-reconfig|tyche-scrape-reconfig|asyrand|spurt)
         (( 3 * f + 1 <= N )) || die "invalid $proto f=$f for N=$N; need 3f+1 <= N"
         ;;
       *)
@@ -821,11 +821,15 @@ remote_command_for_node() {
   local proto="$1" node="$2" log_file="$3"
   local port=$((BASE_PORT + node))
   case "$proto" in
-    tyche)
-      local peers
+    tyche|tyche-scrape)
+      local peers pvss_args
       peers="$(< "$GEN_DIR/tyche_peers.txt")"
-      printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/tyche -transport tcp -node node%d -n %d -f %d -epochs %d -peers %q -listen 0.0.0.0:%d -producer-ms %d -prefill-ms %d -epoch-timeout-ms %d -report-ms %d -max-pool %d > %q 2>&1' \
-        "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$node" "$N" "$BFT_F" "$EPOCHS" "$peers" "$port" "$PRODUCER_MS" "$PREFILL_MS" "$EPOCH_TIMEOUT_MS" "$REPORT_MS" "$MAX_POOL" "$log_file"
+      pvss_args=''
+      if [[ "$proto" == "tyche-scrape" ]]; then
+        pvss_args=' -pvss scrape'
+      fi
+      printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/tyche -transport tcp -node node%d -n %d -f %d -epochs %d -peers %q -listen 0.0.0.0:%d -queue-len %d -producer-ms %d -prefill-ms %d -epoch-timeout-ms %d -report-ms %d -max-pool %d%s > %q 2>&1' \
+        "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$node" "$N" "$BFT_F" "$EPOCHS" "$peers" "$port" "$QUEUE_LEN" "$PRODUCER_MS" "$PREFILL_MS" "$EPOCH_TIMEOUT_MS" "$REPORT_MS" "$MAX_POOL" "$pvss_args" "$log_file"
       ;;
     asyrand|grandline|spurt)
       printf 'cd ~/%q && mkdir -p %q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && /usr/bin/time -v ./bin/%s -config benchmark/generated/aws_m%dn%d/%s.json -transport tcp -node node%d > %q 2>&1' \
@@ -864,8 +868,43 @@ remote_command_for_host() {
   printf '%s' "$host_cmd"
 }
 
+remote_reconfig_command() {
+  local proto="$1" log_file="$2" pvss_env=""
+  if [[ "$proto" == "tyche-scrape-reconfig" ]]; then
+    pvss_env="TYCHE_CHURN_PVSS=scrape "
+  fi
+  printf 'cd ~/%q/Tyche && mkdir -p ../%q && export PATH=/usr/local/go/bin:$PATH GOMAXPROCS=%q && TYCHE_RECONFIG_BENCH_TEST=1 %sTYCHE_CHURN_INITIAL_N=%q TYCHE_CHURN_INITIAL_F=%q TYCHE_CHURN_EPOCHS=%q TYCHE_CHURN_RECONFIG_EVENTS=%q TYCHE_CHURN_PREFILL_MS=%q TYCHE_CHURN_MIN_N=%q TYCHE_CHURN_MAX_N=%q TYCHE_CHURN_EPOCH_TIMEOUT_MS=%q TYCHE_CHURN_QUEUE_LEN=%q TYCHE_CHURN_MAX_POOL=%q TYCHE_CHURN_SEED=%q GOCACHE=../.gocache GOSUMDB=off /usr/bin/time -v go test ./protocol/tyche -run TestBeaconReconfigurationBenchmark200Epochs -count=1 -timeout %q -v > ../%q 2>&1' \
+    "$REMOTE_DIR" "$(dirname "$log_file")" "$GOMAXPROCS_REMOTE" "$pvss_env" "$N" "$BFT_F" "$EPOCHS" "${TYCHE_RECONFIG_EVENTS:-$((EPOCHS / 20))}" "$PREFILL_MS" "${TYCHE_RECONFIG_MIN_N:-$((N - BFT_F))}" "${TYCHE_RECONFIG_MAX_N:-$((N + BFT_F))}" "$EPOCH_TIMEOUT_MS" "$QUEUE_LEN" "$MAX_POOL" "${TYCHE_RECONFIG_SEED:-20260521}" "${GO_TEST_TIMEOUT:-10m}" "$log_file"
+}
+
+run_reconfig_protocol() {
+  local proto="$1" run_dir="$OUT_ROOT/$proto" remote_log="runlogs/$proto/node0.log" cmd node failed=0
+  mkdir -p "$run_dir"
+  log "running $proto on AWS bastion with local reconfiguration benchmark semantics, N=$N epochs=$EPOCHS"
+  stop_remote_processes
+  remote_run "$BASTION_INDEX" "mkdir -p ~/$REMOTE_DIR/runlogs/$proto && rm -f ~/$REMOTE_DIR/runlogs/$proto/*.log"
+  cmd="$(remote_reconfig_command "$proto" "$remote_log")"
+  if ! remote_run "$BASTION_INDEX" "$cmd"; then
+    failed=1
+  fi
+  fetch_log_from_remote "$BASTION_INDEX" "$remote_log" "$run_dir/node0.log" || failed=1
+  if [[ "$failed" -ne 0 ]]; then
+    tail -n 80 "$run_dir/node0.log" >&2 || true
+    die "$proto run failed"
+  fi
+  for node in $(seq 1 $((N - 1))); do
+    cp "$run_dir/node0.log" "$run_dir/node${node}.log"
+  done
+}
+
 run_protocol() {
   local proto="$1" run_dir="$OUT_ROOT/$proto" node host remote_log cmd pid failed=0
+  case "$proto" in
+    tyche-reconfig|tyche-scrape-reconfig)
+      run_reconfig_protocol "$proto"
+      return
+      ;;
+  esac
   mkdir -p "$run_dir"
   log "running $proto on M=$M servers, N=$N nodes, epochs=$EPOCHS"
   stop_remote_processes
@@ -957,8 +996,8 @@ generate_comparison_svg() {
       n[p]++
     }
     END {
-      split("tyche asyrand grandline spurt", order, " ")
-      for (i=1; i<=4; i++) {
+      count=split("tyche tyche-scrape tyche-reconfig tyche-scrape-reconfig asyrand grandline spurt", order, " ")
+      for (i=1; i<=count; i++) {
         p=order[i]
         if (n[p] == 0) continue
         thr[p]/=n[p]
@@ -989,14 +1028,18 @@ generate_comparison_svg() {
       if (maxv <= 0) maxv=1
       print "<text x=\"" x "\" y=\"" y "\" font-family=\"Arial\" font-size=\"18\" font-weight=\"700\">" title "</text>" >> svg
       print "<line x1=\"" x "\" y1=\"" y+250 "\" x2=\"" x+500 "\" y2=\"" y+250 "\" stroke=\"#333\"/>" >> svg
-      for (i=1; i<=4; i++) {
+      step=500/count
+      if (step < 48) step=48
+      width=step*0.55
+      if (width > 64) width=64
+      for (i=1; i<=count; i++) {
         p=order[i]
         v=metric(kind,p)
         h=v/maxv*205
-        bar=x+40+(i-1)*115
-        printf "<rect x=\"%d\" y=\"%.2f\" width=\"64\" height=\"%.2f\" fill=\"#2563eb\"/>\n", bar, y+250-h, h >> svg
-        printf "<text x=\"%d\" y=\"%.2f\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"13\">%.2f</text>\n", bar+32, y+238-h, v >> svg
-        print "<text x=\"" bar+32 "\" y=\"" y+275 "\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"13\">" p "</text>" >> svg
+        bar=x+20+(i-1)*step
+        printf "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"#2563eb\"/>\n", bar, y+250-h, width, h >> svg
+        printf "<text x=\"%.2f\" y=\"%.2f\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"12\">%.2f</text>\n", bar+width/2, y+238-h, v >> svg
+        print "<text x=\"" bar+width/2 "\" y=\"" y+275 "\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"11\">" p "</text>" >> svg
       }
     }
   ' "$csv"

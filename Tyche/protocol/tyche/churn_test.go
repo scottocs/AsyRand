@@ -108,14 +108,16 @@ func TestBeaconReconfigurationBenchmark200Epochs(t *testing.T) {
 }
 
 type churnCluster struct {
-	net          *p2p.MemoryNetwork
-	nodes        map[p2p.NodeID]*Node
-	active       map[p2p.NodeID]bool
-	stopped      map[p2p.NodeID]bool
-	cancels      map[p2p.NodeID]context.CancelFunc
-	pendingJoins map[p2p.NodeID]pendingChurnJoin
-	pvssEpoch    uint64
-	pvss         string
+	net           *p2p.MemoryNetwork
+	nodes         map[p2p.NodeID]*Node
+	active        map[p2p.NodeID]bool
+	stopped       map[p2p.NodeID]bool
+	cancels       map[p2p.NodeID]context.CancelFunc
+	pendingJoins  map[p2p.NodeID]pendingChurnJoin
+	pvssEpoch     uint64
+	pvss          string
+	queueLen      int
+	cryptoWorkers int
 }
 
 type churnResult struct {
@@ -244,25 +246,33 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 	if pvss == "" {
 		pvss = crypto.PVSSO1
 	}
+	queueLen := envInt("TYCHE_CHURN_QUEUE_LEN", 0)
+	initialQueueLen := queueLen
+	if initialQueueLen <= 0 {
+		initialQueueLen = n + 64
+	}
+	cryptoWorkers := envInt("TYCHE_CHURN_MAX_POOL", 0)
 	pp, keys, err := crypto.SetupPVSS(pvss, "churn-config-0", f+1, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := &churnCluster{
-		net:          p2p.NewMemoryNetwork(),
-		nodes:        make(map[p2p.NodeID]*Node, n),
-		active:       make(map[p2p.NodeID]bool, n),
-		stopped:      make(map[p2p.NodeID]bool, n),
-		cancels:      make(map[p2p.NodeID]context.CancelFunc, n),
-		pendingJoins: make(map[p2p.NodeID]pendingChurnJoin),
-		pvss:         pvss,
+		net:           p2p.NewMemoryNetwork(),
+		nodes:         make(map[p2p.NodeID]*Node, n),
+		active:        make(map[p2p.NodeID]bool, n),
+		stopped:       make(map[p2p.NodeID]bool, n),
+		cancels:       make(map[p2p.NodeID]context.CancelFunc, n),
+		pendingJoins:  make(map[p2p.NodeID]pendingChurnJoin),
+		pvss:          pvss,
+		queueLen:      queueLen,
+		cryptoWorkers: cryptoWorkers,
 	}
 	for _, id := range ids {
 		scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: n + 64, PVSS: scheme, PVSSBackend: pvss, Transport: c.net.NewTransport(id, 32768)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: initialQueueLen, PVSS: scheme, PVSSBackend: pvss, CryptoWorkers: cryptoWorkers, Transport: c.net.NewTransport(id, 32768)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -588,7 +598,11 @@ func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2
 	ref.mu.Lock()
 	f := ref.State.F
 	ref.mu.Unlock()
-	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: len(members) + 64, PVSS: scheme, PVSSBackend: c.pvss, Transport: c.net.NewTransport(id, 32768)})
+	queueLen := c.queueLen
+	if queueLen <= 0 {
+		queueLen = len(members) + 64
+	}
+	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: queueLen, PVSS: scheme, PVSSBackend: c.pvss, CryptoWorkers: c.cryptoWorkers, Transport: c.net.NewTransport(id, 32768)})
 	if err != nil {
 		t.Fatal(err)
 	}
