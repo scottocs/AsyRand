@@ -48,6 +48,18 @@ type Beacon struct {
 	Signature     crypto.QuorumCertificate `json:"signature"`
 	ConfigVersion uint64                   `json:"config_version"`
 	State         CertifiedStateDigest     `json:"state"`
+	StateHash     string                   `json:"state_hash"`
+}
+
+type BeaconCertificate struct {
+	Epoch         uint64                   `json:"epoch"`
+	Source        p2p.NodeID               `json:"source"`
+	Seq           uint64                   `json:"seq"`
+	Random        []byte                   `json:"random"`
+	ObjectID      string                   `json:"object_id"`
+	Signature     crypto.QuorumCertificate `json:"signature"`
+	ConfigVersion uint64                   `json:"config_version"`
+	StateHash     string                   `json:"state_hash"`
 }
 
 type CertifiedStateDigest struct {
@@ -133,12 +145,12 @@ type ReconReadyMessage ReconEchoMessage
 // signedReconReadyMessage carries the signer identity counted for READY quorum
 // certification. The READY amplification rule is unchanged.
 type signedReconReadyMessage struct {
-	Epoch     uint64               `json:"epoch"`
-	Source    p2p.NodeID           `json:"source"`
-	Seq       uint64               `json:"seq"`
-	Random    []byte               `json:"random"`
-	State     CertifiedStateDigest `json:"state"`
-	Signature crypto.VoteShare     `json:"signature"`
+	Epoch     uint64           `json:"epoch"`
+	Source    p2p.NodeID       `json:"source"`
+	Seq       uint64           `json:"seq"`
+	Random    []byte           `json:"random"`
+	StateHash string           `json:"state_hash"`
+	Signature crypto.VoteShare `json:"signature"`
 }
 
 type Node struct {
@@ -185,7 +197,7 @@ type Node struct {
 	producing    bool
 	waiters      map[string][]chan Beacon
 	certBeacons  map[string]Beacon
-	pendingCerts map[string]Beacon
+	pendingCerts map[string]BeaconCertificate
 	certifying   map[string]bool
 
 	Beacons chan Beacon
@@ -327,7 +339,7 @@ func NewNode(cfg Config) (*Node, error) {
 		producing:    true,
 		waiters:      make(map[string][]chan Beacon),
 		certBeacons:  make(map[string]Beacon),
-		pendingCerts: make(map[string]Beacon),
+		pendingCerts: make(map[string]BeaconCertificate),
 		certifying:   make(map[string]bool),
 		Beacons:      make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
 	}
@@ -745,7 +757,7 @@ func (n *Node) certifiedBeaconForEpoch(epoch uint64) (Beacon, bool) {
 
 func (n *Node) applyPendingBeaconCert(epoch uint64) (Beacon, bool) {
 	n.mu.Lock()
-	candidates := make([]Beacon, 0, len(n.pendingCerts))
+	candidates := make([]BeaconCertificate, 0, len(n.pendingCerts))
 	for _, b := range n.pendingCerts {
 		if b.Epoch == epoch {
 			candidates = append(candidates, b)
@@ -1156,7 +1168,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.Go(ctx, func() {
-			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, CertifiedStateDigest{}, crypto.VoteShare{})
+			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, "", CertifiedStateDigest{}, crypto.VoteShare{})
 		})
 	case "RECON_READY":
 		body, err := p2p.DecodePayload[signedReconReadyMessage](msg)
@@ -1165,7 +1177,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.Go(ctx, func() {
-			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.State, body.Signature)
+			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.StateHash, CertifiedStateDigest{}, body.Signature)
 		})
 	case "JOIN_ACK":
 		body, err := p2p.DecodePayload[JoinAck](msg)
@@ -1192,7 +1204,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		return n.InstallJoinCertificate(body)
 	case "BEACON_CERT":
-		body, err := p2p.DecodePayload[Beacon](msg)
+		body, err := p2p.DecodePayload[BeaconCertificate](msg)
 		if err != nil {
 			return err
 		}
@@ -1291,10 +1303,9 @@ func debugf(format string, args ...any) {
 	}
 }
 
-func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, sig crypto.VoteShare) {
+func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, stateHash string, state CertifiedStateDigest, sig crypto.VoteShare) {
 	key := epochKey(epoch, source, seq)
 	rh := hex.EncodeToString(random)
-	stateHash := stateDigestHash(state)
 	voteKey := rh + "/" + stateHash
 	readyKey := key + "/" + voteKey
 	if kind == "ready" {
@@ -1355,12 +1366,20 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	var votes []crypto.VoteShare
 	var members map[string]struct{}
 	if certify {
-		members = n.memberSetLocked()
-		for id := range n.readies[key][voteKey] {
-			senders = append(senders, id)
-			votes = append(votes, n.readies[key][voteKey][id])
+		if len(state.Members) == 0 {
+			state = n.certifiedStateDigestForBeaconLocked(source, seq)
+			if stateDigestHash(state) != stateHash {
+				certify = false
+			}
 		}
-		sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
+		members = n.memberSetLocked()
+		if certify {
+			for id := range n.readies[key][voteKey] {
+				senders = append(senders, id)
+				votes = append(votes, n.readies[key][voteKey][id])
+			}
+			sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
+		}
 	}
 	n.mu.Unlock()
 	if needReady {
@@ -1373,7 +1392,7 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 			n.Perf.addCertSign(time.Since(start))
 		}
 		if err == nil {
-			msg, err := p2p.NewMessage(Protocol, "RECON_READY", key, n.ID, "", signedReconReadyMessage{Epoch: epoch, Source: source, Seq: seq, Random: random, State: state, Signature: sig})
+			msg, err := p2p.NewMessage(Protocol, "RECON_READY", key, n.ID, "", signedReconReadyMessage{Epoch: epoch, Source: source, Seq: seq, Random: random, StateHash: stateHash, Signature: sig})
 			if err == nil {
 				n.safeBroadcast(ctx, msg)
 			}
@@ -1399,11 +1418,11 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		}
 		n.certified[readyKey] = true
 		n.mu.Unlock()
-		n.certifyBeacon(epoch, source, seq, random, state, senders, cert)
+		n.certifyBeacon(epoch, source, seq, random, state, senders, cert, true)
 	}
 }
 
-func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate) {
+func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate, broadcastCert bool) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
@@ -1416,10 +1435,10 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 	}
 	n.certifying[key] = true
 	n.mu.Unlock()
-	go n.finishCertifyBeacon(epoch, source, seq, random, state, senders, cert)
+	go n.finishCertifyBeacon(epoch, source, seq, random, state, senders, cert, broadcastCert)
 }
 
-func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate) {
+func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate, broadcastCert bool) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
 	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
@@ -1459,7 +1478,7 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	b := Beacon{
 		Epoch: epoch, Source: source, Seq: seq, PrevRandom: prev, Random: append([]byte(nil), random...),
 		Secret: secret, ObjectID: obj.Commitment.SecretID, ReadySenders: senders, Signature: cert,
-		ConfigVersion: configVersion, State: state,
+		ConfigVersion: configVersion, State: state, StateHash: stateDigestHash(state),
 	}
 	n.certBeacons[key] = b
 	delete(n.certifying, key)
@@ -1476,10 +1495,44 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		default:
 		}
 	}
-	msg, err := p2p.NewMessage(Protocol, "BEACON_CERT", key, n.ID, "", b)
-	if err == nil {
-		n.safeBroadcast(context.Background(), msg)
+	if broadcastCert && n.shouldBroadcastBeaconCert(cert) {
+		c := BeaconCertificate{
+			Epoch: epoch, Source: source, Seq: seq, Random: append([]byte(nil), random...),
+			ObjectID: obj.Commitment.SecretID, Signature: cert, ConfigVersion: configVersion,
+			StateHash: stateDigestHash(state),
+		}
+		msg, err := p2p.NewMessage(Protocol, "BEACON_CERT", key, n.ID, "", c)
+		if err == nil {
+			n.safeBroadcast(context.Background(), msg)
+		}
 	}
+}
+
+func (n *Node) shouldBroadcastBeaconCert(cert crypto.QuorumCertificate) bool {
+	relays := certificateSigners(cert)
+	n.mu.Lock()
+	limit := n.State.F + 1
+	n.mu.Unlock()
+	if limit > len(relays) {
+		limit = len(relays)
+	}
+	for _, id := range relays[:limit] {
+		if id == n.ID {
+			return true
+		}
+	}
+	return false
+}
+
+func certificateSigners(cert crypto.QuorumCertificate) []p2p.NodeID {
+	signers := make([]string, 0, len(cert.Signers))
+	signers = append(signers, cert.Signers...)
+	sort.Strings(signers)
+	ids := make([]p2p.NodeID, 0, len(signers))
+	for _, signer := range signers {
+		ids = append(ids, p2p.NodeID(signer))
+	}
+	return ids
 }
 
 func (n *Node) safeBroadcast(ctx context.Context, msg p2p.Message) {
@@ -1489,7 +1542,7 @@ func (n *Node) safeBroadcast(ctx context.Context, msg p2p.Message) {
 	_ = n.Transport.Broadcast(ctx, msg)
 }
 
-func (n *Node) handleBeaconCert(b Beacon) error {
+func (n *Node) handleBeaconCert(b BeaconCertificate) error {
 	if b.Epoch == 0 || b.Source == "" || b.Seq == 0 || len(b.Random) == 0 {
 		return nil
 	}
@@ -1497,7 +1550,7 @@ func (n *Node) handleBeaconCert(b Beacon) error {
 	return nil
 }
 
-func (n *Node) tryApplyBeaconCert(b Beacon) bool {
+func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 	key := epochKey(b.Epoch, b.Source, b.Seq)
 	n.mu.Lock()
 	if n.State.Epoch >= b.Epoch || n.State.Epoch+1 != b.Epoch || b.ConfigVersion != n.State.ConfigVersion || (n.lockedFrom != 0 && b.Epoch >= n.lockedFrom) {
@@ -1510,6 +1563,12 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 	obj, ok := n.State.ComQ[b.Source][b.Seq]
 	threshold := 2*n.State.F + 1
 	members := n.memberSetLocked()
+	state := CertifiedStateDigest{}
+	stateHash := ""
+	if ok && obj.ConfigVersion == b.ConfigVersion {
+		state = n.certifiedStateDigestForBeaconLocked(b.Source, b.Seq)
+		stateHash = stateDigestHash(state)
+	}
 	n.mu.Unlock()
 
 	if !ok || obj.ConfigVersion != b.ConfigVersion {
@@ -1520,13 +1579,19 @@ func (n *Node) tryApplyBeaconCert(b Beacon) bool {
 		n.mu.Unlock()
 		return false
 	}
+	if b.ObjectID != "" && b.ObjectID != obj.Commitment.SecretID {
+		return false
+	}
+	if b.StateHash == "" || b.StateHash != stateHash {
+		return false
+	}
 	if err := crypto.VerifyQuorumCertificate(b.Signature, members, threshold); err != nil {
 		return false
 	}
 	n.mu.Lock()
 	delete(n.pendingCerts, key)
 	n.mu.Unlock()
-	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, b.State, b.ReadySenders, b.Signature)
+	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, state, certificateSigners(b.Signature), b.Signature, false)
 	return true
 }
 
