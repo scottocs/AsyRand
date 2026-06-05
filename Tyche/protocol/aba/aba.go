@@ -546,6 +546,10 @@ func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round ui
 		return nil
 	}
 	a.ensureRound(st, round)
+	if st.bvalSent[round][value] {
+		a.mu.Unlock()
+		return nil
+	}
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()
 	return a.broadcast(ctx, "BVAL", instance, BValMessage{Round: round, Value: value})
@@ -604,10 +608,23 @@ func (a *Agreement) broadcastAsync(typ, instance string, payload any) {
 		return
 	}
 	go func() {
+		if a.decidedOrPruned(instance) {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = a.Transport.Broadcast(ctx, msg)
 	}()
+}
+
+func (a *Agreement) decidedOrPruned(instance string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.pruned[instance]; ok {
+		return true
+	}
+	st := a.state[instance]
+	return st != nil && st.decided
 }
 
 func CoinFromSeed(instance string, round uint64, seed []byte) bool {

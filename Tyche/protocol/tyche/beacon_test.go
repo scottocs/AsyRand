@@ -648,7 +648,7 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 		seed = []byte("certified-beacon-seed-" + string(rune('a'+i)))
 	}
 	nodes[0].mu.Lock()
-	nodes[0].beaconSeeds[1+st.Round] = seed
+	nodes[0].beaconSeeds[1+st.Round+1] = seed
 	nodes[0].mu.Unlock()
 
 	if err := nodes[0].waitCoinBarrier(ctx, "other"); err != nil {

@@ -30,14 +30,16 @@ func TCPBufferForPeers(peers int) int {
 }
 
 type TCPTransport struct {
-	id       NodeID
-	addr     string
-	peers    map[NodeID]string
-	inbox    chan Message
-	listener net.Listener
-	mu       sync.RWMutex
-	closed   bool
-	conns    map[NodeID]*tcpPeerConn
+	id        NodeID
+	addr      string
+	peers     map[NodeID]string
+	inbox     chan Message
+	listener  net.Listener
+	mu        sync.RWMutex
+	closed    bool
+	conns     map[NodeID]*tcpPeerConn
+	statsMu   sync.Mutex
+	typeStats map[string]MessageTypeMetrics
 
 	maxMessageBytes uint32
 	dialTimeout     time.Duration
@@ -132,8 +134,10 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		sizeWithFrame := uint64(size) + 4
 		t.recvMessages.Add(1)
-		t.recvBytes.Add(uint64(size) + 4)
+		t.recvBytes.Add(sizeWithFrame)
+		t.recordRecvTypeStats(msg, sizeWithFrame)
 		t.inbox <- msg
 	}
 }
@@ -153,8 +157,10 @@ func (t *TCPTransport) Send(ctx context.Context, to NodeID, msg Message) error {
 			size := uint64(len(data)) + 4
 			t.sentMessages.Add(1)
 			t.sentBytes.Add(size)
+			t.recordSentTypeStats(msg, size)
 			t.recvMessages.Add(1)
 			t.recvBytes.Add(size)
+			t.recordRecvTypeStats(msg, size)
 			return nil
 		default:
 			go t.enqueueSelf(ctx, msg, uint64(len(data))+4)
@@ -182,8 +188,10 @@ func (t *TCPTransport) Send(ctx context.Context, to NodeID, msg Message) error {
 		last = t.sendOnce(sendCtx, to, addr, data)
 		cancel()
 		if last == nil {
+			size := uint64(len(data)) + 4
 			t.sentMessages.Add(1)
-			t.sentBytes.Add(uint64(len(data)) + 4)
+			t.sentBytes.Add(size)
+			t.recordSentTypeStats(msg, size)
 			return nil
 		}
 	}
@@ -195,8 +203,10 @@ func (t *TCPTransport) enqueueSelf(ctx context.Context, msg Message, size uint64
 	case t.inbox <- msg:
 		t.sentMessages.Add(1)
 		t.sentBytes.Add(size)
+		t.recordSentTypeStats(msg, size)
 		t.recvMessages.Add(1)
 		t.recvBytes.Add(size)
+		t.recordRecvTypeStats(msg, size)
 	case <-ctx.Done():
 	}
 }
@@ -239,6 +249,42 @@ func (t *TCPTransport) Metrics() Metrics {
 		RecvMessages: t.recvMessages.Load(),
 		RecvBytes:    t.recvBytes.Load(),
 	}
+}
+
+func (t *TCPTransport) MessageTypeMetrics() map[string]MessageTypeMetrics {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	out := make(map[string]MessageTypeMetrics, len(t.typeStats))
+	for k, v := range t.typeStats {
+		out[k] = v
+	}
+	return out
+}
+
+func (t *TCPTransport) recordSentTypeStats(msg Message, size uint64) {
+	key := msg.Protocol + "/" + msg.Type
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	if t.typeStats == nil {
+		t.typeStats = make(map[string]MessageTypeMetrics)
+	}
+	stats := t.typeStats[key]
+	stats.SentMessages++
+	stats.SentBytes += size
+	t.typeStats[key] = stats
+}
+
+func (t *TCPTransport) recordRecvTypeStats(msg Message, size uint64) {
+	key := msg.Protocol + "/" + msg.Type
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	if t.typeStats == nil {
+		t.typeStats = make(map[string]MessageTypeMetrics)
+	}
+	stats := t.typeStats[key]
+	stats.RecvMessages++
+	stats.RecvBytes += size
+	t.typeStats[key] = stats
 }
 
 func (t *TCPTransport) Close() error {

@@ -8,6 +8,7 @@ import (
 	asig "github.com/scottocs/Tyche/asyrand/crypto"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,7 @@ type finalMetricWindow struct {
 	start   time.Time
 	metrics metricSnapshot
 	perf    asyrand.PerfSnapshot
+	types   map[string]p2p.MessageTypeMetrics
 	beacons uint64
 }
 
@@ -336,6 +338,27 @@ func collectMetrics(nodes []*asyrand.Node) metricSnapshot {
 	return out
 }
 
+func collectMessageTypeMetrics(nodes []*asyrand.Node) map[string]p2p.MessageTypeMetrics {
+	out := make(map[string]p2p.MessageTypeMetrics)
+	for _, node := range nodes {
+		typed, ok := node.Transport.(interface {
+			MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
+		})
+		if !ok {
+			continue
+		}
+		for key, stats := range typed.MessageTypeMetrics() {
+			current := out[key]
+			current.SentMessages += stats.SentMessages
+			current.SentBytes += stats.SentBytes
+			current.RecvMessages += stats.RecvMessages
+			current.RecvBytes += stats.RecvBytes
+			out[key] = current
+		}
+	}
+	return out
+}
+
 func collectPerf(nodes []*asyrand.Node) asyrand.PerfSnapshot {
 	var out asyrand.PerfSnapshot
 	for _, node := range nodes {
@@ -364,6 +387,7 @@ func (w *finalMetricWindow) recordBeacon(nodes []*asyrand.Node) {
 		w.start = time.Now()
 		w.metrics = collectMetrics(nodes)
 		w.perf = collectPerf(nodes)
+		w.types = collectMessageTypeMetrics(nodes)
 		return
 	}
 	w.beacons++
@@ -375,6 +399,7 @@ func (w *finalMetricWindow) print(nodes []*asyrand.Node, queueTotal int, queueMa
 		return
 	}
 	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
+	printMessageTypeMetricsDiff(collectMessageTypeMetrics(nodes), w.types)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
@@ -410,6 +435,80 @@ func printMetricDelta(label string, delta metricSnapshot, perf asyrand.PerfSnaps
 		asyrand.AvgDuration(perf.RBCHandleTotal, perf.RBCHandleCount),
 		asyrand.AvgDuration(perf.CertSignTotal, perf.CertSignCount),
 		asyrand.AvgDuration(perf.CertVerifyTotal, perf.CertVerifyCount), asyrand.AvgDuration(perf.CertAggregateTotal, perf.CertAggregateCount))
+}
+
+func printMessageTypeMetricsDiff(types map[string]p2p.MessageTypeMetrics, prev map[string]p2p.MessageTypeMetrics) {
+	if len(types) == 0 {
+		return
+	}
+	if prev != nil {
+		types = subtractMessageTypeMetrics(types, prev)
+	}
+	printMessageCategoryMetrics(types)
+	keys := make([]string, 0, len(types))
+	for key := range types {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		stats := types[key]
+		fmt.Printf("message_type type=%s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB\n", key, stats.SentMessages, stats.RecvMessages, float64(stats.SentBytes)/1024, float64(stats.RecvBytes)/1024)
+	}
+}
+
+func subtractMessageTypeMetrics(current, prev map[string]p2p.MessageTypeMetrics) map[string]p2p.MessageTypeMetrics {
+	out := make(map[string]p2p.MessageTypeMetrics, len(current))
+	for key, stats := range current {
+		before := prev[key]
+		out[key] = p2p.MessageTypeMetrics{
+			SentMessages: stats.SentMessages - before.SentMessages,
+			SentBytes:    stats.SentBytes - before.SentBytes,
+			RecvMessages: stats.RecvMessages - before.RecvMessages,
+			RecvBytes:    stats.RecvBytes - before.RecvBytes,
+		}
+	}
+	return out
+}
+
+func printMessageCategoryMetrics(types map[string]p2p.MessageTypeMetrics) {
+	categories := make(map[string]p2p.MessageTypeMetrics)
+	for key, stats := range types {
+		category := messageCategory(key)
+		current := categories[category]
+		current.SentMessages += stats.SentMessages
+		current.SentBytes += stats.SentBytes
+		current.RecvMessages += stats.RecvMessages
+		current.RecvBytes += stats.RecvBytes
+		categories[category] = current
+	}
+	keys := make([]string, 0, len(categories))
+	for key := range categories {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		stats := categories[key]
+		fmt.Printf("message_category category=%s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB\n", key, stats.SentMessages, stats.RecvMessages, float64(stats.SentBytes)/1024, float64(stats.RecvBytes)/1024)
+	}
+}
+
+func messageCategory(key string) string {
+	switch {
+	case key == "rbc/VAL":
+		return "producer_rbc_value"
+	case strings.HasPrefix(key, "rbc/"):
+		return "rbc_control"
+	case key == "asyrand/RECON":
+		return "consumer_recon"
+	case key == "asyrand/ECHO":
+		return "consumer_echo"
+	case key == "asyrand/READY":
+		return "consumer_ready"
+	case strings.HasPrefix(key, "asyrand/"):
+		return "asyrand_other"
+	default:
+		return "other"
+	}
 }
 
 func waitForTCPPeers(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeID]string, timeout time.Duration) error {

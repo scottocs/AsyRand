@@ -172,33 +172,34 @@ type Node struct {
 	// readies stores verified READY votes rather than bare sender ids.
 	// This lets certification aggregate the exact votes that justified the
 	// Bracha-style READY threshold.
-	readies      map[string]map[string]map[p2p.NodeID]crypto.VoteShare
-	readySent    map[string]bool
-	reconSent    map[string]bool
-	certified    map[string]bool
-	joinAcks     map[string]map[p2p.NodeID]JoinAck
-	joinCommits  map[string]map[p2p.NodeID]JoinCommit
-	joinRequests map[string]JoinRequest
-	pendingJoins map[string]JoinCertificate
-	joinCoinWait map[string]uint64
-	armSent      map[string]bool
-	commitSent   map[string]bool
-	abaInputSent map[string]bool
-	abaInputs    map[string]bool
-	lockedFrom   uint64
-	pvssKeys     map[string]kyber.Scalar
-	pvssBackend  string
-	beaconSeeds  map[uint64][]byte
-	verified     map[string]verifiedObject
-	producerBusy map[uint64]bool
-	producerLow  int
-	producerHigh int
-	removalWait  time.Duration
-	producing    bool
-	waiters      map[string][]chan Beacon
-	certBeacons  map[string]Beacon
-	pendingCerts map[string]BeaconCertificate
-	certifying   map[string]bool
+	readies        map[string]map[string]map[p2p.NodeID]crypto.VoteShare
+	readySent      map[string]bool
+	readySentEpoch map[string]bool
+	reconSent      map[string]bool
+	certified      map[string]bool
+	joinAcks       map[string]map[p2p.NodeID]JoinAck
+	joinCommits    map[string]map[p2p.NodeID]JoinCommit
+	joinRequests   map[string]JoinRequest
+	pendingJoins   map[string]JoinCertificate
+	joinCoinWait   map[string]uint64
+	armSent        map[string]bool
+	commitSent     map[string]bool
+	abaInputSent   map[string]bool
+	abaInputs      map[string]bool
+	lockedFrom     uint64
+	pvssKeys       map[string]kyber.Scalar
+	pvssBackend    string
+	beaconSeeds    map[uint64][]byte
+	verified       map[string]verifiedObject
+	producerBusy   map[uint64]bool
+	producerLow    int
+	producerHigh   int
+	removalWait    time.Duration
+	producing      bool
+	waiters        map[string][]chan Beacon
+	certBeacons    map[string]Beacon
+	pendingCerts   map[string]BeaconCertificate
+	certifying     map[string]bool
 
 	Beacons chan Beacon
 	Joins   chan JoinCertificate
@@ -321,7 +322,7 @@ func NewNode(cfg Config) (*Node, error) {
 		State:  st,
 		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool), reconClosing: make(map[string]bool),
 		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare),
-		readySent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
+		readySent: make(map[string]bool), readySentEpoch: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
 		joinRequests: make(map[string]JoinRequest), pendingJoins: make(map[string]JoinCertificate),
 		joinCoinWait: make(map[string]uint64),
@@ -1032,7 +1033,7 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 		p.Round = st.Round
 		p.CoinWait = st.CoinWait
 		if st.CoinWait {
-			target := p.Epoch + st.Round
+			target := p.Epoch + st.Round + 1
 			if seed := n.beaconSeeds[target]; len(seed) > 0 {
 				p.CoinWait = false
 				feeds = append(feeds, seedFeed{instance: inst, round: st.Round, seed: append([]byte(nil), seed...)})
@@ -1308,6 +1309,12 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	rh := hex.EncodeToString(random)
 	voteKey := rh + "/" + stateHash
 	readyKey := key + "/" + voteKey
+	n.mu.Lock()
+	if n.State.Epoch >= epoch {
+		n.mu.Unlock()
+		return
+	}
+	n.mu.Unlock()
 	if kind == "ready" {
 		n.mu.Lock()
 		duplicate := n.certified[readyKey]
@@ -1357,8 +1364,9 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	}
 	echoCount := len(n.echoes[key][rh])
 	readyCount := len(n.readies[key][voteKey])
-	needReady := !n.readySent[readyKey] && (echoCount >= 2*n.State.F+1 || readyCount >= n.State.F+1)
+	needReady := !n.readySentEpoch[key] && !n.readySent[readyKey] && (echoCount >= 2*n.State.F+1 || readyCount >= n.State.F+1)
 	if needReady {
+		n.readySentEpoch[key] = true
 		n.readySent[readyKey] = true
 	}
 	certify := !n.certified[readyKey] && readyCount >= 2*n.State.F+1
@@ -1510,18 +1518,7 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 
 func (n *Node) shouldBroadcastBeaconCert(cert crypto.QuorumCertificate) bool {
 	relays := certificateSigners(cert)
-	n.mu.Lock()
-	limit := n.State.F + 1
-	n.mu.Unlock()
-	if limit > len(relays) {
-		limit = len(relays)
-	}
-	for _, id := range relays[:limit] {
-		if id == n.ID {
-			return true
-		}
-	}
-	return false
+	return len(relays) > 0 && relays[0] == n.ID
 }
 
 func certificateSigners(cert crypto.QuorumCertificate) []p2p.NodeID {
@@ -1603,7 +1600,7 @@ type coinFeed struct {
 func (n *Node) processPendingABAsLocked(certEpoch uint64) []coinFeed {
 	var feeds []coinFeed
 	for inst, p := range n.State.PendingABAs {
-		if p.CoinWait && p.Epoch+p.Round == certEpoch {
+		if p.CoinWait && p.Epoch+p.Round+1 == certEpoch {
 			feeds = append(feeds, coinFeed{instance: inst, round: p.Round})
 		}
 	}
@@ -1723,6 +1720,11 @@ func (n *Node) cleanupCertifiedStateLocked(epoch uint64) {
 	for key := range n.readySent {
 		if keyEpoch(key) < minRecon {
 			delete(n.readySent, key)
+		}
+	}
+	for key := range n.readySentEpoch {
+		if keyEpoch(key) < minRecon {
+			delete(n.readySentEpoch, key)
 		}
 	}
 	for key := range n.reconSent {
@@ -2000,7 +2002,7 @@ func (n *Node) handleCoinRequest(req aba.CoinRequest) {
 	if p := n.State.PendingABAs[req.Instance]; p != nil {
 		p.Round = req.Round
 		p.CoinWait = true
-		target := p.Epoch + req.Round
+		target := p.Epoch + req.Round + 1
 		if known := n.beaconSeeds[target]; len(known) > 0 {
 			seed = append([]byte(nil), known...)
 			p.CoinWait = false

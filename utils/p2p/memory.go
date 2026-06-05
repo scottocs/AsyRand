@@ -66,9 +66,10 @@ func (t *MemoryTransport) Send(ctx context.Context, to NodeID, msg Message) erro
 	case peer.inbox <- msg:
 		t.sentMessages.Add(1)
 		t.sentBytes.Add(uint64(size))
-		t.recordTypeStats(msg, size)
+		t.recordSentTypeStats(msg, size)
 		peer.recvMessages.Add(1)
 		peer.recvBytes.Add(uint64(size))
+		peer.recordRecvTypeStats(msg, size)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -116,7 +117,7 @@ func (t *MemoryTransport) MessageTypeMetrics() map[string]MessageTypeMetrics {
 	return out
 }
 
-func (t *MemoryTransport) recordTypeStats(msg Message, size int) {
+func (t *MemoryTransport) recordSentTypeStats(msg Message, size int) {
 	key := msg.Protocol + "/" + msg.Type
 	t.statsMu.Lock()
 	defer t.statsMu.Unlock()
@@ -126,6 +127,19 @@ func (t *MemoryTransport) recordTypeStats(msg Message, size int) {
 	stats := t.typeStats[key]
 	stats.SentMessages++
 	stats.SentBytes += uint64(size)
+	t.typeStats[key] = stats
+}
+
+func (t *MemoryTransport) recordRecvTypeStats(msg Message, size int) {
+	key := msg.Protocol + "/" + msg.Type
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	if t.typeStats == nil {
+		t.typeStats = make(map[string]MessageTypeMetrics)
+	}
+	stats := t.typeStats[key]
+	stats.RecvMessages++
+	stats.RecvBytes += uint64(size)
 	t.typeStats[key] = stats
 }
 

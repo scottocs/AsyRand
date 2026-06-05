@@ -12,6 +12,8 @@ type Metrics struct {
 type MessageTypeMetrics struct {
 	SentMessages uint64
 	SentBytes    uint64
+	RecvMessages uint64
+	RecvBytes    uint64
 }
 
 type Transport interface {

@@ -27,6 +27,7 @@ type finalMetricWindow struct {
 	start   time.Time
 	metrics metricSnapshot
 	perf    tyche.PerfSnapshot
+	types   map[string]p2p.MessageTypeMetrics
 	beacons uint64
 }
 
@@ -212,7 +213,6 @@ func runMemory(opts runOptions) error {
 
 	queueTotal, queueMax := collectQueue(nodes)
 	finalWindow.print(nodes, queueTotal, queueMax)
-	printMessageTypeMetrics(nodes)
 	return nil
 }
 
@@ -297,7 +297,6 @@ func runTCP(opts runOptions) error {
 	}
 	queueTotal, queueMax := collectQueue(nodes)
 	finalWindow.print(nodes, queueTotal, queueMax)
-	printMessageTypeMetrics(nodes)
 	return nil
 }
 
@@ -549,6 +548,8 @@ func collectMessageTypeMetrics(nodes []*tyche.Node) map[string]p2p.MessageTypeMe
 			current := out[key]
 			current.SentMessages += stats.SentMessages
 			current.SentBytes += stats.SentBytes
+			current.RecvMessages += stats.RecvMessages
+			current.RecvBytes += stats.RecvBytes
 			out[key] = current
 		}
 	}
@@ -582,6 +583,7 @@ func (w *finalMetricWindow) recordBeacon(nodes []*tyche.Node) {
 		w.start = time.Now()
 		w.metrics = collectMetrics(nodes)
 		w.perf = collectPerf(nodes)
+		w.types = collectMessageTypeMetrics(nodes)
 		return
 	}
 	w.beacons++
@@ -593,6 +595,7 @@ func (w *finalMetricWindow) print(nodes []*tyche.Node, queueTotal int, queueMax 
 		return
 	}
 	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
+	printMessageTypeMetricsDiff(collectMessageTypeMetrics(nodes), w.types)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
@@ -714,9 +717,17 @@ func printDebugSnapshots(nodes []*tyche.Node) {
 
 func printMessageTypeMetrics(nodes []*tyche.Node) {
 	types := collectMessageTypeMetrics(nodes)
+	printMessageTypeMetricsDiff(types, nil)
+}
+
+func printMessageTypeMetricsDiff(types map[string]p2p.MessageTypeMetrics, prev map[string]p2p.MessageTypeMetrics) {
 	if len(types) == 0 {
 		return
 	}
+	if prev != nil {
+		types = subtractMessageTypeMetrics(types, prev)
+	}
+	printMessageCategoryMetrics(types)
 	keys := make([]string, 0, len(types))
 	for key := range types {
 		keys = append(keys, key)
@@ -724,6 +735,67 @@ func printMessageTypeMetrics(nodes []*tyche.Node) {
 	sort.Strings(keys)
 	for _, key := range keys {
 		stats := types[key]
-		fmt.Printf("message_type type=%s sent_msgs=%d sent=%.2fKB\n", key, stats.SentMessages, float64(stats.SentBytes)/1024)
+		fmt.Printf("message_type type=%s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB\n", key, stats.SentMessages, stats.RecvMessages, float64(stats.SentBytes)/1024, float64(stats.RecvBytes)/1024)
+	}
+}
+
+func subtractMessageTypeMetrics(current, prev map[string]p2p.MessageTypeMetrics) map[string]p2p.MessageTypeMetrics {
+	out := make(map[string]p2p.MessageTypeMetrics, len(current))
+	for key, stats := range current {
+		before := prev[key]
+		out[key] = p2p.MessageTypeMetrics{
+			SentMessages: stats.SentMessages - before.SentMessages,
+			SentBytes:    stats.SentBytes - before.SentBytes,
+			RecvMessages: stats.RecvMessages - before.RecvMessages,
+			RecvBytes:    stats.RecvBytes - before.RecvBytes,
+		}
+	}
+	return out
+}
+
+func printMessageCategoryMetrics(types map[string]p2p.MessageTypeMetrics) {
+	categories := make(map[string]p2p.MessageTypeMetrics)
+	for key, stats := range types {
+		category := messageCategory(key)
+		current := categories[category]
+		current.SentMessages += stats.SentMessages
+		current.SentBytes += stats.SentBytes
+		current.RecvMessages += stats.RecvMessages
+		current.RecvBytes += stats.RecvBytes
+		categories[category] = current
+	}
+	keys := make([]string, 0, len(categories))
+	for key := range categories {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		stats := categories[key]
+		fmt.Printf("message_category category=%s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB\n", key, stats.SentMessages, stats.RecvMessages, float64(stats.SentBytes)/1024, float64(stats.RecvBytes)/1024)
+	}
+}
+
+func messageCategory(key string) string {
+	switch {
+	case key == "rbc/VAL":
+		return "producer_rbc_value"
+	case strings.HasPrefix(key, "rbc/"):
+		return "rbc_control"
+	case key == "tyche/RECON":
+		return "consumer_recon"
+	case key == "tyche/RECON_ECHO":
+		return "consumer_echo"
+	case key == "tyche/RECON_READY":
+		return "recon_ready"
+	case key == "tyche/BEACON_CERT":
+		return "beacon_cert"
+	case strings.HasPrefix(key, "aba/"):
+		return "aba"
+	case strings.HasPrefix(key, "tyche/JOIN"):
+		return "reconfig_join"
+	case strings.HasPrefix(key, "tyche/"):
+		return "tyche_other"
+	default:
+		return "other"
 	}
 }
