@@ -139,9 +139,17 @@ func TestBValSendsAuxOncePerRound(t *testing.T) {
 	a.handleBVal(ctx, instance, "n2", 0, true)
 	a.handleBVal(ctx, instance, "n3", 0, true)
 
-	stats := transport.MessageTypeMetrics()["aba/AUX"]
-	if stats.SentMessages != 1 {
-		t.Fatalf("AUX broadcast count = %d, want 1", stats.SentMessages)
+	deadline := time.After(time.Second)
+	for {
+		stats := transport.MessageTypeMetrics()["aba/AUX"]
+		if stats.SentMessages == 1 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("AUX broadcast count = %d, want 1", stats.SentMessages)
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 

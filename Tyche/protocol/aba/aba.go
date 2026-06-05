@@ -14,6 +14,8 @@ import (
 
 const Protocol = "aba"
 
+const bvalBroadcastDelay = 50 * time.Millisecond
+
 type InputMessage struct {
 	Value bool `json:"value"`
 }
@@ -552,7 +554,8 @@ func (a *Agreement) broadcastBVal(ctx context.Context, instance string, round ui
 	}
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()
-	return a.broadcast(ctx, "BVAL", instance, BValMessage{Round: round, Value: value})
+	a.broadcastDelayed("BVAL", instance, BValMessage{Round: round, Value: value}, bvalBroadcastDelay)
+	return nil
 }
 
 func (a *Agreement) broadcastBValAsync(instance string, round uint64, value bool) {
@@ -569,7 +572,7 @@ func (a *Agreement) broadcastBValAsync(instance string, round uint64, value bool
 	a.ensureRound(st, round)
 	st.bvalSent[round][value] = true
 	a.mu.Unlock()
-	a.broadcastAsync("BVAL", instance, BValMessage{Round: round, Value: value})
+	a.broadcastDelayed("BVAL", instance, BValMessage{Round: round, Value: value}, bvalBroadcastDelay)
 }
 
 func (a *Agreement) rebroadcastUntilReady(ctx context.Context, instance string) {
@@ -603,11 +606,20 @@ func (a *Agreement) broadcast(ctx context.Context, typ, instance string, payload
 }
 
 func (a *Agreement) broadcastAsync(typ, instance string, payload any) {
+	a.broadcastDelayed(typ, instance, payload, 0)
+}
+
+func (a *Agreement) broadcastDelayed(typ, instance string, payload any, delay time.Duration) {
 	msg, err := p2p.NewMessage(Protocol, typ, instance, a.ID, "", payload)
 	if err != nil {
 		return
 	}
 	go func() {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			<-timer.C
+		}
 		if a.decidedOrPruned(instance) {
 			return
 		}
