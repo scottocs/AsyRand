@@ -240,7 +240,7 @@ write_final_metrics_log() {
     logf="$OUT_ROOT/$proto/local.log"
     [[ -f "$logf" ]] || continue
     awk -v proto="$proto" -v node="local" -v host="host0" -v region="local" -v ip="127.0.0.1" '
-      /bench_result|final metrics|compare|message_type/ {
+      /bench_result|final metrics|compare|message_category|message_type/ {
         printf "protocol=%s node=%s host=%s region=%s ip=%s %s\n", proto, node, host, region, ip, $0
       }
     ' "$logf" >> "$out"

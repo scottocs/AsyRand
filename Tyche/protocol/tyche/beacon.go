@@ -1161,14 +1161,14 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 			return err
 		}
 		from := msg.From
-		n.Crypto.Go(ctx, func() { _ = n.handleRecon(ctx, from, body) })
+		n.Crypto.GoPriority(ctx, func() { _ = n.handleRecon(ctx, from, body) })
 	case "RECON_ECHO":
 		body, err := p2p.DecodePayload[ReconEchoMessage](msg)
 		if err != nil {
 			return err
 		}
 		from := msg.From
-		n.Crypto.Go(ctx, func() {
+		n.Crypto.GoPriority(ctx, func() {
 			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, "", CertifiedStateDigest{}, crypto.VoteShare{})
 		})
 	case "RECON_READY":
@@ -1177,7 +1177,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 			return err
 		}
 		from := msg.From
-		n.Crypto.Go(ctx, func() {
+		n.Crypto.GoPriority(ctx, func() {
 			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.StateHash, CertifiedStateDigest{}, body.Signature)
 		})
 	case "JOIN_ACK":

@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,6 +155,7 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 	rng := rand.New(rand.NewSource(seed))
 	nextJoin := initialN
 	before := aggregateMetrics(cluster.transports())
+	beforeTypes := aggregateMessageTypeMetrics(cluster.transports())
 	start := time.Now()
 	if prefill > 0 {
 		time.Sleep(prefill)
@@ -173,6 +175,7 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 	}
 	elapsed := time.Since(start)
 	after := aggregateMetrics(cluster.transports())
+	afterTypes := aggregateMessageTypeMetrics(cluster.transports())
 	sentMessages := after.SentMessages - before.SentMessages
 	recvMessages := after.RecvMessages - before.RecvMessages
 	sentBytes := after.SentBytes - before.SentBytes
@@ -221,7 +224,109 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 		result.finalF,
 		result.reconfigurationOps,
 	)
+	logMessageTypeMetricsDiff(t, afterTypes, beforeTypes)
 	return result
+}
+
+func aggregateMessageTypeMetrics(transports []p2p.Transport) map[string]p2p.MessageTypeMetrics {
+	out := make(map[string]p2p.MessageTypeMetrics)
+	for _, transport := range transports {
+		typed, ok := transport.(interface {
+			MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
+		})
+		if !ok {
+			continue
+		}
+		for key, stats := range typed.MessageTypeMetrics() {
+			current := out[key]
+			current.SentMessages += stats.SentMessages
+			current.SentBytes += stats.SentBytes
+			current.RecvMessages += stats.RecvMessages
+			current.RecvBytes += stats.RecvBytes
+			out[key] = current
+		}
+	}
+	return out
+}
+
+func logMessageTypeMetricsDiff(t *testing.T, current map[string]p2p.MessageTypeMetrics, before map[string]p2p.MessageTypeMetrics) {
+	t.Helper()
+	types := subtractChurnMessageTypeMetrics(current, before)
+	if len(types) == 0 {
+		return
+	}
+	logMessageCategoryMetrics(t, types)
+	keys := make([]string, 0, len(types))
+	for key := range types {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		stats := types[key]
+		t.Logf("message_type type=%s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB", key, stats.SentMessages, stats.RecvMessages, float64(stats.SentBytes)/1024, float64(stats.RecvBytes)/1024)
+	}
+}
+
+func subtractChurnMessageTypeMetrics(current map[string]p2p.MessageTypeMetrics, before map[string]p2p.MessageTypeMetrics) map[string]p2p.MessageTypeMetrics {
+	out := make(map[string]p2p.MessageTypeMetrics, len(current))
+	for key, stats := range current {
+		prev := before[key]
+		out[key] = p2p.MessageTypeMetrics{
+			SentMessages: stats.SentMessages - prev.SentMessages,
+			SentBytes:    stats.SentBytes - prev.SentBytes,
+			RecvMessages: stats.RecvMessages - prev.RecvMessages,
+			RecvBytes:    stats.RecvBytes - prev.RecvBytes,
+		}
+	}
+	return out
+}
+
+func logMessageCategoryMetrics(t *testing.T, types map[string]p2p.MessageTypeMetrics) {
+	t.Helper()
+	categories := make(map[string]p2p.MessageTypeMetrics)
+	for key, stats := range types {
+		category := churnMessageCategory(key)
+		current := categories[category]
+		current.SentMessages += stats.SentMessages
+		current.SentBytes += stats.SentBytes
+		current.RecvMessages += stats.RecvMessages
+		current.RecvBytes += stats.RecvBytes
+		categories[category] = current
+	}
+	keys := make([]string, 0, len(categories))
+	for key := range categories {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		stats := categories[key]
+		t.Logf("message_category category=%s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB", key, stats.SentMessages, stats.RecvMessages, float64(stats.SentBytes)/1024, float64(stats.RecvBytes)/1024)
+	}
+}
+
+func churnMessageCategory(key string) string {
+	switch {
+	case key == "rbc/VAL":
+		return "producer_rbc_value"
+	case strings.HasPrefix(key, "rbc/"):
+		return "rbc_control"
+	case key == "tyche/RECON":
+		return "consumer_recon"
+	case key == "tyche/RECON_ECHO":
+		return "consumer_echo"
+	case key == "tyche/RECON_READY":
+		return "recon_ready"
+	case key == "tyche/BEACON_CERT":
+		return "beacon_cert"
+	case strings.HasPrefix(key, "aba/"):
+		return "aba"
+	case strings.HasPrefix(key, "tyche/JOIN"):
+		return "reconfig_join"
+	case strings.HasPrefix(key, "tyche/"):
+		return "tyche_other"
+	default:
+		return "other"
+	}
 }
 
 func shouldRunReconfiguration(rng *rand.Rand, epoch int, epochs int, completed int, target int) bool {
