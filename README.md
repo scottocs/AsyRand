@@ -35,45 +35,167 @@ export GOMAXPROCS=$(getconf _NPROCESSORS_ONLN)
 
 The preferred experiment entrypoint is the Fabric workspace under `benchmark/`:
 
+Windows PowerShell:
+
 ```powershell
 cd benchmark
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+macOS/Linux:
+
+```sh
+cd benchmark
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Run an 8-node local in-memory comparison for all default protocols:
+
+```powershell
+cd benchmark
 .\.venv\Scripts\fab local --nodes=8 --epochs=1000
 .\.venv\Scripts\fab logs
 ```
 
-Generated configs and run outputs are stored under `benchmark/generated/` and `benchmark/runs/` by default. The local and AWS Fabric runners start Go directly from Python/Fabric and do not call `scripts/*.sh`.
+```sh
+cd benchmark
+.venv/bin/fab local --nodes=8 --epochs=1000
+.venv/bin/fab logs
+```
 
-AWS node lifecycle commands are also exposed through Fabric:
+Run a specific protocol set, including reconfiguration variants:
+
+```sh
+cd benchmark
+.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche,tyche-scrape,tyche-reconfig,tyche-scrape-reconfig,asyrand,grandline,spurt
+```
+
+For Tyche reconfiguration benchmarks, tune churn with Fabric options:
+
+```sh
+cd benchmark
+.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche-reconfig --reconfig-events=15
+```
+
+The reconfiguration benchmark starts with `--nodes` members and then injects churn events during the run. A stalled-source event disables one active producer; the protocol then observes that the selected source cannot supply a usable next object, drives the consume-or-mark ABA, and eventually applies the removal marker for that member. A joining proposal creates a new node and exercises the JOIN certificate path until the join activation boundary. Event choices are pseudo-random but deterministic for a given seed. By default the seed is `20260521`; override it with `--reconfig-seed`. The membership bounds default to `min_n = n - f` and `max_n = n + f`, and can be overridden with `--reconfig-min-n` and `--reconfig-max-n`.
+
+The runner writes detailed churn events to the protocol log, including `event=stop_produce`, `event=aba_deleted`, `event=joining_proposal`, and `event=joined`. To make a horizontal epoch timeline from one run, parse those lines from the latest log under `benchmark/runs/<run>/tyche-reconfig/local.log` and draw each event at its epoch. For example:
+
+```sh
+cd benchmark
+.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche-reconfig --reconfig-events=15
+python - <<'PY'
+from pathlib import Path
+import re
+
+run = Path("runs/local_n8_e200")
+log = run / "tyche-reconfig" / "local.log"
+events = {"stop_produce": [], "aba_deleted": [], "joining_proposal": [], "joined": []}
+for line in log.read_text(errors="replace").splitlines():
+    for kind in events:
+        if f"event={kind} " in line:
+            epoch = int(re.search(r"epoch=(\d+)", line).group(1))
+            node = re.search(r"node=([^ ]+)", line).group(1)
+            events[kind].append((epoch, node))
+
+max_epoch = max((epoch for values in events.values() for epoch, _ in values), default=200)
+max_epoch = max(200, ((max_epoch + 99) // 100) * 100)
+width, height = 1200, 300
+left, right = 125, 30
+rows = {"stop_produce": 65, "aba_deleted": 120, "joining_proposal": 175, "joined": 230}
+labels = {
+    "stop_produce": "stalled source",
+    "aba_deleted": "removal applied",
+    "joining_proposal": "joining proposal",
+    "joined": "join activated",
+}
+colors = {
+    "stop_produce": "#d97706",
+    "aba_deleted": "#dc2626",
+    "joining_proposal": "#2563eb",
+    "joined": "#16a34a",
+}
+def node_label(node): return node.removeprefix("node")
+def x(epoch): return left + (width - left - right) * epoch / max_epoch
+
+svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">']
+svg.append('<rect width="100%" height="100%" fill="white"/>')
+svg.append('<text x="125" y="28" font-family="Arial" font-size="20" font-weight="700">Tyche reconfiguration timeline</text>')
+tick_step = max(20, max_epoch // 10)
+for tick in range(0, max_epoch + 1, tick_step):
+    xx = x(tick)
+    svg.append(f'<line x1="{xx:.1f}" y1="45" x2="{xx:.1f}" y2="255" stroke="#e5e7eb"/>')
+    svg.append(f'<text x="{xx:.1f}" y="278" text-anchor="middle" font-family="Arial" font-size="11">{tick}</text>')
+for kind, y in rows.items():
+    svg.append(f'<text x="10" y="{y+4}" font-family="Arial" font-size="12">{labels[kind]}</text>')
+    svg.append(f'<line x1="{left}" y1="{y}" x2="{width-right}" y2="{y}" stroke="#d1d5db"/>')
+    for epoch, node in events[kind]:
+        xx = x(epoch)
+        title = f"<title>epoch {epoch}: {node}</title>"
+        if kind == "stop_produce":
+            points = f"{xx:.1f},{y-7} {xx-6:.1f},{y+5} {xx+6:.1f},{y+5}"
+            svg.append(f'<polygon points="{points}" fill="{colors[kind]}">{title}</polygon>')
+            svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
+        elif kind == "aba_deleted":
+            svg.append(f'<g stroke="{colors[kind]}" stroke-width="2.5" stroke-linecap="round">{title}<line x1="{xx-5:.1f}" y1="{y-5}" x2="{xx+5:.1f}" y2="{y+5}"/><line x1="{xx+5:.1f}" y1="{y-5}" x2="{xx-5:.1f}" y2="{y+5}"/></g>')
+        else:
+            svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="5" fill="{colors[kind]}">{title}</circle>')
+            if kind == "joining_proposal":
+                svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
+svg.append('</svg>')
+(run / "reconfig_timeline.svg").write_text("\n".join(svg), encoding="utf-8")
+print(run / "reconfig_timeline.svg")
+PY
+```
+
+Generated configs and run outputs are stored under `benchmark/generated/` and `benchmark/runs/` by default. The local and AWS Fabric runners start Go directly from Python/Fabric; the legacy shell benchmark scripts have been removed.
+
+### AWS Multi-Node Benchmark
+
+AWS runs use one EC2 instance per Tyche benchmark node. Configure `benchmark/settings.json` with AWS regions, instance type, key name, and local private key path before creating or discovering instances.
+
+Create, inspect, stop/start, and destroy AWS benchmark nodes through Fabric:
 
 ```powershell
 cd benchmark
-.\.venv\Scripts\fab create --nodes=1
+.\.venv\Scripts\fab create --nodes=8
 .\.venv\Scripts\fab info
 .\.venv\Scripts\fab stop
-.\.venv\Scripts\fab start --max=10
+.\.venv\Scripts\fab start --max=100
 .\.venv\Scripts\fab destroy
 ```
 
-Tyche uses flags for `n` and `epochs`:
-
 ```sh
-cd Tyche
-go run ./cmd/tyche -n 8 -epochs 1000 -transport memory
+cd benchmark
+.venv/bin/fab create --nodes=8
+.venv/bin/fab info
+.venv/bin/fab stop
+.venv/bin/fab start --max=100
+.venv/bin/fab destroy
 ```
 
-AsyRand, SPURT, and Grandline use JSON configs. Adjust `round` for `epochs`, and adjust the member list for `n`:
+Run all default protocols on 8 AWS nodes for 200 epochs:
 
 ```sh
-cd asyrand
-go run ./cmd/asyrand -config configs/local_8_rounds_1000.json -transport memory
+cd benchmark
+.venv/bin/fab aws --nodes=8 --epochs=200
+```
 
-cd ../spurt
-go run ./cmd/spurt -config configs/local_8_rounds_1000.json -transport memory
+Run a specific AWS protocol set:
 
-cd ../grandline
-go run ./cmd/grandline -config configs/local_8_rounds_1000.json -transport memory
+```sh
+cd benchmark
+.venv/bin/fab aws --nodes=8 --epochs=200 --protocols=tyche,tyche-scrape,asyrand,grandline,spurt
+```
+
+Run AWS Tyche reconfiguration:
+
+```sh
+cd benchmark
+.venv/bin/fab aws --nodes=8 --epochs=200 --protocols=tyche-reconfig,tyche-scrape-reconfig --reconfig-events=10
 ```
 
 Each runner prints a final line like:

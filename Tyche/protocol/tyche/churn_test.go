@@ -43,7 +43,7 @@ func TestBeaconChurnCrashAndJoin10000Epochs(t *testing.T) {
 			t.Logf("epoch=%d event=deleted node=%s active_after=%v members_after=%v", epoch, failed, cluster.activeIDs(), cluster.members())
 		}
 		if joiner := joins[epoch]; joiner != "" {
-			t.Logf("epoch=%d event=join node=%s active_before=%v members_before=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
+			t.Logf("epoch=%d event=joining_proposal node=%s active_before=%v members_before=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
 			cluster.join(t, ctx, joiner)
 			t.Logf("epoch=%d event=joined node=%s active_after=%v members_after=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
 		}
@@ -501,14 +501,13 @@ func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *ra
 	(*nextJoin)++
 	beforeMembers := c.members()
 	beforeF := c.currentF(t)
-	t.Logf("epoch=%d event=join node=%s n_before=%d f_before=%d active_before=%v members_before=%v", epoch, joiner, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers)
+	t.Logf("epoch=%d event=joining_proposal node=%s n_before=%d f_before=%d active_before=%v members_before=%v", epoch, joiner, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers)
 	joined := c.join(t, parent, joiner)
 	afterMembers := c.members()
 	if !joined {
 		t.Logf("epoch=%d event=join_stale node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
 		return true
 	}
-	t.Logf("epoch=%d event=join_scheduled node=%s n_after=%d f_after=%d active_after=%v members_after=%v", epoch, joiner, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers)
 	return true
 }
 
