@@ -165,6 +165,56 @@ func TestBeaconAutoProducerCertifiesEpochN4(t *testing.T) {
 	}
 }
 
+func TestProducerDefaultWatermarks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	node := newTestNodes(t, ctx)[0]
+	if node.producerLow != 2 || node.producerHigh != 3 {
+		t.Fatalf("producer watermarks low=%d high=%d, want low=2 high=3", node.producerLow, node.producerHigh)
+	}
+}
+
+func TestProducerHighWatermarkBoundsAllocatedObjects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	producer := nodes[0]
+	producer.producerHigh = 2
+	producer.producerLow = 1
+
+	if _, err := producer.Produce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := producer.Produce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := producer.Produce(ctx); err == nil {
+		t.Fatal("expected producer high watermark to block third object")
+	}
+
+	producer.mu.Lock()
+	window := producer.producerWindowDepthLocked()
+	seq := producer.State.ProducerSeq
+	producer.mu.Unlock()
+	if window != 2 || seq != 2 {
+		t.Fatalf("producer window=%d seq=%d, want window=2 seq=2", window, seq)
+	}
+
+	typed, ok := producer.Transport.(interface {
+		MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
+	})
+	if !ok {
+		t.Fatal("transport does not expose message-type metrics")
+	}
+	sent := typed.MessageTypeMetrics()["rbc/VAL"].SentMessages
+	want := uint64(2 * len(nodes))
+	if sent != want {
+		t.Fatalf("rbc/VAL sent=%d, want %d", sent, want)
+	}
+}
+
 func TestBeaconAutoProducerRunnerIDsCertifiesEpochsN4(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

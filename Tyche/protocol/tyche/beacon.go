@@ -487,9 +487,9 @@ func (n *Node) Produce(ctx context.Context) (Object, error) {
 		n.mu.Unlock()
 		return Object{}, errors.New("local producer is stopped")
 	}
-	if n.outstandingQueueDepthLocked(n.ID)+len(n.producerBusy) >= n.State.QueueLen {
+	if n.producerWindowDepthLocked() >= n.producerHigh {
 		n.mu.Unlock()
-		return Object{}, errors.New("local producer queue is full")
+		return Object{}, errors.New("local producer high watermark reached")
 	}
 	n.State.ProducerSeq++
 	seq := n.State.ProducerSeq
@@ -561,6 +561,15 @@ func (n *Node) requestProduceSeq(ctx context.Context, seq uint64, version uint64
 		n.mu.Unlock()
 		return false
 	}
+	consumed := n.State.Seqs[n.ID]
+	targetProduced := n.State.ProducerSeq
+	if seq > targetProduced {
+		targetProduced = seq
+	}
+	if targetProduced > consumed && int(targetProduced-consumed) > n.producerHigh {
+		n.mu.Unlock()
+		return false
+	}
 	if n.State.ProducerSeq < seq {
 		n.State.ProducerSeq = seq
 	}
@@ -589,17 +598,16 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 		producing := true
 		for {
 			n.mu.Lock()
-			depth := n.outstandingQueueDepthLocked(n.ID)
+			storedDepth := n.outstandingQueueDepthLocked(n.ID)
+			level := n.producerWindowDepthLocked()
 			low, high, queueLen := n.producerLow, n.producerHigh, n.State.QueueLen
-			inFlight := len(n.producerBusy)
 			n.mu.Unlock()
-			level := depth + inFlight
 			if level >= high {
 				producing = false
 			} else if level <= low {
 				producing = true
 			}
-			if producing && level < high && depth < queueLen && inFlight < high {
+			if producing && level < high && storedDepth < queueLen {
 				_, _ = n.Produce(ctx)
 			}
 			select {
@@ -609,6 +617,14 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}()
+}
+
+func (n *Node) producerWindowDepthLocked() int {
+	consumed := n.State.Seqs[n.ID]
+	if n.State.ProducerSeq <= consumed {
+		return 0
+	}
+	return int(n.State.ProducerSeq - consumed)
 }
 
 func (n *Node) outstandingQueueDepthLocked(id p2p.NodeID) int {
