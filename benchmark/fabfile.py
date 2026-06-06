@@ -94,6 +94,7 @@ def aws(
     reconfig_max_n="",
     reconfig_seed="",
     reconfig_queue_len="",
+    reconfig_removal_expiration_ms="",
 ):
     """Run the AWS TCP beacon benchmark."""
     with _temporary_env(
@@ -102,6 +103,7 @@ def aws(
         TYCHE_RECONFIG_MAX_N=reconfig_max_n,
         TYCHE_RECONFIG_SEED=reconfig_seed,
         TYCHE_RECONFIG_QUEUE_LEN=reconfig_queue_len,
+        TYCHE_RECONFIG_REMOVAL_EXPIRATION_MS=reconfig_removal_expiration_ms,
     ):
         _run_or_exit(
             run_aws,

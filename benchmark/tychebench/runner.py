@@ -74,6 +74,7 @@ class AwsOptions:
     max_pool: int = 2
     transport_buffer: int = 0
     removal_expiration_ms: int = 0
+    reconfig_removal_expiration_ms: int = 1000
     aggregation_lookahead: int = 8
     gomaxprocs: int = 2
     startup_wait_sec: int | None = None
@@ -507,6 +508,14 @@ def _reconfig_seed_value():
     return os.environ.get("TYCHE_RECONFIG_SEED", "20260521")
 
 
+def _reconfig_crash_grace_ms_value():
+    return os.environ.get("TYCHE_RECONFIG_CRASH_GRACE_MS", "2000")
+
+
+def _reconfig_removal_expiration_ms_value():
+    return os.environ.get("TYCHE_RECONFIG_REMOVAL_EXPIRATION_MS", "1000")
+
+
 def _protocol_config(protocol, options):
     protocol_names = {
         "asyrand": "asyrand-v1",
@@ -790,6 +799,7 @@ def _local_run_config(n, epochs, protocol_list, fault_threshold):
         "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(n + bft_f)),
         "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
         "tyche_reconfig_queue_len": os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "1"),
+        "tyche_reconfig_crash_grace_ms": _reconfig_crash_grace_ms_value(),
     }
 
 
@@ -1162,12 +1172,17 @@ def _remote_command_for_node(protocol, node, options):
             reconfig_events = _reconfig_events_value(options)
             reconfig_min_n = _reconfig_min_n_value(options)
             reconfig_seed = _reconfig_seed_value()
+            reconfig_crash_grace_ms = _reconfig_crash_grace_ms_value()
             reconfig_arg = (
                 f" -reconfig-events {_remote_quote(reconfig_events)}"
                 f" -reconfig-min-n {_remote_quote(reconfig_min_n)}"
                 f" -reconfig-seed {_remote_quote(reconfig_seed)}"
+                f" -reconfig-crash-grace-ms {_remote_quote(reconfig_crash_grace_ms)}"
             )
         queue_len = _tyche_queue_len_for_protocol(protocol, options)
+        removal_expiration_ms = options.removal_expiration_ms
+        if protocol in {"tyche-reconfig", "tyche-scrape-reconfig"}:
+            removal_expiration_ms = options.reconfig_removal_expiration_ms
         return (
             f"mkdir -p {_remote_quote('runlogs/' + protocol)} && "
             "export PATH=/usr/local/go/bin:$PATH && "
@@ -1177,7 +1192,7 @@ def _remote_command_for_node(protocol, node, options):
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
             f"-queue-len {queue_len} -max-pool {options.max_pool} "
             f"-transport-buffer {options.transport_buffer} "
-            f"-removal-expiration-ms {options.removal_expiration_ms} "
+            f"-removal-expiration-ms {removal_expiration_ms} "
             f"-producer-ms {options.producer_ms} -prefill-ms {options.prefill_ms} "
             f"-epoch-timeout-ms {options.epoch_timeout_ms} -report-ms {options.report_ms} "
             f"{pvss_arg}{reconfig_arg} "
@@ -1350,7 +1365,7 @@ def _reconfig_summary(lines):
     for line in lines:
         if line.startswith("reconfig_schedule "):
             schedule_count += 1
-        if " reconfig_stop_producing " in f" {line} ":
+        if " reconfig_stop_producing " in f" {line} " or " reconfig_stop_node " in f" {line} ":
             stop_count += 1
         if line.startswith("reconfig_final "):
             final = line
@@ -1641,6 +1656,7 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "max_pool": int(os.environ.get("MAX_POOL", "2")),
         "transport_buffer": int(os.environ.get("TYCHE_TRANSPORT_BUFFER", "0")),
         "removal_expiration_ms": int(os.environ.get("TYCHE_REMOVAL_EXPIRATION_MS", "0")),
+        "tyche_reconfig_removal_expiration_ms": _reconfig_removal_expiration_ms_value(),
         "aggregation_lookahead": int(os.environ.get("AGGREGATION_LOOKAHEAD", "8")),
         "gomaxprocs": int(os.environ.get("GOMAXPROCS_REMOTE", "2")),
         "startup_wait_sec": int(os.environ["STARTUP_WAIT_SEC"]) if os.environ.get("STARTUP_WAIT_SEC") else None,
@@ -1658,6 +1674,7 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(nodes + bft_f)),
         "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
         "tyche_reconfig_queue_len": os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "1"),
+        "tyche_reconfig_crash_grace_ms": _reconfig_crash_grace_ms_value(),
     }
 
 
@@ -1710,6 +1727,7 @@ def _legacy_aws_config_from_state(path, rows):
         "max_pool": 16,
         "transport_buffer": 0,
         "removal_expiration_ms": 0,
+        "tyche_reconfig_removal_expiration_ms": "1000",
         "aggregation_lookahead": 8,
         "gomaxprocs": 4,
         "startup_wait_sec": None,
@@ -1726,6 +1744,7 @@ def _legacy_aws_config_from_state(path, rows):
         "tyche_reconfig_min_n": "",
         "tyche_reconfig_max_n": "",
         "tyche_reconfig_seed": "20260521",
+        "tyche_reconfig_crash_grace_ms": "2000",
     }
 
 
@@ -1948,6 +1967,7 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
         max_pool=config["max_pool"],
         transport_buffer=config["transport_buffer"],
         removal_expiration_ms=config["removal_expiration_ms"],
+        reconfig_removal_expiration_ms=int(config["tyche_reconfig_removal_expiration_ms"]),
         aggregation_lookahead=config["aggregation_lookahead"],
         gomaxprocs=config["gomaxprocs"],
         startup_wait_sec=config["startup_wait_sec"],

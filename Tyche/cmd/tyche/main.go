@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sort"
@@ -65,6 +66,10 @@ func main() {
 	transportBufferFlag := flag.Int("transport-buffer", 0, "transport inbox buffer length; defaults to a size scaled by n")
 	removalExpirationMS := flag.Int("removal-expiration-ms", 0, "epoch-control ABA false-input timeout in milliseconds; defaults to a size scaled by n")
 	pvss := flag.String("pvss", "o1", "PVSS backend: o1 or scrape")
+	reconfigEvents := flag.Int("reconfig-events", 0, "number of deterministic stop-producing reconfiguration events")
+	reconfigMinN := flag.Int("reconfig-min-n", 0, "minimum membership size for stop-producing reconfiguration events")
+	reconfigSeed := flag.Int64("reconfig-seed", 20260521, "seed for deterministic reconfiguration event schedule")
+	reconfigCrashGraceMS := flag.Int("reconfig-crash-grace-ms", 2000, "milliseconds a reconfiguration victim waits after broadcasting its current object before exiting")
 	flag.Parse()
 
 	opts := runOptions{
@@ -73,7 +78,9 @@ func main() {
 		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
 		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS, maxPool: *maxPool,
 		transportBuffer: *transportBufferFlag, removalExpirationMS: *removalExpirationMS,
-		pvss: strings.ToLower(*pvss),
+		pvss:           strings.ToLower(*pvss),
+		reconfigEvents: *reconfigEvents, reconfigMinN: *reconfigMinN, reconfigSeed: *reconfigSeed,
+		reconfigCrashGraceMS: *reconfigCrashGraceMS,
 	}
 	if err := run(opts); err != nil {
 		log.Fatal(err)
@@ -81,23 +88,27 @@ func main() {
 }
 
 type runOptions struct {
-	n                   int
-	epochs              int
-	f                   int
-	transport           string
-	nodeID              p2p.NodeID
-	peersRaw            string
-	listenAddr          string
-	listenIP            string
-	queueLen            int
-	producerMS          int
-	prefillMS           int
-	epochTimeoutMS      int
-	reportMS            int
-	maxPool             int
-	transportBuffer     int
-	removalExpirationMS int
-	pvss                string
+	n                    int
+	epochs               int
+	f                    int
+	transport            string
+	nodeID               p2p.NodeID
+	peersRaw             string
+	listenAddr           string
+	listenIP             string
+	queueLen             int
+	producerMS           int
+	prefillMS            int
+	epochTimeoutMS       int
+	reportMS             int
+	maxPool              int
+	transportBuffer      int
+	removalExpirationMS  int
+	pvss                 string
+	reconfigEvents       int
+	reconfigMinN         int
+	reconfigSeed         int64
+	reconfigCrashGraceMS int
 }
 
 func run(opts runOptions) error {
@@ -131,6 +142,24 @@ func run(opts runOptions) error {
 	if opts.epochTimeoutMS <= 0 {
 		opts.epochTimeoutMS = 10000
 	}
+	if opts.reconfigMinN <= 0 {
+		opts.reconfigMinN = opts.n - opts.f
+	}
+	if opts.reconfigMinN < 1 {
+		opts.reconfigMinN = 1
+	}
+	if opts.reconfigMinN > opts.n {
+		return fmt.Errorf("-reconfig-min-n must be <= -n: min=%d n=%d", opts.reconfigMinN, opts.n)
+	}
+	if opts.reconfigEvents < 0 {
+		return fmt.Errorf("-reconfig-events must be non-negative")
+	}
+	if opts.reconfigEvents > 0 && opts.queueLen != 1 {
+		return fmt.Errorf("reconfiguration crash benchmark requires -queue-len 1 to avoid pre-broadcasting lookahead objects, got %d", opts.queueLen)
+	}
+	if opts.reconfigCrashGraceMS < 0 {
+		return fmt.Errorf("-reconfig-crash-grace-ms must be non-negative")
+	}
 	opts.transportBuffer = resolveTransportBuffer(opts)
 	opts.removalExpirationMS = resolveRemovalExpirationMS(opts)
 	if opts.transport == "tcp" {
@@ -156,15 +185,16 @@ func runMemory(opts runOptions) error {
 			return err
 		}
 		node, err := tyche.NewNode(tyche.Config{
-			ID:                id,
-			Members:           ids,
-			F:                 opts.f,
-			QueueLen:          opts.queueLen,
-			PVSS:              scheme,
-			PVSSBackend:       opts.pvss,
-			CryptoWorkers:     opts.maxPool,
-			RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond,
-			Transport:         net.NewTransport(id, opts.transportBuffer),
+			ID:                    id,
+			Members:               ids,
+			F:                     opts.f,
+			QueueLen:              opts.queueLen,
+			PVSS:                  scheme,
+			PVSSBackend:           opts.pvss,
+			CryptoWorkers:         opts.maxPool,
+			RemovalExpiration:     time.Duration(opts.removalExpirationMS) * time.Millisecond,
+			CurrentMissingRemoval: opts.reconfigEvents > 0,
+			Transport:             net.NewTransport(id, opts.transportBuffer),
 		})
 		if err != nil {
 			return err
@@ -183,8 +213,21 @@ func runMemory(opts runOptions) error {
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
 	var finalWindow finalMetricWindow
+	reconfigSchedule := buildReconfigSchedule(ids, opts)
+	localStops := 0
 
 	for epoch := 1; epoch <= opts.epochs; epoch++ {
+		if victim, ok := reconfigSchedule[epoch]; ok {
+			fmt.Printf("reconfig_schedule epoch=%d action=stop_producing node=%s min_n=%d seed=%d\n", epoch, victim, opts.reconfigMinN, opts.reconfigSeed)
+			for _, node := range nodes {
+				if node.ID == victim {
+					node.SetProducing(false)
+					localStops++
+					fmt.Printf("reconfig_stop_producing epoch=%d node=%s\n", epoch, victim)
+					break
+				}
+			}
+		}
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
 		results := make(chan result, len(nodes))
 		for _, node := range nodes {
@@ -213,6 +256,7 @@ func runMemory(opts runOptions) error {
 
 	queueTotal, queueMax := collectQueue(nodes)
 	finalWindow.print(nodes, queueTotal, queueMax)
+	printReconfigFinal(nodes[0], len(reconfigSchedule), localStops, opts)
 	return nil
 }
 
@@ -255,7 +299,7 @@ func runTCP(opts runOptions) error {
 	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, opts.transportBuffer)
 	node, err := tyche.NewNode(tyche.Config{
 		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool,
-		RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond, Transport: transport,
+		RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond, CurrentMissingRemoval: opts.reconfigEvents > 0, Transport: transport,
 	})
 	if err != nil {
 		return err
@@ -282,10 +326,45 @@ func runTCP(opts runOptions) error {
 		fmt.Printf("node=%s prefilled_epochs=%d counted=0\n", opts.nodeID, completed)
 	}
 	var finalWindow finalMetricWindow
+	reconfigTarget := reconfigEventLimit(opts)
+	reconfigs := 0
+	localStops := 0
 
 	for counted := 0; counted < opts.epochs; counted++ {
+		epoch := counted + 1
+		snapshot := node.DebugSnapshot()
+		if shouldRunReconfiguration(epoch, opts.epochs, reconfigs, reconfigTarget) && snapshot.Source != "" {
+			victim := snapshot.Source
+			fmt.Printf("reconfig_schedule epoch=%d action=stop_node node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d seed=%d\n",
+				epoch, victim, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigSeed)
+			node.MarkRemovalCandidate(victim)
+			reconfigs++
+			if victim == opts.nodeID {
+				node.SetProducing(false)
+				ensureCtx, cancelEnsure := context.WithTimeout(runCtx, epochAttemptTimeout)
+				seq, err := node.EnsureCurrentObject(ensureCtx)
+				cancelEnsure()
+				if err != nil {
+					return fmt.Errorf("node %s failed to broadcast current object before reconfiguration stop at epoch %d seq=%d: %w", opts.nodeID, epoch, seq, err)
+				}
+				localStops++
+				fmt.Printf("reconfig_current_object_ready epoch=%d node=%s source=%s seq=%d completed=%d config_version=%d\n",
+					epoch, victim, snapshot.Source, seq, node.CompletedEpoch(), snapshot.ConfigVersion)
+				if opts.reconfigCrashGraceMS > 0 {
+					grace := time.Duration(opts.reconfigCrashGraceMS) * time.Millisecond
+					fmt.Printf("reconfig_crash_grace epoch=%d node=%s seq=%d grace_ms=%d\n", epoch, victim, seq, opts.reconfigCrashGraceMS)
+					select {
+					case <-time.After(grace):
+					case <-runCtx.Done():
+						return runCtx.Err()
+					}
+				}
+				fmt.Printf("reconfig_stop_node epoch=%d node=%s seq=%d\n", epoch, victim, seq)
+				return fmt.Errorf("node %s stopped for reconfiguration at epoch %d", opts.nodeID, epoch)
+			}
+		}
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
-		targetEpoch := uint64(counted + 1)
+		targetEpoch := uint64(epoch)
 		beacon, err := node.RunEpochAt(epochCtx, targetEpoch)
 		cancelEpoch()
 		if err != nil {
@@ -297,7 +376,101 @@ func runTCP(opts runOptions) error {
 	}
 	queueTotal, queueMax := collectQueue(nodes)
 	finalWindow.print(nodes, queueTotal, queueMax)
+	printReconfigFinal(node, reconfigTarget, localStops, opts)
 	return nil
+}
+
+func reconfigEventLimit(opts runOptions) int {
+	if opts.reconfigEvents <= 0 || opts.epochs <= 0 || opts.n <= opts.reconfigMinN {
+		return 0
+	}
+	maxEvents := opts.n - opts.reconfigMinN
+	if opts.reconfigEvents < maxEvents {
+		maxEvents = opts.reconfigEvents
+	}
+	if opts.epochs < maxEvents {
+		maxEvents = opts.epochs
+	}
+	return maxEvents
+}
+
+func buildReconfigSchedule(ids []p2p.NodeID, opts runOptions) map[int]p2p.NodeID {
+	schedule := make(map[int]p2p.NodeID)
+	maxEvents := reconfigEventLimit(opts)
+	if maxEvents == 0 {
+		return schedule
+	}
+	removable := append([]p2p.NodeID(nil), ids...)
+	rng := rand.New(rand.NewSource(opts.reconfigSeed))
+	rng.Shuffle(len(removable), func(i, j int) {
+		removable[i], removable[j] = removable[j], removable[i]
+	})
+	for i := 0; i < maxEvents; i++ {
+		epoch := 1 + (i+1)*opts.epochs/(maxEvents+1)
+		if epoch < 1 {
+			epoch = 1
+		}
+		if epoch > opts.epochs {
+			epoch = opts.epochs
+		}
+		for {
+			if _, exists := schedule[epoch]; !exists {
+				break
+			}
+			epoch++
+			if epoch > opts.epochs {
+				epoch = 1
+				break
+			}
+		}
+		for {
+			if _, exists := schedule[epoch]; !exists {
+				break
+			}
+			epoch++
+		}
+		schedule[epoch] = removable[i]
+	}
+	return schedule
+}
+
+func shouldRunReconfiguration(epoch int, epochs int, completed int, target int) bool {
+	if target <= 0 || completed >= target || epochs <= 0 {
+		return false
+	}
+	targetEpoch := 1 + (completed+1)*epochs/(target+1)
+	if targetEpoch < 1 {
+		targetEpoch = 1
+	}
+	if targetEpoch > epochs {
+		targetEpoch = epochs
+	}
+	return epoch >= targetEpoch
+}
+
+func printReconfigFinal(node *tyche.Node, scheduled int, localStops int, opts runOptions) {
+	if scheduled == 0 {
+		return
+	}
+	members := append([]p2p.NodeID(nil), node.State.Members...)
+	sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
+	removed := opts.n - len(members)
+	if removed < 0 {
+		removed = 0
+	}
+	fmt.Printf("reconfig_final scheduled_events=%d local_stop_events=%d membership_changes=%d removed=%d completed_epochs=%d final_n=%d final_f=%d config_version=%d min_n=%d seed=%d members=%v\n",
+		scheduled,
+		localStops,
+		removed,
+		removed,
+		node.CompletedEpoch(),
+		len(members),
+		node.State.F,
+		node.State.ConfigVersion,
+		opts.reconfigMinN,
+		opts.reconfigSeed,
+		members,
+	)
 }
 
 func tycheEpochAttemptTimeout(opts runOptions) time.Duration {

@@ -81,14 +81,15 @@ type Config struct {
 	// proposing 0 to the epoch-control ABA when the selected source's next FIFO
 	// object is not yet available. It is an implementation policy, not a
 	// network synchrony assumption.
-	RemovalExpiration time.Duration
-	ConfigVersion     uint64
-	InitialRandom     []byte
-	PVSS              crypto.PVSSScheme
-	PVSSBackend       string
-	PVSSKeys          map[string]kyber.Scalar
-	CryptoWorkers     int
-	Transport         p2p.Transport
+	RemovalExpiration     time.Duration
+	CurrentMissingRemoval bool
+	ConfigVersion         uint64
+	InitialRandom         []byte
+	PVSS                  crypto.PVSSScheme
+	PVSSBackend           string
+	PVSSKeys              map[string]kyber.Scalar
+	CryptoWorkers         int
+	Transport             p2p.Transport
 }
 
 type State struct {
@@ -172,34 +173,36 @@ type Node struct {
 	// readies stores verified READY votes rather than bare sender ids.
 	// This lets certification aggregate the exact votes that justified the
 	// Bracha-style READY threshold.
-	readies        map[string]map[string]map[p2p.NodeID]crypto.VoteShare
-	readySent      map[string]bool
-	readySentEpoch map[string]bool
-	reconSent      map[string]bool
-	certified      map[string]bool
-	joinAcks       map[string]map[p2p.NodeID]JoinAck
-	joinCommits    map[string]map[p2p.NodeID]JoinCommit
-	joinRequests   map[string]JoinRequest
-	pendingJoins   map[string]JoinCertificate
-	joinCoinWait   map[string]uint64
-	armSent        map[string]bool
-	commitSent     map[string]bool
-	abaInputSent   map[string]bool
-	abaInputs      map[string]bool
-	lockedFrom     uint64
-	pvssKeys       map[string]kyber.Scalar
-	pvssBackend    string
-	beaconSeeds    map[uint64][]byte
-	verified       map[string]verifiedObject
-	producerBusy   map[uint64]bool
-	producerLow    int
-	producerHigh   int
-	removalWait    time.Duration
-	producing      bool
-	waiters        map[string][]chan Beacon
-	certBeacons    map[string]Beacon
-	pendingCerts   map[string]BeaconCertificate
-	certifying     map[string]bool
+	readies               map[string]map[string]map[p2p.NodeID]crypto.VoteShare
+	readySent             map[string]bool
+	readySentEpoch        map[string]bool
+	reconSent             map[string]bool
+	certified             map[string]bool
+	joinAcks              map[string]map[p2p.NodeID]JoinAck
+	joinCommits           map[string]map[p2p.NodeID]JoinCommit
+	joinRequests          map[string]JoinRequest
+	pendingJoins          map[string]JoinCertificate
+	joinCoinWait          map[string]uint64
+	armSent               map[string]bool
+	commitSent            map[string]bool
+	abaInputSent          map[string]bool
+	abaInputs             map[string]bool
+	lockedFrom            uint64
+	pvssKeys              map[string]kyber.Scalar
+	pvssBackend           string
+	beaconSeeds           map[uint64][]byte
+	verified              map[string]verifiedObject
+	producerBusy          map[uint64]bool
+	producerLow           int
+	producerHigh          int
+	removalWait           time.Duration
+	currentMissingRemoval bool
+	removalCandidates     map[p2p.NodeID]bool
+	producing             bool
+	waiters               map[string][]chan Beacon
+	certBeacons           map[string]Beacon
+	pendingCerts          map[string]BeaconCertificate
+	certifying            map[string]bool
 
 	Beacons chan Beacon
 	Joins   chan JoinCertificate
@@ -216,6 +219,7 @@ type DebugSnapshot struct {
 	Node          p2p.NodeID
 	Completed     uint64
 	NextEpoch     uint64
+	ConfigVersion uint64
 	Source        p2p.NodeID
 	Seq           uint64
 	Instance      string
@@ -327,22 +331,24 @@ func NewNode(cfg Config) (*Node, error) {
 		joinRequests: make(map[string]JoinRequest), pendingJoins: make(map[string]JoinCertificate),
 		joinCoinWait: make(map[string]uint64),
 		armSent:      make(map[string]bool), commitSent: make(map[string]bool),
-		abaInputSent: make(map[string]bool),
-		abaInputs:    make(map[string]bool),
-		beaconSeeds:  make(map[uint64][]byte),
-		verified:     make(map[string]verifiedObject),
-		producerBusy: make(map[uint64]bool),
-		pvssKeys:     make(map[string]kyber.Scalar),
-		pvssBackend:  pvssBackend,
-		producerLow:  low,
-		producerHigh: high,
-		removalWait:  removalWait,
-		producing:    true,
-		waiters:      make(map[string][]chan Beacon),
-		certBeacons:  make(map[string]Beacon),
-		pendingCerts: make(map[string]BeaconCertificate),
-		certifying:   make(map[string]bool),
-		Beacons:      make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
+		abaInputSent:          make(map[string]bool),
+		abaInputs:             make(map[string]bool),
+		beaconSeeds:           make(map[uint64][]byte),
+		verified:              make(map[string]verifiedObject),
+		producerBusy:          make(map[uint64]bool),
+		pvssKeys:              make(map[string]kyber.Scalar),
+		pvssBackend:           pvssBackend,
+		producerLow:           low,
+		producerHigh:          high,
+		removalWait:           removalWait,
+		currentMissingRemoval: cfg.CurrentMissingRemoval,
+		removalCandidates:     make(map[p2p.NodeID]bool),
+		producing:             true,
+		waiters:               make(map[string][]chan Beacon),
+		certBeacons:           make(map[string]Beacon),
+		pendingCerts:          make(map[string]BeaconCertificate),
+		certifying:            make(map[string]bool),
+		Beacons:               make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
 	}
 	for epoch, key := range cfg.PVSSKeys {
 		if key != nil {
@@ -509,6 +515,68 @@ func (n *Node) SetProducing(enabled bool) {
 	n.mu.Lock()
 	n.producing = enabled
 	n.mu.Unlock()
+}
+
+func (n *Node) IsProducing() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.producing
+}
+
+func (n *Node) MarkRemovalCandidate(id p2p.NodeID) {
+	n.mu.Lock()
+	if n.currentMissingRemoval {
+		n.removalCandidates[id] = true
+	}
+	n.mu.Unlock()
+}
+
+func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
+	n.mu.Lock()
+	seq := n.State.Seqs[n.ID] + 1
+	version := n.State.ConfigVersion
+	if obj, ok := n.State.ComQ[n.ID][seq]; ok && obj.ConfigVersion == version {
+		n.mu.Unlock()
+		return seq, nil
+	}
+	if !n.producerBusy[seq] {
+		if n.State.ProducerSeq < seq {
+			n.State.ProducerSeq = seq
+		}
+		n.producerBusy[seq] = true
+		n.mu.Unlock()
+		obj, err := n.produceSeq(ctx, seq, version)
+		if err != nil {
+			n.finishProducerSeq(seq)
+			n.rollbackProducerSeq(seq)
+			return seq, err
+		}
+		if err := n.storeObject(obj); err != nil {
+			n.rollbackProducerSeq(seq)
+			return seq, err
+		}
+		return seq, nil
+	}
+	n.mu.Unlock()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		n.mu.Lock()
+		obj, ok := n.State.ComQ[n.ID][seq]
+		currentVersion := n.State.ConfigVersion
+		n.mu.Unlock()
+		if currentVersion != version {
+			return seq, fmt.Errorf("configuration changed while producing current object: start=%d current=%d", version, currentVersion)
+		}
+		if ok && obj.ConfigVersion == currentVersion {
+			return seq, nil
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return seq, ctx.Err()
+		}
+	}
 }
 
 func (n *Node) produceSeq(ctx context.Context, seq uint64, version uint64) (Object, error) {
@@ -679,6 +747,26 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return b, err
 		}
+		if skipCurrentABA {
+			if err := n.startRemovalEpochEcho(ctx, epoch, source, seq); err != nil {
+				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+				return Beacon{}, err
+			}
+			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
+			n.unregisterBeaconWaiter(epoch, source, seq, wait)
+			return b, err
+		}
+		if source == n.ID && n.IsProducing() {
+			ensuredSeq, err := n.EnsureCurrentObject(ctx)
+			if err != nil {
+				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+				return Beacon{}, err
+			}
+			if ensuredSeq != seq {
+				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+				return Beacon{}, fmt.Errorf("ensured local seq %d while epoch %d needs seq %d", ensuredSeq, epoch, seq)
+			}
+		}
 
 		obj, certified, err := n.waitObjectOrBeacon(ctx, epoch, source, seq, instance, wait)
 		if err != nil {
@@ -808,6 +896,54 @@ func (n *Node) waitForEpochBeacon(ctx context.Context, epoch uint64, source p2p.
 	}
 }
 
+func (n *Node) startRemovalEpochEcho(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64) error {
+	key := epochKey(epoch, source, seq)
+	n.mu.Lock()
+	if n.reconSent[key] || n.reconDone[key] {
+		n.mu.Unlock()
+		return nil
+	}
+	version := n.State.ConfigVersion
+	prev := append([]byte(nil), n.State.RPrev...)
+	n.reconSent[key] = true
+	n.reconDone[key] = true
+	n.mu.Unlock()
+	random := crypto.HashBytes(prev, []byte(fmt.Sprintf("removal/%d/%s/%d", version, source, seq)))
+	echo, err := p2p.NewMessage(Protocol, "RECON_ECHO", key, n.ID, "", ReconEchoMessage{Epoch: epoch, Source: source, Seq: seq, Random: random})
+	if err != nil {
+		return err
+	}
+	return n.Transport.Broadcast(ctx, echo)
+}
+
+func (n *Node) startMissingCurrentRemovalEpochEcho(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64) error {
+	key := epochKey(epoch, source, seq)
+	instance := aba.EpochInstance(epoch, source)
+	n.mu.Lock()
+	if n.reconSent[key] || n.reconDone[key] {
+		n.mu.Unlock()
+		return nil
+	}
+	if n.State.RmMark[source] == -1 || n.State.RmMark[source] > int64(seq) {
+		n.State.RmMark[source] = int64(seq)
+	}
+	delete(n.State.PendingABAs, instance)
+	delete(n.abaInputSent, instance)
+	delete(n.abaInputs, instance)
+	version := n.State.ConfigVersion
+	prev := append([]byte(nil), n.State.RPrev...)
+	n.reconSent[key] = true
+	n.reconDone[key] = true
+	n.mu.Unlock()
+	debugf("node=%s current-missing-removal epoch=%d source=%s seq=%d", n.ID, epoch, source, seq)
+	random := crypto.HashBytes(prev, []byte(fmt.Sprintf("removal/%d/%s/%d", version, source, seq)))
+	echo, err := p2p.NewMessage(Protocol, "RECON_ECHO", key, n.ID, "", ReconEchoMessage{Epoch: epoch, Source: source, Seq: seq, Random: random})
+	if err != nil {
+		return err
+	}
+	return n.Transport.Broadcast(ctx, echo)
+}
+
 func (n *Node) registerBeaconWaiter(epoch uint64, source p2p.NodeID, seq uint64) chan Beacon {
 	key := epochKey(epoch, source, seq)
 	ch := make(chan Beacon, 1)
@@ -885,6 +1021,16 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64, instance string, wait <-chan Beacon) (Object, *Beacon, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	var expire <-chan time.Time
+	var expireTimer *time.Timer
+	n.mu.Lock()
+	removalCandidate := n.currentMissingRemoval && n.removalCandidates[source]
+	n.mu.Unlock()
+	if removalCandidate && source != n.ID {
+		expireTimer = time.NewTimer(n.removalWait)
+		defer expireTimer.Stop()
+		expire = expireTimer.C
+	}
 	loggedWait := false
 	for {
 		if b, ok := n.certifiedBeaconForEpoch(epoch); ok {
@@ -906,6 +1052,15 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 		case b := <-wait:
 			return Object{}, &b, nil
 		case <-ticker.C:
+		case <-expire:
+			if err := n.startMissingCurrentRemovalEpochEcho(ctx, epoch, source, seq); err != nil {
+				return Object{}, nil, err
+			}
+			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
+			if err != nil {
+				return Object{}, nil, err
+			}
+			return Object{}, &b, nil
 		case <-ctx.Done():
 			return Object{}, nil, ctx.Err()
 		}
@@ -1574,6 +1729,7 @@ func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 		return false
 	}
 	obj, ok := n.State.ComQ[b.Source][b.Seq]
+	removalEpoch := n.State.RmMark[b.Source] != -1 && b.Seq == uint64(n.State.RmMark[b.Source])
 	threshold := 2*n.State.F + 1
 	members := n.memberSetLocked()
 	state := CertifiedStateDigest{}
@@ -1581,10 +1737,13 @@ func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 	if ok && obj.ConfigVersion == b.ConfigVersion {
 		state = n.certifiedStateDigestForBeaconLocked(b.Source, b.Seq)
 		stateHash = stateDigestHash(state)
+	} else if removalEpoch {
+		state = n.certifiedStateDigestForBeaconLocked(b.Source, b.Seq)
+		stateHash = stateDigestHash(state)
 	}
 	n.mu.Unlock()
 
-	if !ok || obj.ConfigVersion != b.ConfigVersion {
+	if (!ok || obj.ConfigVersion != b.ConfigVersion) && !removalEpoch {
 		n.mu.Lock()
 		if n.State.Epoch < b.Epoch && b.ConfigVersion == n.State.ConfigVersion {
 			n.pendingCerts[key] = b
@@ -1592,7 +1751,11 @@ func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 		n.mu.Unlock()
 		return false
 	}
-	if b.ObjectID != "" && b.ObjectID != obj.Commitment.SecretID {
+	if removalEpoch {
+		if b.ObjectID != "" {
+			return false
+		}
+	} else if b.ObjectID != "" && b.ObjectID != obj.Commitment.SecretID {
 		return false
 	}
 	if b.StateHash == "" || b.StateHash != stateHash {
@@ -1874,6 +2037,8 @@ func (n *Node) installRemovalPVSSLocked() {
 }
 
 func (n *Node) resetConfigurationCachesLocked() {
+	n.State.ProducerSeq = n.State.Seqs[n.ID]
+	n.producerBusy = make(map[uint64]bool)
 	n.recon = make(map[string]map[p2p.NodeID]crypto.DecryptedShare)
 	n.reconSecret = make(map[string][]byte)
 	n.reconDone = make(map[string]bool)
@@ -1911,6 +2076,7 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 		Node:          n.ID,
 		Completed:     n.State.Epoch,
 		NextEpoch:     n.State.Epoch + 1,
+		ConfigVersion: n.State.ConfigVersion,
 		PendingABAs:   len(n.State.PendingABAs),
 		VerifiedCache: len(n.verified),
 	}
