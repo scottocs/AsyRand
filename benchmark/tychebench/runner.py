@@ -1152,6 +1152,8 @@ def _remote_command_for_node(protocol, node, options):
         tyche_env = f"GOMAXPROCS={options.gomaxprocs}"
         if os.environ.get("TYCHE_EPOCH_ATTEMPT_MS"):
             tyche_env += f" TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(os.environ['TYCHE_EPOCH_ATTEMPT_MS'])}"
+        if os.environ.get("TYCHE_TCP_PEER_WAIT_MS"):
+            tyche_env += f" TYCHE_TCP_PEER_WAIT_MS={_remote_quote(os.environ['TYCHE_TCP_PEER_WAIT_MS'])}"
         if os.environ.get("TYCHE_DEBUG"):
             tyche_env += f" TYCHE_DEBUG={_remote_quote(os.environ['TYCHE_DEBUG'])}"
         pvss_arg = " -pvss scrape" if protocol in {"tyche-scrape", "tyche-scrape-reconfig"} else ""
@@ -1649,6 +1651,7 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "aws_goarch": os.environ.get("AWS_GOARCH", "amd64"),
         "aws_cgo_enabled": os.environ.get("AWS_CGO_ENABLED", "0"),
         "tyche_epoch_attempt_ms": os.environ.get("TYCHE_EPOCH_ATTEMPT_MS", ""),
+        "tyche_tcp_peer_wait_ms": os.environ.get("TYCHE_TCP_PEER_WAIT_MS", ""),
         "tyche_debug": os.environ.get("TYCHE_DEBUG", ""),
         "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", str(_default_reconfig_events(epochs))),
         "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", str(nodes - bft_f)),
@@ -1717,6 +1720,7 @@ def _legacy_aws_config_from_state(path, rows):
         "aws_goarch": "amd64",
         "aws_cgo_enabled": "0",
         "tyche_epoch_attempt_ms": "10000",
+        "tyche_tcp_peer_wait_ms": "",
         "tyche_debug": "",
         "tyche_reconfig_events": "",
         "tyche_reconfig_min_n": "",

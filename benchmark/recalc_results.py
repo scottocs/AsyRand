@@ -132,6 +132,27 @@ def final_metrics(lines):
     return ""
 
 
+def period_bandwidth_metrics(lines, fallback):
+    elapsed = 0.0
+    sent = 0.0
+    recv = 0.0
+
+    for line in lines:
+        if "periodic metrics" not in line:
+            continue
+        elapsed += float_metric(line, "elapsed_s")
+        sent += float_metric(line, "sent")
+        recv += float_metric(line, "recv")
+
+    if elapsed <= 0:
+        return (
+            float_metric(fallback, "bandwidth"),
+            float_metric(fallback, "sent"),
+            float_metric(fallback, "recv"),
+        )
+    return (sent + recv) / elapsed, sent, recv
+
+
 def node_index_from_path(path):
     match = re.search(r"node(\d+)\.log$", path.name)
     return int(match.group(1)) if match else -1
@@ -171,9 +192,7 @@ def parse_log(protocol, log_file, regions):
         raise ValueError("missing final metrics")
 
     throughput = float_metric(final, "throughput")
-    bandwidth = float_metric(final, "bandwidth")
-    sent = float_metric(final, "sent")
-    recv = float_metric(final, "recv")
+    bandwidth, sent, recv = period_bandwidth_metrics(lines, final)
     protocol_elapsed = protocol_elapsed_seconds(final)
     wall_elapsed = parse_duration_seconds(line_value(lines, "Elapsed (wall clock) time"))
     elapsed = protocol_elapsed or wall_elapsed
