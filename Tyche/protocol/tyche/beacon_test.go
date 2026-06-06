@@ -170,8 +170,8 @@ func TestProducerDefaultWatermarks(t *testing.T) {
 	defer cancel()
 
 	node := newTestNodes(t, ctx)[0]
-	if node.producerLow != 2 || node.producerHigh != 3 {
-		t.Fatalf("producer watermarks low=%d high=%d, want low=2 high=3", node.producerLow, node.producerHigh)
+	if node.producerLow != 2 || node.producerHigh != 4 {
+		t.Fatalf("producer watermarks low=%d high=%d, want low=2 high=4", node.producerLow, node.producerHigh)
 	}
 }
 

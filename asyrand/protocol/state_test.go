@@ -10,6 +10,71 @@ import (
 	"time"
 )
 
+func TestProducerHighWatermarkBoundsAllocatedCommitments(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	net := p2p.NewMemoryNetwork()
+	keys := make(map[p2p.NodeID]asig.KeyPair)
+	pubs := make(map[string]ed25519.PublicKey)
+	pvssPublic := make(map[p2p.NodeID]kyber.Point)
+	pvssPrivate := make(map[p2p.NodeID]kyber.Scalar)
+	for _, id := range ids {
+		kp, err := asig.GenerateKeyPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys[id] = kp
+		pubs[string(id)] = kp.Public
+		pvssKey := asig.PVSSKeyPairFromSeed(asig.HashBytes([]byte(id)))
+		pvssPrivate[id] = pvssKey.Private
+		pvssPublic[id] = pvssKey.Public
+	}
+
+	scheme, err := asig.NewScheme("n0", 2, pvssPrivate["n0"], pvssPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(NodeConfig{
+		ID: "n0", Members: ids, F: 1, QueueLen: 4, Keys: keys["n0"],
+		Public: pubs, Transport: net.NewTransport("n0", 1024), PVSS: scheme,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids[1:] {
+		net.NewTransport(id, 1024)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := node.Produce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := node.Produce(ctx); err == nil {
+		t.Fatal("expected producer high watermark to block fifth commitment")
+	}
+	if got := node.producerWindowDepth(); got != 4 {
+		t.Fatalf("producer window=%d, want 4", got)
+	}
+
+	typed, ok := node.Transport.(interface {
+		MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
+	})
+	if !ok {
+		t.Fatal("transport does not expose message-type metrics")
+	}
+	sent := typed.MessageTypeMetrics()["rbc/VAL"].SentMessages
+	want := uint64(4 * len(ids))
+	if sent != want {
+		t.Fatalf("rbc/VAL sent=%d, want %d", sent, want)
+	}
+}
+
 func TestStateRemoveSourceOnEmptySource(t *testing.T) {
 	state := NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1, 4, []byte{0})
 	source, err := state.Source()

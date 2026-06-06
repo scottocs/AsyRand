@@ -126,10 +126,10 @@ func (n *Node) StartProtocol(ctx context.Context) {
 }
 
 func (n *Node) Produce(ctx context.Context) (asig.Commitment, error) {
-	n.seqMu.Lock()
-	n.seq++
-	seq := n.seq
-	n.seqMu.Unlock()
+	seq, err := n.reserveProducerSeq()
+	if err != nil {
+		return asig.Commitment{}, err
+	}
 
 	start := time.Now()
 	commit, _, err := n.PVSS.Share(n.ID, seq, n.State.Members)
@@ -137,13 +137,16 @@ func (n *Node) Produce(ctx context.Context) (asig.Commitment, error) {
 		n.Perf.addShare(time.Since(start))
 	}
 	if err != nil {
+		n.releaseProducerSeq(seq)
 		return asig.Commitment{}, err
 	}
 	raw, err := json.Marshal(commit)
 	if err != nil {
+		n.releaseProducerSeq(seq)
 		return asig.Commitment{}, err
 	}
 	if err := n.RBC.Broadcast(ctx, seq, raw); err != nil {
+		n.releaseProducerSeq(seq)
 		return asig.Commitment{}, err
 	}
 	return commit, nil
@@ -177,18 +180,14 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 			case <-timer.C:
 				n.refreshProducerInFlight()
 				depth := n.State.QueueLength(n.ID)
-				inFlight := n.producerInFlightCount()
-				level := depth + inFlight
+				level := n.producerWindowDepth()
 				if level >= high {
 					producing = false
 				} else if level <= low {
 					producing = true
 				}
-				if producing && level < high && depth < queueLen && inFlight < high {
-					commit, err := n.Produce(ctx)
-					if err == nil {
-						n.trackProducerInFlight(commit.Seq)
-					}
+				if producing && level < high && depth < queueLen {
+					_, _ = n.Produce(ctx)
 				}
 				timer.Reset(interval)
 			case <-ctx.Done():
@@ -628,15 +627,61 @@ func (n *Node) producerInFlightCount() int {
 	return len(n.producerInFlight)
 }
 
-func (n *Node) trackProducerInFlight(seq uint64) {
+func (n *Node) reserveProducerSeq() (uint64, error) {
+	n.seqMu.Lock()
+	defer n.seqMu.Unlock()
+	if n.producerWindowDepthLocked() >= n.producerHighWatermark() {
+		return 0, errors.New("local producer high watermark reached")
+	}
+	n.seq++
+	seq := n.seq
 	n.producerMu.Lock()
-	defer n.producerMu.Unlock()
 	n.producerInFlight = append(n.producerInFlight, seq)
+	n.producerMu.Unlock()
+	return seq, nil
 }
 
-func (n *Node) markProducedDelivered(seq uint64) {
+func (n *Node) releaseProducerSeq(seq uint64) {
+	n.seqMu.Lock()
 	n.producerMu.Lock()
-	defer n.producerMu.Unlock()
+	n.removeProducerInFlightLocked(seq)
+	n.producerMu.Unlock()
+	if n.seq == seq {
+		n.seq--
+	}
+	n.seqMu.Unlock()
+}
+
+func (n *Node) producerWindowDepth() int {
+	n.seqMu.Lock()
+	defer n.seqMu.Unlock()
+	return n.producerWindowDepthLocked()
+}
+
+func (n *Node) producerWindowDepthLocked() int {
+	consumed := n.State.ConsumedSeq(n.ID)
+	if n.seq <= consumed {
+		return 0
+	}
+	return int(n.seq - consumed)
+}
+
+func (n *Node) producerHighWatermark() int {
+	queueLen := n.State.QueueLen
+	if queueLen <= 0 {
+		queueLen = 8
+	}
+	high := 4
+	if high > queueLen {
+		high = queueLen
+	}
+	if high <= 0 {
+		high = 1
+	}
+	return high
+}
+
+func (n *Node) removeProducerInFlightLocked(seq uint64) {
 	out := n.producerInFlight[:0]
 	for _, pending := range n.producerInFlight {
 		if pending != seq {
@@ -644,6 +689,12 @@ func (n *Node) markProducedDelivered(seq uint64) {
 		}
 	}
 	n.producerInFlight = out
+}
+
+func (n *Node) markProducedDelivered(seq uint64) {
+	n.producerMu.Lock()
+	defer n.producerMu.Unlock()
+	n.removeProducerInFlightLocked(seq)
 }
 
 func (n *Node) refreshProducerInFlight() {
