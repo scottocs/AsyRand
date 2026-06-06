@@ -2170,6 +2170,23 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
                                 future.result()
                             except Exception:
                                 pass
+            if run_error is None and protocol in {"tyche-reconfig", "tyche-scrape-reconfig"} and failed_hosts:
+                stopped_jobs = [
+                    (hosts[node], node)
+                    for node in sorted(failed_hosts)
+                    if node not in fetched_nodes
+                ]
+                if stopped_jobs:
+                    with ThreadPoolExecutor(max_workers=min(16, len(stopped_jobs))) as pool:
+                        stopped_fetches = [
+                            pool.submit(_fetch_node_log, host, options, protocol, node)
+                            for host, node in stopped_jobs
+                        ]
+                        for future in as_completed(stopped_fetches):
+                            try:
+                                future.result()
+                            except Exception:
+                                pass
             if run_error is None:
                 break
             if attempt < protocol_retries:

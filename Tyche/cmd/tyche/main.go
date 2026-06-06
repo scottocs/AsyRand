@@ -326,19 +326,16 @@ func runTCP(opts runOptions) error {
 		fmt.Printf("node=%s prefilled_epochs=%d counted=0\n", opts.nodeID, completed)
 	}
 	var finalWindow finalMetricWindow
-	reconfigTarget := reconfigEventLimit(opts)
-	reconfigs := 0
+	reconfigSchedule := buildReconfigSchedule(ids, opts)
 	localStops := 0
 
 	for counted := 0; counted < opts.epochs; counted++ {
 		epoch := counted + 1
-		snapshot := node.DebugSnapshot()
-		if shouldRunReconfiguration(epoch, opts.epochs, reconfigs, reconfigTarget) && snapshot.Source != "" {
-			victim := snapshot.Source
+		if victim, ok := reconfigSchedule[epoch]; ok {
+			snapshot := node.DebugSnapshot()
 			fmt.Printf("reconfig_schedule epoch=%d action=stop_node node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d seed=%d\n",
 				epoch, victim, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigSeed)
 			node.MarkRemovalCandidate(victim)
-			reconfigs++
 			if victim == opts.nodeID {
 				node.SetProducing(false)
 				ensureCtx, cancelEnsure := context.WithTimeout(runCtx, epochAttemptTimeout)
@@ -376,7 +373,7 @@ func runTCP(opts runOptions) error {
 	}
 	queueTotal, queueMax := collectQueue(nodes)
 	finalWindow.print(nodes, queueTotal, queueMax)
-	printReconfigFinal(node, reconfigTarget, localStops, opts)
+	printReconfigFinal(node, len(reconfigSchedule), localStops, opts)
 	return nil
 }
 
