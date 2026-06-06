@@ -31,7 +31,7 @@ class LocalOptions:
     fault_threshold: int
     grandline_fault_threshold: int
     queue_len: int = 8
-    producer_ms: int = 250
+    producer_ms: int = 50
     prefill_ms: int = 3000
     epoch_timeout_ms: int = 15000
     report_ms: int = 5000
@@ -66,7 +66,7 @@ class AwsOptions:
     grandline_fault_threshold: int
     base_port: int = 9000
     queue_len: int = 8
-    producer_ms: int = 250
+    producer_ms: int = 50
     prefill_ms: int = 8000
     epoch_timeout_ms: int = 60000
     report_ms: int = 5000

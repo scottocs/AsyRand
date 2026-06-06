@@ -15,7 +15,7 @@ from tychebench.aws import (
 )
 
 
-DEFAULT_PROTOCOLS = "tyche,tyche-scrape,tyche-reconfig,tyche-scrape-reconfig,asyrand,grandline,spurt"
+DEFAULT_PROTOCOLS = "tyche,tyche-scrape,asyrand,grandline,spurt"
 
 
 @contextmanager
