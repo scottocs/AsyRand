@@ -197,7 +197,6 @@ type Node struct {
 	producerHigh          int
 	removalWait           time.Duration
 	currentMissingRemoval bool
-	removalCandidates     map[p2p.NodeID]bool
 	producing             bool
 	waiters               map[string][]chan Beacon
 	certBeacons           map[string]Beacon
@@ -342,7 +341,6 @@ func NewNode(cfg Config) (*Node, error) {
 		producerHigh:          high,
 		removalWait:           removalWait,
 		currentMissingRemoval: cfg.CurrentMissingRemoval,
-		removalCandidates:     make(map[p2p.NodeID]bool),
 		producing:             true,
 		waiters:               make(map[string][]chan Beacon),
 		certBeacons:           make(map[string]Beacon),
@@ -521,14 +519,6 @@ func (n *Node) IsProducing() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.producing
-}
-
-func (n *Node) MarkRemovalCandidate(id p2p.NodeID) {
-	n.mu.Lock()
-	if n.currentMissingRemoval {
-		n.removalCandidates[id] = true
-	}
-	n.mu.Unlock()
 }
 
 func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
@@ -1024,9 +1014,9 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 	var expire <-chan time.Time
 	var expireTimer *time.Timer
 	n.mu.Lock()
-	removalCandidate := n.currentMissingRemoval && n.removalCandidates[source]
+	currentMissingRemoval := n.currentMissingRemoval
 	n.mu.Unlock()
-	if removalCandidate && source != n.ID {
+	if currentMissingRemoval && source != n.ID {
 		expireTimer = time.NewTimer(n.removalWait)
 		defer expireTimer.Stop()
 		expire = expireTimer.C

@@ -335,7 +335,6 @@ func runTCP(opts runOptions) error {
 			snapshot := node.DebugSnapshot()
 			fmt.Printf("reconfig_schedule epoch=%d action=stop_node node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d seed=%d\n",
 				epoch, victim, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigSeed)
-			node.MarkRemovalCandidate(victim)
 			if victim == opts.nodeID {
 				node.SetProducing(false)
 				ensureCtx, cancelEnsure := context.WithTimeout(runCtx, epochAttemptTimeout)
