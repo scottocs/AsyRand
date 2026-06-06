@@ -154,7 +154,7 @@ func (n *Node) Produce(ctx context.Context) (asig.Commitment, error) {
 
 func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
-		interval = 100 * time.Millisecond
+		interval = 50 * time.Millisecond
 	}
 	queueLen := n.State.QueueLen
 	if queueLen <= 0 {

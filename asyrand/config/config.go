@@ -69,7 +69,7 @@ func Load(path string) (Config, error) {
 		cfg.ListenIP = "0.0.0.0"
 	}
 	if cfg.ProducerMS == 0 {
-		cfg.ProducerMS = 250
+		cfg.ProducerMS = 50
 	}
 	if cfg.PrefillMS == 0 {
 		cfg.PrefillMS = 1000
