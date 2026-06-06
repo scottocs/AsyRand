@@ -331,6 +331,12 @@ func runTCP(opts runOptions) error {
 
 	for counted := 0; counted < opts.epochs; counted++ {
 		epoch := counted + 1
+		if !node.IsMember(opts.nodeID) {
+			snapshot := node.DebugSnapshot()
+			fmt.Printf("reconfig_self_removed epoch=%d node=%s completed=%d config_version=%d\n", epoch, opts.nodeID, snapshot.Completed, snapshot.ConfigVersion)
+			printReconfigFinal(node, len(reconfigSchedule), localStops, opts)
+			return nil
+		}
 		if victim, ok := reconfigSchedule[epoch]; ok {
 			snapshot := node.DebugSnapshot()
 			fmt.Printf("reconfig_schedule epoch=%d action=stop_node node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d seed=%d\n",
@@ -348,15 +354,14 @@ func runTCP(opts runOptions) error {
 					epoch, victim, snapshot.Source, seq, node.CompletedEpoch(), snapshot.ConfigVersion)
 				if opts.reconfigCrashGraceMS > 0 {
 					grace := time.Duration(opts.reconfigCrashGraceMS) * time.Millisecond
-					fmt.Printf("reconfig_crash_grace epoch=%d node=%s seq=%d grace_ms=%d\n", epoch, victim, seq, opts.reconfigCrashGraceMS)
+					fmt.Printf("reconfig_stop_grace epoch=%d node=%s seq=%d grace_ms=%d\n", epoch, victim, seq, opts.reconfigCrashGraceMS)
 					select {
 					case <-time.After(grace):
 					case <-runCtx.Done():
 						return runCtx.Err()
 					}
 				}
-				fmt.Printf("reconfig_stop_node epoch=%d node=%s seq=%d\n", epoch, victim, seq)
-				return fmt.Errorf("node %s stopped for reconfiguration at epoch %d", opts.nodeID, epoch)
+				fmt.Printf("reconfig_stop_producing epoch=%d node=%s seq=%d\n", epoch, victim, seq)
 			}
 		}
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)

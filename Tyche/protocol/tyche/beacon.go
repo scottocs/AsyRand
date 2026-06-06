@@ -1015,8 +1015,9 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 	var expireTimer *time.Timer
 	n.mu.Lock()
 	currentMissingRemoval := n.currentMissingRemoval
+	producing := n.producing
 	n.mu.Unlock()
-	if currentMissingRemoval && source != n.ID {
+	if currentMissingRemoval && (source != n.ID || !producing) {
 		expireTimer = time.NewTimer(n.removalWait)
 		defer expireTimer.Stop()
 		expire = expireTimer.C
@@ -2058,6 +2059,12 @@ func (n *Node) CompletedEpoch() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.State.Epoch
+}
+
+func (n *Node) IsMember(id p2p.NodeID) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return contains(n.State.Members, id)
 }
 
 func (n *Node) DebugSnapshot() DebugSnapshot {
