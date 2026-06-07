@@ -128,6 +128,52 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 	}
 }
 
+func TestHandleReconStoresMissingObjectFromMessage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	source := nextSource(nodes[0])
+	var producer *Node
+	for _, n := range nodes {
+		if n.ID == source {
+			producer = n
+			break
+		}
+	}
+	if producer == nil {
+		t.Fatalf("missing producer %s", source)
+	}
+	obj, err := producer.Produce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStored(t, ctx, nodes, source, obj.Seq)
+
+	target := nodes[0]
+	holder := nodes[1]
+	if holder.ID == target.ID {
+		holder = nodes[2]
+	}
+	target.mu.Lock()
+	delete(target.State.ComQ[source], obj.Seq)
+	target.mu.Unlock()
+
+	share, err := holder.PVSS.PreReconVerified(obj.Commitment, holder.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.handleRecon(ctx, holder.ID, ReconMessage{Epoch: 1, Source: source, Seq: obj.Seq, Share: share, Object: &obj}); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	_, stored := target.State.ComQ[source][obj.Seq]
+	target.mu.Unlock()
+	if !stored {
+		t.Fatalf("recon did not restore missing object %s/%d", source, obj.Seq)
+	}
+}
+
 func TestBeaconAutoProducerCertifiesEpochN4(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -779,6 +825,422 @@ func TestMarkedSelectedSourceRemovedAtMarkedSequence(t *testing.T) {
 	}
 	if f != 0 || rbcF != 0 || abaF != 0 || rbcN != 3 || abaN != 3 {
 		t.Fatalf("thresholds not updated after removal: stateF=%d rbc=(%d,%d) aba=(%d,%d)", f, rbcN, rbcF, abaN, abaF)
+	}
+}
+
+func TestCertifiedStateDigestIgnoresUnconsumedRemovalMarks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	left := nodes[0]
+	right := nodes[1]
+
+	for _, node := range []*Node{left, right} {
+		node.mu.Lock()
+		node.State.RSQ = []p2p.NodeID{"n2", "n3"}
+		node.State.SCL = []p2p.NodeID{"n0", "n1"}
+		node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
+		node.mu.Unlock()
+	}
+
+	left.mu.Lock()
+	left.State.RmMark["n2"] = 4
+	leftDigest := left.certifiedStateDigestForBeaconLocked("n0", 1)
+	leftHash := stateDigestHash(leftDigest)
+	leftRm := leftDigest.RmMark["n2"]
+	left.mu.Unlock()
+
+	right.mu.Lock()
+	rightDigest := right.certifiedStateDigestForBeaconLocked("n0", 1)
+	rightHash := stateDigestHash(rightDigest)
+	rightRm := rightDigest.RmMark["n2"]
+	right.mu.Unlock()
+
+	if leftHash != rightHash {
+		t.Fatalf("unconsumed removal mark changed certified state hash: left=%s right=%s", leftHash, rightHash)
+	}
+	if leftRm != -1 || rightRm != -1 {
+		t.Fatalf("unconsumed removal marks leaked into certified digest: left=%d right=%d", leftRm, rightRm)
+	}
+}
+
+func TestQueueLenOneSkipsLookaheadABA(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	pp, keys, err := crypto.Setup("test-epoch", 2, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{
+		ID:                  "n0",
+		Members:             ids,
+		F:                   1,
+		QueueLen:            1,
+		LookaheadExpiration: time.Hour,
+		PVSS:                s,
+		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if certified, err := node.proposeEpochABAInputFromLookahead(ctx, 1, "n0", 1, "test-instance", make(chan Beacon, 1)); err != nil {
+		t.Fatal(err)
+	} else if certified != nil {
+		t.Fatalf("unexpected certified beacon: %+v", *certified)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("queue_len=1 waited for lookahead: %s", elapsed)
+	}
+	node.mu.Lock()
+	sent := node.abaInputSent["test-instance"]
+	_, inputStored := node.abaInputs["test-instance"]
+	node.mu.Unlock()
+	if sent || inputStored {
+		t.Fatalf("queue_len=1 created lookahead ABA input: sent=%v stored=%v", sent, inputStored)
+	}
+}
+
+func TestExplicitRemovalOnlyKeepsLookaheadABA(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	pp, keys, err := crypto.Setup("test-explicit-lookahead", 2, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{
+		ID:                  "n0",
+		Members:             ids,
+		F:                   1,
+		QueueLen:            8,
+		LookaheadExpiration: time.Hour,
+		ExplicitRemovalOnly: true,
+		PVSS:                s,
+		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, seq, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip || certified {
+		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
+	}
+	node.mu.Lock()
+	_, pending := node.State.PendingABAs[instance]
+	node.mu.Unlock()
+	if !pending {
+		t.Fatalf("explicit removal mode did not create lookahead ABA %s", instance)
+	}
+
+	node.mu.Lock()
+	version := node.State.ConfigVersion
+	node.State.ComQ[source][seq+1] = Object{Producer: source, Seq: seq + 1, ConfigVersion: version}
+	node.mu.Unlock()
+
+	start := time.Now()
+	if certifiedBeacon, err := node.proposeEpochABAInputFromLookahead(ctx, 1, source, seq, instance, make(chan Beacon, 1)); err != nil {
+		t.Fatal(err)
+	} else if certifiedBeacon != nil {
+		t.Fatalf("unexpected certified beacon: %+v", *certifiedBeacon)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("explicit removal mode waited for lookahead: %s", elapsed)
+	}
+	node.mu.Lock()
+	sent := node.abaInputSent[instance]
+	input, inputStored := node.abaInputs[instance]
+	node.mu.Unlock()
+	if !sent || !inputStored || !input {
+		t.Fatalf("explicit removal mode did not propose lookahead true input: sent=%v stored=%v input=%v", sent, inputStored, input)
+	}
+}
+
+func TestExplicitRemovalOnlyDropsMissingLookaheadABA(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	pp, keys, err := crypto.Setup("test-explicit-missing-lookahead", 2, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{
+		ID:                  "n0",
+		Members:             ids,
+		F:                   1,
+		QueueLen:            8,
+		LookaheadExpiration: time.Millisecond,
+		ExplicitRemovalOnly: true,
+		PVSS:                s,
+		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, seq, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip || certified {
+		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
+	}
+
+	start := time.Now()
+	if certifiedBeacon, err := node.proposeEpochABAInputFromLookahead(ctx, 1, source, seq, instance, make(chan Beacon, 1)); err != nil {
+		t.Fatal(err)
+	} else if certifiedBeacon != nil {
+		t.Fatalf("unexpected certified beacon: %+v", *certifiedBeacon)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("explicit removal mode waited too long for missing lookahead: %s", elapsed)
+	}
+	node.mu.Lock()
+	_, pending := node.State.PendingABAs[instance]
+	sent := node.abaInputSent[instance]
+	_, inputStored := node.abaInputs[instance]
+	mark := node.State.RmMark[source]
+	node.mu.Unlock()
+	if pending || sent || inputStored {
+		t.Fatalf("missing lookahead left ABA state: pending=%v sent=%v input=%v", pending, sent, inputStored)
+	}
+	if mark != -1 {
+		t.Fatalf("missing lookahead marked source for removal: source=%s mark=%d", source, mark)
+	}
+}
+
+func TestExplicitRemovalOnlyDropsUnreadyLookaheadABA(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	pp, keys, err := crypto.Setup("test-explicit-unready-lookahead", 2, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{
+		ID:                  "n0",
+		Members:             ids,
+		F:                   1,
+		QueueLen:            8,
+		LookaheadExpiration: time.Millisecond,
+		ExplicitRemovalOnly: true,
+		PVSS:                s,
+		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip || certified {
+		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
+	}
+	if err := node.proposeEpochABAInput(ctx, instance, true); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := node.waitCurrentABAReady(ctx, instance); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("explicit removal mode waited too long for unready lookahead ABA: %s", elapsed)
+	}
+	node.mu.Lock()
+	_, pending := node.State.PendingABAs[instance]
+	_, inputStored := node.abaInputs[instance]
+	node.mu.Unlock()
+	if pending || inputStored {
+		t.Fatalf("unready lookahead left pending ABA state: pending=%v input=%v", pending, inputStored)
+	}
+}
+
+func TestExplicitRemovalOnlyDoesNotAutoRemoveMissingCurrentObject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	pp, keys, err := crypto.Setup("test-explicit-current", 2, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{
+		ID:                    "n0",
+		Members:               ids,
+		F:                     1,
+		QueueLen:              8,
+		RemovalExpiration:     time.Millisecond,
+		CurrentMissingRemoval: true,
+		ExplicitRemovalOnly:   true,
+		PVSS:                  s,
+		Transport:             p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	missingCtx, cancelMissing := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancelMissing()
+	source := p2p.NodeID("n1")
+	seq := uint64(1)
+	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, aba.EpochInstance(1, source), make(chan Beacon, 1))
+	if err == nil {
+		t.Fatal("expected missing current object to wait for context")
+	}
+	node.mu.Lock()
+	mark := node.State.RmMark[source]
+	node.mu.Unlock()
+	if mark != -1 {
+		t.Fatalf("explicit removal mode auto-marked missing source %s: mark=%d", source, mark)
+	}
+}
+
+func TestForceReconfigurationRemovalMarksCurrentSequence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	node := nodes[0]
+	source := nextSource(node)
+
+	seq, applied, err := node.ForceReconfigurationRemoval(1, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatalf("expected forced ABA false for selected source %s", source)
+	}
+	node.mu.Lock()
+	mark := node.State.RmMark[source]
+	_, pending := node.State.PendingABAs[aba.EpochInstance(1, source)]
+	_, inputStored := node.abaInputs[aba.EpochInstance(1, source)]
+	node.mu.Unlock()
+	if mark != int64(seq) {
+		t.Fatalf("removal mark mismatch: got %d want %d", mark, seq)
+	}
+	if pending || inputStored {
+		t.Fatalf("forced removal left pending state: pending=%v input=%v", pending, inputStored)
+	}
+}
+
+func TestForceReconfigurationRemovalIgnoresOtherSources(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	node := nodes[0]
+	selected := nextSource(node)
+	other := p2p.NodeID("")
+	for _, id := range []p2p.NodeID{"n0", "n1", "n2", "n3"} {
+		if id != selected {
+			other = id
+			break
+		}
+	}
+	if other == "" {
+		t.Fatal("missing alternate source")
+	}
+	if _, applied, err := node.ForceReconfigurationRemoval(1, other); err != nil {
+		t.Fatal(err)
+	} else if applied {
+		t.Fatalf("forced removal for non-selected source %s", other)
+	}
+	node.mu.Lock()
+	mark := node.State.RmMark[other]
+	node.mu.Unlock()
+	if mark != -1 {
+		t.Fatalf("non-selected source was marked for removal: %s mark=%d", other, mark)
+	}
+}
+
+func TestPrepareEpochDoesNotCreateLookaheadABAAtQueueLenOne(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	pp, keys, err := crypto.Setup("test-epoch", 2, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{
+		ID:        "n0",
+		Members:   ids,
+		F:         1,
+		QueueLen:  1,
+		PVSS:      s,
+		Transport: p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip || certified {
+		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
+	}
+	node.mu.Lock()
+	_, pending := node.State.PendingABAs[instance]
+	node.mu.Unlock()
+	if pending {
+		t.Fatalf("queue_len=1 created pending lookahead ABA %s", instance)
+	}
+}
+
+func TestEnsureCurrentObjectReleasesProducerBusy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	node := nodes[0]
+	seq, err := node.EnsureCurrentObject(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	busy := node.producerBusy[seq]
+	node.mu.Unlock()
+	if busy {
+		t.Fatalf("producer busy mark leaked for seq %d", seq)
 	}
 }
 

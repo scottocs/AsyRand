@@ -77,23 +77,22 @@ For Tyche reconfiguration benchmarks, tune churn with Fabric options:
 
 ```sh
 cd benchmark
-.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche-reconfig --reconfig-events=16
+.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche-reconfig --reconfig-events=15
 ```
 
 The reconfiguration benchmark starts with `--nodes` members and then injects churn events during the run. A stalled-source event disables one active producer; the protocol then observes that the selected source cannot supply a usable next object, drives the consume-or-mark ABA, and eventually applies the removal marker for that member. A joining proposal creates a new node and exercises the JOIN certificate path until the join activation boundary. Event choices are pseudo-random but deterministic for a given seed. By default the seed is `20260521`; override it with `--reconfig-seed`. The membership bounds default to `min_n = n - f` and `max_n = n + f`, and can be overridden with `--reconfig-min-n` and `--reconfig-max-n`.
 
-The runner writes detailed churn events to the protocol log, including `event=stop_produce`, `event=aba_deleted`, `event=joining_proposal`, and `event=joined`. To make a horizontal epoch timeline from one run, parse those lines from the latest log under `benchmark/runs/<run>/tyche-reconfig/local.log` and draw each event at its epoch. The example below draws the same no-title timeline style used in the paper figure:
+The runner writes detailed churn events to the protocol log, including `event=stop_produce`, `event=aba_deleted`, `event=joining_proposal`, and `event=joined`. To make a horizontal epoch timeline from one run, parse those lines from the latest log under `benchmark/runs/<run>/tyche-reconfig/local.log` and draw each event at its epoch. For example:
 
 ```sh
 cd benchmark
-.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche-reconfig --reconfig-events=16
+.venv/bin/fab local --nodes=8 --epochs=200 --protocols=tyche-reconfig --reconfig-events=15
 python - <<'PY'
 from pathlib import Path
 import re
 
 run = Path("runs/local_n8_e200")
-protocol_dir = run / "tyche-reconfig"
-log = protocol_dir / "local.log"
+log = run / "tyche-reconfig" / "local.log"
 events = {"stop_produce": [], "aba_deleted": [], "joining_proposal": [], "joined": []}
 for line in log.read_text(errors="replace").splitlines():
     for kind in events:
@@ -104,9 +103,9 @@ for line in log.read_text(errors="replace").splitlines():
 
 max_epoch = max((epoch for values in events.values() for epoch, _ in values), default=200)
 max_epoch = max(200, ((max_epoch + 99) // 100) * 100)
-width, height = 1400, 250
-left, right = 125, 35
-rows = {"stop_produce": 46, "aba_deleted": 88, "joining_proposal": 148, "joined": 190}
+width, height = 1200, 300
+left, right = 125, 30
+rows = {"stop_produce": 65, "aba_deleted": 120, "joining_proposal": 175, "joined": 230}
 labels = {
     "stop_produce": "stalled source",
     "aba_deleted": "removal applied",
@@ -124,31 +123,31 @@ def x(epoch): return left + (width - left - right) * epoch / max_epoch
 
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">']
 svg.append('<rect width="100%" height="100%" fill="white"/>')
+svg.append('<text x="125" y="28" font-family="Arial" font-size="20" font-weight="700">Tyche reconfiguration timeline</text>')
 tick_step = max(20, max_epoch // 10)
 for tick in range(0, max_epoch + 1, tick_step):
     xx = x(tick)
-    svg.append(f'<line x1="{xx:.1f}" y1="25" x2="{xx:.1f}" y2="212" stroke="#e5e7eb"/>')
-    svg.append(f'<text x="{xx:.1f}" y="238" text-anchor="middle" font-family="Arial" font-size="15">{tick}</text>')
+    svg.append(f'<line x1="{xx:.1f}" y1="45" x2="{xx:.1f}" y2="255" stroke="#e5e7eb"/>')
+    svg.append(f'<text x="{xx:.1f}" y="278" text-anchor="middle" font-family="Arial" font-size="11">{tick}</text>')
 for kind, y in rows.items():
-    svg.append(f'<text x="10" y="{y+5}" font-family="Arial" font-size="16">{labels[kind]}</text>')
+    svg.append(f'<text x="10" y="{y+4}" font-family="Arial" font-size="12">{labels[kind]}</text>')
     svg.append(f'<line x1="{left}" y1="{y}" x2="{width-right}" y2="{y}" stroke="#d1d5db"/>')
     for epoch, node in events[kind]:
         xx = x(epoch)
         title = f"<title>epoch {epoch}: {node}</title>"
         if kind == "stop_produce":
-            points = f"{xx:.1f},{y-14} {xx-12:.1f},{y+10} {xx+12:.1f},{y+10}"
+            points = f"{xx:.1f},{y-7} {xx-6:.1f},{y+5} {xx+6:.1f},{y+5}"
             svg.append(f'<polygon points="{points}" fill="{colors[kind]}">{title}</polygon>')
-            svg.append(f'<text x="{xx+15:.1f}" y="{y+5}" font-family="Arial" font-size="14" fill="{colors[kind]}" font-weight="700">{node_label(node)}</text>')
+            svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
         elif kind == "aba_deleted":
-            svg.append(f'<g stroke="{colors[kind]}" stroke-width="3.5" stroke-linecap="round">{title}<line x1="{xx-7:.1f}" y1="{y-7}" x2="{xx+7:.1f}" y2="{y+7}"/><line x1="{xx+7:.1f}" y1="{y-7}" x2="{xx-7:.1f}" y2="{y+7}"/></g>')
+            svg.append(f'<g stroke="{colors[kind]}" stroke-width="2.5" stroke-linecap="round">{title}<line x1="{xx-5:.1f}" y1="{y-5}" x2="{xx+5:.1f}" y2="{y+5}"/><line x1="{xx+5:.1f}" y1="{y-5}" x2="{xx-5:.1f}" y2="{y+5}"/></g>')
         else:
-            svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="10" fill="{colors[kind]}">{title}</circle>')
+            svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="5" fill="{colors[kind]}">{title}</circle>')
             if kind == "joining_proposal":
-                svg.append(f'<text x="{xx+15:.1f}" y="{y+5}" font-family="Arial" font-size="14" fill="{colors[kind]}" font-weight="700">{node_label(node)}</text>')
+                svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
 svg.append('</svg>')
-out = protocol_dir / "reconfig_timeline.svg"
-out.write_text("\n".join(svg), encoding="utf-8")
-print(out)
+(run / "reconfig_timeline.svg").write_text("\n".join(svg), encoding="utf-8")
+print(run / "reconfig_timeline.svg")
 PY
 ```
 

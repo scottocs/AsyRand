@@ -26,6 +26,13 @@ METRICS = {
         "ylabel": "Avg Throughput (beacons/min per node)",
         "precision": 4,
     },
+    "period_throughput": {
+        "column": "throughput_period_beacon_min",
+        "summary": "period_throughput_summary",
+        "title": "Period Beacon Throughput vs Cluster Size",
+        "ylabel": "Avg Period Throughput (beacons/min per node)",
+        "precision": 4,
+    },
     "cpu": {
         "column": "cpu_percent",
         "summary": "cpu_summary",

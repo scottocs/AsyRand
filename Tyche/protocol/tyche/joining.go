@@ -168,6 +168,7 @@ func (n *Node) HandleJoinArm(ctx context.Context, arm JoinArm) error {
 
 func (n *Node) HandleJoinCommit(ctx context.Context, commit JoinCommit) error {
 	if !n.validJoinCommit(commit) {
+		debugf("node=%s ignore join_commit signer=%s transition=%s reason=invalid", n.ID, commit.Signer, commit.Transition.String())
 		return nil
 	}
 	key := commit.Transition.String() + "/" + commit.RequestDigest + "/" + fmt.Sprint(commit.ActivationEpoch)
@@ -178,10 +179,13 @@ func (n *Node) HandleJoinCommit(ctx context.Context, commit JoinCommit) error {
 	n.joinCommits[key][commit.Signer] = commit
 	req, hasReq := n.joinRequests[commit.RequestDigest]
 	ready := len(n.joinCommits[key]) >= 2*n.State.F+1 && hasReq
+	commitCount := len(n.joinCommits[key])
+	commitNeed := 2*n.State.F + 1
 	cert2 := collectCommits(n.joinCommits[key], 2*n.State.F+1)
 	cert1 := collectAcks(n.joinAcks[commit.Transition.String()+"/"+commit.RequestDigest], 2*n.State.F+1)
 	n.mu.Unlock()
 	if !ready {
+		debugf("node=%s join_commit_wait transition=%s digest=%s commits=%d has_req=%t need=%d", n.ID, commit.Transition.String(), commit.RequestDigest, commitCount, hasReq, commitNeed)
 		return nil
 	}
 	cert := JoinCertificate{Request: req, Cert1: cert1, Cert2: cert2}
@@ -196,32 +200,39 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 	rho := JoinDigest(cert.Request)
 	n.mu.Lock()
 	if contains(n.State.Members, cert.Request.Joiner) {
+		debugf("node=%s ignore join_cert joiner=%s reason=already_member version=%d epoch=%d activation=%d", n.ID, cert.Request.Joiner, n.State.ConfigVersion, n.State.Epoch, cert.Request.ActivationEpoch)
 		n.mu.Unlock()
 		return nil
 	}
 	if cert.Request.ConfigVersion != n.State.ConfigVersion {
+		debugf("node=%s discard join_cert joiner=%s reason=config_mismatch cert_version=%d local_version=%d epoch=%d activation=%d", n.ID, cert.Request.Joiner, cert.Request.ConfigVersion, n.State.ConfigVersion, n.State.Epoch, cert.Request.ActivationEpoch)
 		n.discardStaleJoinLocked(cert)
 		n.mu.Unlock()
 		return nil
 	}
 	n.mu.Unlock()
 	if err := n.verifyJoinRequest(cert.Request); err != nil {
+		debugf("node=%s reject join_cert joiner=%s reason=verify_request err=%v", n.ID, cert.Request.Joiner, err)
 		return err
 	}
 	if len(cert.Cert2) == 0 || !n.verifyAckCert(cert.Cert1, rho) || !n.verifyCommitCert(cert.Cert2, rho, cert.Request.ActivationEpoch) {
+		debugf("node=%s reject join_cert joiner=%s reason=invalid_cert cert1=%d cert2=%d activation=%d", n.ID, cert.Request.Joiner, len(cert.Cert1), len(cert.Cert2), cert.Request.ActivationEpoch)
 		return errors.New("invalid join certificate")
 	}
 	scheme, err := n.schemeForCandidate(cert.Request.CandidateParams)
 	if err != nil {
+		debugf("node=%s reject join_cert joiner=%s reason=scheme err=%v", n.ID, cert.Request.Joiner, err)
 		return err
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if cert.Request.ConfigVersion != n.State.ConfigVersion || !n.noPendingRemovalLocked() {
+		debugf("node=%s defer_discard join_cert joiner=%s reason=state_changed cert_version=%d local_version=%d no_pending=%t epoch=%d activation=%d", n.ID, cert.Request.Joiner, cert.Request.ConfigVersion, n.State.ConfigVersion, n.noPendingRemovalLocked(), n.State.Epoch, cert.Request.ActivationEpoch)
 		n.discardStaleJoinLocked(cert)
 		return nil
 	}
 	if n.State.Epoch+1 < cert.Request.ActivationEpoch {
+		debugf("node=%s store_pending_join joiner=%s epoch=%d activation=%d version=%d", n.ID, cert.Request.Joiner, n.State.Epoch, cert.Request.ActivationEpoch, n.State.ConfigVersion)
 		key := transitionCertKey(cert)
 		n.pendingJoins[key] = cert
 		if n.lockedFrom == 0 || cert.Request.ActivationEpoch < n.lockedFrom {
@@ -230,12 +241,14 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 		return nil
 	}
 	if n.State.Epoch+1 > cert.Request.ActivationEpoch {
+		debugf("node=%s discard join_cert joiner=%s reason=past_activation epoch=%d activation=%d version=%d", n.ID, cert.Request.Joiner, n.State.Epoch, cert.Request.ActivationEpoch, n.State.ConfigVersion)
 		n.discardStaleJoinLocked(cert)
 		return nil
 	}
 	if contains(n.State.Members, cert.Request.Joiner) {
 		return nil
 	}
+	debugf("node=%s install_join joiner=%s epoch=%d activation=%d version=%d", n.ID, cert.Request.Joiner, n.State.Epoch, cert.Request.ActivationEpoch, n.State.ConfigVersion)
 	return n.installJoinCertificateLocked(cert, scheme)
 }
 
@@ -309,6 +322,10 @@ func (n *Node) RegisterPVSSKey(paramsEpoch string, private kyber.Scalar) {
 	n.mu.Lock()
 	n.pvssKeys[paramsEpoch] = private.Clone()
 	n.mu.Unlock()
+}
+
+func (n *Node) ActivatePendingJoins(ctx context.Context, epoch uint64) error {
+	return n.activatePendingJoins(ctx, epoch)
 }
 
 func (n *Node) schemeForCandidate(pp crypto.PVSSParams) (crypto.PVSSScheme, error) {

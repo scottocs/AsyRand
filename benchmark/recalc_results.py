@@ -14,6 +14,8 @@ FIELDS = [
     "ip",
     "throughput_beacon_min",
     "throughput_beacon_s",
+    "throughput_period_beacon_min",
+    "throughput_period_beacon_s",
     "elapsed_s",
     "latency_s",
     "bandwidth_kbps",
@@ -132,8 +134,9 @@ def final_metrics(lines):
     return ""
 
 
-def period_bandwidth_metrics(lines, fallback):
+def period_metrics(lines, fallback):
     elapsed = 0.0
+    beacons = 0.0
     sent = 0.0
     recv = 0.0
 
@@ -141,16 +144,18 @@ def period_bandwidth_metrics(lines, fallback):
         if "periodic metrics" not in line:
             continue
         elapsed += float_metric(line, "elapsed_s")
+        beacons += float_metric(line, "beacons")
         sent += float_metric(line, "sent")
         recv += float_metric(line, "recv")
 
     if elapsed <= 0:
         return (
+            float_metric(fallback, "throughput"),
             float_metric(fallback, "bandwidth"),
             float_metric(fallback, "sent"),
             float_metric(fallback, "recv"),
         )
-    return (sent + recv) / elapsed, sent, recv
+    return beacons * 60 / elapsed, (sent + recv) / elapsed, sent, recv
 
 
 def node_index_from_path(path):
@@ -192,7 +197,7 @@ def parse_log(protocol, log_file, regions):
         raise ValueError("missing final metrics")
 
     throughput = float_metric(final, "throughput")
-    bandwidth, sent, recv = period_bandwidth_metrics(lines, final)
+    period_throughput, bandwidth, sent, recv = period_metrics(lines, final)
     protocol_elapsed = protocol_elapsed_seconds(final)
     wall_elapsed = parse_duration_seconds(line_value(lines, "Elapsed (wall clock) time"))
     elapsed = protocol_elapsed or wall_elapsed
@@ -209,6 +214,8 @@ def parse_log(protocol, log_file, regions):
         "ip": ip,
         "throughput_beacon_min": f"{throughput:.4f}",
         "throughput_beacon_s": f"{throughput / 60:.4f}",
+        "throughput_period_beacon_min": f"{period_throughput:.4f}",
+        "throughput_period_beacon_s": f"{period_throughput / 60:.4f}",
         "elapsed_s": f"{elapsed:.3f}",
         "latency_s": f"{(60 / throughput) if throughput > 0 else 0:.4f}",
         "bandwidth_kbps": f"{bandwidth:.4f}",

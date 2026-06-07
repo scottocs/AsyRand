@@ -77,19 +77,23 @@ type Config struct {
 	QueueLen     int
 	ProducerLow  int
 	ProducerHigh int
-	// RemovalExpiration is the local look-ahead expiration event used before
-	// proposing 0 to the epoch-control ABA when the selected source's next FIFO
-	// object is not yet available. It is an implementation policy, not a
-	// network synchrony assumption.
+	// RemovalExpiration bounds how long a reconfiguration run waits for the
+	// selected source's current object before certifying a missing-source
+	// removal epoch.
 	RemovalExpiration     time.Duration
+	LookaheadExpiration   time.Duration
 	CurrentMissingRemoval bool
-	ConfigVersion         uint64
-	InitialRandom         []byte
-	PVSS                  crypto.PVSSScheme
-	PVSSBackend           string
-	PVSSKeys              map[string]kyber.Scalar
-	CryptoWorkers         int
-	Transport             p2p.Transport
+	// ExplicitRemovalOnly disables timeout-driven missing-current removal.
+	// Scheduled reconfiguration callers still mark removals explicitly; normal
+	// lookahead ABA continues to follow QueueLen.
+	ExplicitRemovalOnly bool
+	ConfigVersion       uint64
+	InitialRandom       []byte
+	PVSS                crypto.PVSSScheme
+	PVSSBackend         string
+	PVSSKeys            map[string]kyber.Scalar
+	CryptoWorkers       int
+	Transport           p2p.Transport
 }
 
 type State struct {
@@ -132,6 +136,7 @@ type ReconMessage struct {
 	Source p2p.NodeID            `json:"source"`
 	Seq    uint64                `json:"seq"`
 	Share  crypto.DecryptedShare `json:"share"`
+	Object *Object               `json:"object,omitempty"`
 }
 
 type ReconEchoMessage struct {
@@ -196,7 +201,9 @@ type Node struct {
 	producerLow           int
 	producerHigh          int
 	removalWait           time.Duration
+	lookaheadWait         time.Duration
 	currentMissingRemoval bool
+	explicitRemovalOnly   bool
 	producing             bool
 	waiters               map[string][]chan Beacon
 	certBeacons           map[string]Beacon
@@ -291,6 +298,10 @@ func NewNode(cfg Config) (*Node, error) {
 	if removalWait <= 0 {
 		removalWait = 5 * time.Second
 	}
+	lookaheadWait := cfg.LookaheadExpiration
+	if lookaheadWait <= 0 {
+		lookaheadWait = removalWait
+	}
 	pvssBackend := cfg.PVSSBackend
 	if pvssBackend == "" {
 		pvssBackend = crypto.PVSSO1
@@ -340,7 +351,9 @@ func NewNode(cfg Config) (*Node, error) {
 		producerLow:           low,
 		producerHigh:          high,
 		removalWait:           removalWait,
+		lookaheadWait:         lookaheadWait,
 		currentMissingRemoval: cfg.CurrentMissingRemoval,
+		explicitRemovalOnly:   cfg.ExplicitRemovalOnly,
 		producing:             true,
 		waiters:               make(map[string][]chan Beacon),
 		certBeacons:           make(map[string]Beacon),
@@ -542,9 +555,11 @@ func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
 			return seq, err
 		}
 		if err := n.storeObject(obj); err != nil {
+			n.finishProducerSeq(seq)
 			n.rollbackProducerSeq(seq)
 			return seq, err
 		}
+		n.finishProducerSeq(seq)
 		return seq, nil
 	}
 	n.mu.Unlock()
@@ -817,7 +832,14 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
 				return Beacon{}, err
 			}
-			msg, err := p2p.NewMessage(Protocol, "RECON", instance, n.ID, "", ReconMessage{Epoch: epoch, Source: source, Seq: seq, Share: sh})
+			n.mu.Lock()
+			includeObject := n.currentMissingRemoval
+			n.mu.Unlock()
+			recon := ReconMessage{Epoch: epoch, Source: source, Seq: seq, Share: sh}
+			if includeObject {
+				recon.Object = &obj
+			}
+			msg, err := p2p.NewMessage(Protocol, "RECON", instance, n.ID, "", recon)
 			if err != nil {
 				n.mu.Lock()
 				delete(n.reconSent, key)
@@ -993,7 +1015,8 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 	seq := n.State.Seqs[source] + 1
 	instance := aba.EpochInstance(epoch, source)
 	skipCurrentABA := n.State.RmMark[source] != -1 && seq == uint64(n.State.RmMark[source])
-	if !skipCurrentABA && n.State.PendingABAs[instance] == nil {
+	useLookaheadABA := n.State.QueueLen > 1
+	if useLookaheadABA && !skipCurrentABA && n.State.PendingABAs[instance] == nil {
 		n.State.PendingABAs[instance] = &PendingABA{Instance: instance, Epoch: epoch, Source: source, Seq: seq}
 	}
 	version := n.State.ConfigVersion
@@ -1015,9 +1038,10 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 	var expireTimer *time.Timer
 	n.mu.Lock()
 	currentMissingRemoval := n.currentMissingRemoval
+	explicitRemovalOnly := n.explicitRemovalOnly
 	producing := n.producing
 	n.mu.Unlock()
-	if currentMissingRemoval && (source != n.ID || !producing) {
+	if currentMissingRemoval && !explicitRemovalOnly && (source != n.ID || !producing) {
 		expireTimer = time.NewTimer(n.removalWait)
 		defer expireTimer.Stop()
 		expire = expireTimer.C
@@ -1060,9 +1084,20 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 
 func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64, instance string, wait <-chan Beacon) (*Beacon, error) {
 	next := seq + 1
+	n.mu.Lock()
+	queueLen := n.State.QueueLen
+	explicitRemovalOnly := n.explicitRemovalOnly
+	n.mu.Unlock()
+	if queueLen <= 1 {
+		return nil, nil
+	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	expire := time.NewTimer(n.removalWait)
+	lookaheadWait := n.lookaheadWait
+	if explicitRemovalOnly {
+		lookaheadWait = minDuration(lookaheadWait, 250*time.Millisecond)
+	}
+	expire := time.NewTimer(lookaheadWait)
 	defer expire.Stop()
 	for {
 		if b, ok := n.certifiedBeaconForEpoch(epoch); ok {
@@ -1084,11 +1119,22 @@ func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint
 			return &b, nil
 		case <-ticker.C:
 		case <-expire.C:
+			if explicitRemovalOnly {
+				n.dropPendingEpochABA(instance)
+				return nil, nil
+			}
 			return nil, n.proposeEpochABAInput(context.Background(), instance, false)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a <= 0 || a > b {
+		return b
+	}
+	return a
 }
 
 func (n *Node) proposeEpochABAInput(ctx context.Context, instance string, value bool) error {
@@ -1103,11 +1149,30 @@ func (n *Node) proposeEpochABAInput(ctx context.Context, instance string, value 
 	return n.ABA.Propose(ctx, instance, value)
 }
 
+func (n *Node) dropPendingEpochABA(instance string) {
+	n.mu.Lock()
+	delete(n.State.PendingABAs, instance)
+	delete(n.abaInputSent, instance)
+	delete(n.abaInputs, instance)
+	n.mu.Unlock()
+}
+
 func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	rebroadcast := time.NewTicker(100 * time.Millisecond)
 	defer rebroadcast.Stop()
+	n.mu.Lock()
+	explicitRemovalOnly := n.explicitRemovalOnly
+	readyWait := minDuration(n.lookaheadWait, 250*time.Millisecond)
+	n.mu.Unlock()
+	var expire <-chan time.Time
+	var expireTimer *time.Timer
+	if explicitRemovalOnly {
+		expireTimer = time.NewTimer(readyWait)
+		defer expireTimer.Stop()
+		expire = expireTimer.C
+	}
 	for {
 		st := n.ABA.Status(instance)
 		if st.Decided || st.CoinWait {
@@ -1126,6 +1191,9 @@ func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
 			if hasInput {
 				_ = n.ABA.Propose(context.Background(), instance, input)
 			}
+		case <-expire:
+			n.dropPendingEpochABA(instance)
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -1183,7 +1251,7 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 		if st.Decided {
 			p.Decided = true
 			p.Decision = st.Value
-			if !st.Value && n.State.RmMark[p.Source] == -1 {
+			if !st.Value && !n.explicitRemovalOnly && n.State.RmMark[p.Source] == -1 {
 				n.markRemovalLocked(p.Source, p.Seq)
 			}
 			delete(n.State.PendingABAs, inst)
@@ -1379,8 +1447,19 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessage) error {
 	obj, err := n.lookupEpochObject(body.Epoch, body.Source, body.Seq)
 	if err != nil {
-		debugf("node=%s ignore recon from=%s epoch=%d source=%s seq=%d reason=%v", n.ID, from, body.Epoch, body.Source, body.Seq, err)
-		return nil
+		if body.Object == nil || body.Object.Producer != body.Source || body.Object.Seq != body.Seq {
+			debugf("node=%s ignore recon from=%s epoch=%d source=%s seq=%d reason=%v", n.ID, from, body.Epoch, body.Source, body.Seq, err)
+			return nil
+		}
+		if storeErr := n.storeObject(*body.Object); storeErr != nil {
+			debugf("node=%s ignore recon from=%s epoch=%d source=%s seq=%d reason=store-object err=%v", n.ID, from, body.Epoch, body.Source, body.Seq, storeErr)
+			return nil
+		}
+		obj, err = n.lookupEpochObject(body.Epoch, body.Source, body.Seq)
+		if err != nil {
+			debugf("node=%s ignore recon from=%s epoch=%d source=%s seq=%d reason=%v", n.ID, from, body.Epoch, body.Source, body.Seq, err)
+			return nil
+		}
 	}
 	key := epochKey(body.Epoch, body.Source, body.Seq)
 	n.mu.Lock()
@@ -1801,7 +1880,7 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 		if st.Decided {
 			p.Decided = true
 			p.Decision = st.Value
-			if !st.Value && n.State.RmMark[p.Source] == -1 {
+			if !st.Value && !n.explicitRemovalOnly && n.State.RmMark[p.Source] == -1 {
 				n.markRemovalLocked(p.Source, p.Seq)
 			}
 			delete(n.State.PendingABAs, feed.instance)
@@ -2006,9 +2085,13 @@ func copyRemovalMarks(in map[p2p.NodeID]int64) map[p2p.NodeID]int64 {
 }
 
 func (n *Node) installRemovalPVSSLocked() {
-	if !contains(n.State.Members, n.ID) || len(n.State.Members) == 0 {
+	if len(n.State.Members) == 0 {
 		n.producing = false
 		return
+	}
+	isMember := contains(n.State.Members, n.ID)
+	if !isMember {
+		n.producing = false
 	}
 	epoch := fmt.Sprintf("Tyche-v1/removal-config/%d/%v", n.State.ConfigVersion, n.State.Members)
 	pp, keys, err := crypto.SetupPVSS(n.pvssBackend, epoch, n.State.F+1, n.State.Members)
@@ -2016,15 +2099,22 @@ func (n *Node) installRemovalPVSSLocked() {
 		return
 	}
 	key := keys[n.ID]
-	if key.Private == nil {
-		return
+	private := key.Private
+	if private == nil {
+		private = crypto.KeyPairFromSeed(crypto.HashBytes(
+			[]byte("Tyche-v1/observer-pvss"),
+			[]byte(n.ID),
+			[]byte(pp.Epoch()),
+		)).Private
 	}
-	scheme, err := crypto.NewPVSSScheme(n.ID, key.Private, pp)
+	scheme, err := crypto.NewPVSSScheme(n.ID, private, pp)
 	if err != nil {
 		return
 	}
 	n.PVSS = scheme
-	n.pvssKeys[pp.Epoch()] = key.Private.Clone()
+	if key.Private != nil {
+		n.pvssKeys[pp.Epoch()] = key.Private.Clone()
+	}
 }
 
 func (n *Node) resetConfigurationCachesLocked() {
@@ -2061,10 +2151,30 @@ func (n *Node) CompletedEpoch() uint64 {
 	return n.State.Epoch
 }
 
+func (n *Node) ApplyPendingBeaconCertificatesUntil(target uint64) uint64 {
+	for {
+		completed := n.CompletedEpoch()
+		if completed >= target {
+			return completed
+		}
+		n.applyPendingBeaconCert(completed + 1)
+		advanced := n.CompletedEpoch()
+		if advanced <= completed {
+			return advanced
+		}
+	}
+}
+
 func (n *Node) IsMember(id p2p.NodeID) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return contains(n.State.Members, id)
+}
+
+func (n *Node) MembershipSnapshot() ([]p2p.NodeID, int, uint64, uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]p2p.NodeID(nil), n.State.Members...), n.State.F, n.State.ConfigVersion, n.State.Epoch
 }
 
 func (n *Node) DebugSnapshot() DebugSnapshot {
@@ -2132,6 +2242,40 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 	return s
 }
 
+// ForceReconfigurationRemoval is a benchmark-only hook used by distributed
+// reconfiguration experiments. Once a stopped producer is selected again, every
+// live node marks the current source sequence as the removal epoch. This keeps
+// the TCP benchmark from waiting on stale or exhausted objects after an earlier
+// configuration change.
+func (n *Node) ForceReconfigurationRemoval(epoch uint64, source p2p.NodeID) (uint64, bool, error) {
+	n.mu.Lock()
+	if n.State.Epoch+1 != epoch || !contains(n.State.Members, source) {
+		n.mu.Unlock()
+		return 0, false, nil
+	}
+	if len(n.State.SCL) == 0 {
+		n.refillSCLLocked()
+	}
+	if len(n.State.SCL) == 0 {
+		n.mu.Unlock()
+		return 0, false, errors.New("empty source candidate list")
+	}
+	selected := n.State.SCL[beaconIndex(n.State.RPrev, len(n.State.SCL))]
+	seq := n.State.Seqs[selected] + 1
+	if selected != source || n.State.RmMark[source] != -1 {
+		n.mu.Unlock()
+		return seq, false, nil
+	}
+	instance := aba.EpochInstance(epoch, source)
+	n.State.RmMark[source] = int64(seq)
+	delete(n.State.PendingABAs, instance)
+	delete(n.abaInputSent, instance)
+	delete(n.abaInputs, instance)
+	n.mu.Unlock()
+	n.ABA.Prune(instance)
+	return seq, true, nil
+}
+
 func maxEchoCount(votes map[string]map[p2p.NodeID]bool) int {
 	max := 0
 	for _, bySender := range votes {
@@ -2157,7 +2301,7 @@ func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 	if p := n.State.PendingABAs[dec.Instance]; p != nil {
 		p.Decided = true
 		p.Decision = dec.Value
-		if !dec.Value && n.State.RmMark[p.Source] == -1 {
+		if !dec.Value && !n.explicitRemovalOnly && n.State.RmMark[p.Source] == -1 {
 			n.markRemovalLocked(p.Source, p.Seq)
 		}
 		delete(n.State.PendingABAs, dec.Instance)
@@ -2221,9 +2365,9 @@ func (n *Node) stateDigestLocked() CertifiedStateDigest {
 	for id, v := range n.State.Seqs {
 		seqs[id] = v
 	}
-	rm := make(map[p2p.NodeID]int64, len(n.State.RmMark))
-	for id, v := range n.State.RmMark {
-		rm[id] = v
+	rm := make(map[p2p.NodeID]int64, len(n.State.Members))
+	for _, id := range n.State.Members {
+		rm[id] = -1
 	}
 	return CertifiedStateDigest{
 		Members: append([]p2p.NodeID(nil), n.State.Members...),
@@ -2234,6 +2378,7 @@ func (n *Node) stateDigestLocked() CertifiedStateDigest {
 }
 
 func (n *Node) certifiedStateDigestForBeaconLocked(source p2p.NodeID, seq uint64) CertifiedStateDigest {
+	removalMark := n.State.RmMark[source]
 	d := n.stateDigestLocked()
 	window := n.exclusionWindowLocked()
 	if window > 0 && len(d.RSQ) >= window && len(d.RSQ) > 0 {
@@ -2250,7 +2395,7 @@ func (n *Node) certifiedStateDigestForBeaconLocked(source p2p.NodeID, seq uint64
 		}
 		d.Seqs[source] = seq
 	}
-	if d.RmMark[source] != -1 && seq == uint64(d.RmMark[source]) {
+	if removalMark != -1 && seq == uint64(removalMark) {
 		d.Members = removeID(d.Members, source)
 		d.SCL = removeID(d.SCL, source)
 		d.RSQ = removeID(d.RSQ, source)

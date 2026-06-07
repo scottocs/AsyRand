@@ -62,6 +62,7 @@ For CPU-heavy SCRAPE runs, also keep remote worker settings below the instance's
 AWS node lifecycle tasks use `settings.json` by default:
 
 ```powershell
+
 cd benchmark
 .\.venv\Scripts\fab create --nodes=1
 .\.venv\Scripts\fab info
@@ -87,6 +88,9 @@ $env:PREFILL_MS = "3000"
 $env:MAX_POOL = "2"
 $env:GOMAXPROCS_REMOTE = "2"
 $env:QUEUE_LEN = "2"
+
+# reconfig timeline
+python plot_reconfig_timeline.py runs/reconfig/aws_n16_e500/tyche-reconfig --epochs 500
 ```
 
 `create --nodes=1` means one EC2 instance per region listed in `settings.json`. It waits for the instances to reach `running` and pass AWS status checks. The AWS `KeyName` must already exist in every configured region, and `key.path` must point to its local private key.
