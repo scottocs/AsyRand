@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -94,18 +95,22 @@ func TestBeaconReconfigurationBenchmark200Epochs(t *testing.T) {
 	}
 	epochs := envInt("TYCHE_CHURN_EPOCHS", 200)
 	initialN := envInt("TYCHE_CHURN_INITIAL_N", 8)
+	totalN := envInt("TYCHE_CHURN_TOTAL_N", initialN+max(1, initialN/2))
+	if totalN < initialN {
+		totalN = initialN
+	}
 	initialF := envInt("TYCHE_CHURN_INITIAL_F", (initialN-1)/3)
-	reconfigTarget := envInt("TYCHE_CHURN_RECONFIG_EVENTS", max(1, epochs/20))
+	reconfigTarget := envInt("TYCHE_CHURN_RECONFIG_EVENTS", max(1, int(float64(epochs)/16.0+0.5)))
 	epochTimeout := time.Duration(envInt("TYCHE_CHURN_EPOCH_TIMEOUT_MS", 10000)) * time.Millisecond
 	prefill := time.Duration(envInt("TYCHE_CHURN_PREFILL_MS", 0)) * time.Millisecond
 	minN := envInt("TYCHE_CHURN_MIN_N", initialN-initialF)
-	maxN := envInt("TYCHE_CHURN_MAX_N", initialN+initialF)
+	maxN := envInt("TYCHE_CHURN_MAX_N", totalN)
 	if maxN < initialN {
 		maxN = initialN
 	}
 	seed := int64(envInt("TYCHE_CHURN_SEED", 20260521))
 
-	runChurnBenchmarkCase(t, "reconfig", epochs, reconfigTarget, epochTimeout, prefill, minN, maxN, seed, initialN, initialF)
+	runChurnBenchmarkCase(t, "reconfig", epochs, reconfigTarget, epochTimeout, prefill, minN, maxN, seed, initialN, totalN, initialF)
 }
 
 type churnCluster struct {
@@ -147,13 +152,13 @@ type churnBenchmarkResult struct {
 	reconfigurationOps int
 }
 
-func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarget int, epochTimeout time.Duration, prefill time.Duration, minN int, maxN int, seed int64, initialN int, initialF int) churnBenchmarkResult {
+func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarget int, epochTimeout time.Duration, prefill time.Duration, minN int, maxN int, seed int64, initialN int, totalN int, initialF int) churnBenchmarkResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(epochs)*2*time.Second+prefill)
 	defer cancel()
 	cluster := newChurnCluster(t, ctx, initialN, initialF)
 	rng := rand.New(rand.NewSource(seed))
-	nextJoin := initialN
+	schedule := buildChurnReconfigSchedule(rng, initialN, totalN, epochs, reconfigTarget, minN, maxN)
 	before := aggregateMetrics(cluster.transports())
 	beforeTypes := aggregateMessageTypeMetrics(cluster.transports())
 	start := time.Now()
@@ -161,10 +166,14 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 		time.Sleep(prefill)
 	}
 	reconfigs := 0
+	localStops := 0
 	for epoch := 1; epoch <= epochs; epoch++ {
-		if shouldRunReconfiguration(rng, epoch, epochs, reconfigs, reconfigTarget) {
-			if cluster.randomChurn(t, ctx, rng, uint64(epoch), minN, maxN, &nextJoin) {
+		if event, ok := schedule[epoch]; ok {
+			if cluster.applyScheduledReconfiguration(t, ctx, event, uint64(epoch), minN, maxN) {
 				reconfigs++
+				if event.action == "stop" {
+					localStops++
+				}
 				cluster.assertMembershipBounds(t, minN, maxN)
 			}
 		}
@@ -197,6 +206,20 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 		finalF:             cluster.currentF(t),
 		reconfigurationOps: reconfigs,
 	}
+	finalMembers := cluster.members()
+	t.Logf("reconfig_final scheduled_events=%d local_stop_events=%d membership_changes=%d removed=%d completed_epochs=%d final_n=%d final_f=%d config_version=%d min_n=%d seed=%d members=%v",
+		len(schedule),
+		localStops,
+		cluster.currentConfigVersion(t),
+		initialRemovedCount(finalMembers, initialN),
+		epochs,
+		len(finalMembers),
+		cluster.currentF(t),
+		cluster.currentConfigVersion(t),
+		minN,
+		seed,
+		finalMembers,
+	)
 	t.Logf("bench_result label=%s epochs=%d elapsed=%s throughput=%.4f/s bandwidth=%.2fKB/s sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB final_n=%d final_f=%d reconfig_ops=%d",
 		result.label,
 		epochs,
@@ -339,6 +362,232 @@ func shouldRunReconfiguration(rng *rand.Rand, epoch int, epochs int, completed i
 		return true
 	}
 	return rng.Float64() < float64(remainingEvents)/float64(remainingEpochs)
+}
+
+type scheduledChurnReconfiguration struct {
+	action string
+	node   p2p.NodeID
+	race   string
+}
+
+func buildChurnReconfigSchedule(rng *rand.Rand, initialN int, totalN int, epochs int, target int, minN int, maxN int) map[int]scheduledChurnReconfiguration {
+	schedule := make(map[int]scheduledChurnReconfiguration)
+	if target <= 0 || epochs <= 0 {
+		return schedule
+	}
+	if target > epochs {
+		target = epochs
+	}
+	planningEpochs := epochs - churnJoinDelay()
+	if planningEpochs < 1 {
+		planningEpochs = epochs
+	}
+	latestStopEpoch := epochs - 2*churnRemovalDelay(initialN)
+	if latestStopEpoch < churnInitialQuietEpoch() {
+		latestStopEpoch = churnInitialQuietEpoch()
+	}
+	members := make(map[p2p.NodeID]bool, initialN)
+	initialIDs := make([]p2p.NodeID, 0, initialN)
+	for i := 0; i < initialN; i++ {
+		id := p2p.NodeID(fmt.Sprintf("node%d", i))
+		members[id] = true
+		initialIDs = append(initialIDs, id)
+	}
+	standby := make([]p2p.NodeID, 0, max(0, totalN-initialN))
+	for i := initialN; i < totalN; i++ {
+		standby = append(standby, p2p.NodeID(fmt.Sprintf("node%d", i)))
+	}
+	rng.Shuffle(len(standby), func(i, j int) { standby[i], standby[j] = standby[j], standby[i] })
+
+	stopQuota := target / 2
+	joinQuota := target - stopQuota
+	nextEpoch := churnInitialQuietEpoch()
+	if target >= 4 && len(standby) > 0 && stopQuota > 0 && joinQuota > 1 {
+		joiner := popChurnNode(&standby)
+		joinEpoch := findOpenChurnEpoch(schedule, nextEpoch, planningEpochs)
+		schedule[joinEpoch] = scheduledChurnReconfiguration{action: "join", node: joiner, race: "proposal_before_remove"}
+		joinQuota--
+
+		stopEpoch := findOpenChurnEpoch(schedule, joinEpoch+max(2, churnJoinDelay()/2), planningEpochs)
+		victim := randomChurnMember(rng, initialIDs, members)
+		if victim != "" {
+			delete(members, victim)
+			schedule[stopEpoch] = scheduledChurnReconfiguration{action: "stop", node: victim, race: "remove_before_join_activation"}
+			stopQuota--
+			followEpoch := findOpenChurnEpoch(schedule, stopEpoch+churnRemovalDelay(initialN), planningEpochs)
+			members[joiner] = true
+			schedule[followEpoch] = scheduledChurnReconfiguration{action: "join", node: joiner, race: "join_after_remove"}
+			joinQuota--
+			nextEpoch = followEpoch + churnQuietEpochs()
+		}
+	}
+
+	for len(schedule) < target && nextEpoch <= planningEpochs {
+		remainingSlots := max(1, planningEpochs-nextEpoch+1)
+		remainingEvents := target - len(schedule)
+		stride := max(1, remainingSlots/remainingEvents)
+		epoch := findOpenChurnEpoch(schedule, nextEpoch+rng.Intn(stride), planningEpochs)
+		canStop := stopQuota > 0 && epoch <= latestStopEpoch && len(members) > minN
+		canJoin := joinQuota > 0 && len(members) < maxN && len(standby) > 0
+		if !canStop && !canJoin {
+			break
+		}
+		action := "stop"
+		if canStop && canJoin {
+			if rng.Intn(stopQuota+joinQuota) >= stopQuota {
+				action = "join"
+			}
+		} else if canJoin {
+			action = "join"
+		}
+		switch action {
+		case "stop":
+			victim := randomChurnMember(rng, initialIDs, members)
+			if victim == "" {
+				nextEpoch = epoch + 1
+				continue
+			}
+			delete(members, victim)
+			schedule[epoch] = scheduledChurnReconfiguration{action: "stop", node: victim}
+			stopQuota--
+			nextEpoch = epoch + churnRemovalDelay(initialN)
+		case "join":
+			joiner := popChurnNode(&standby)
+			if joiner == "" {
+				nextEpoch = epoch + 1
+				continue
+			}
+			members[joiner] = true
+			schedule[epoch] = scheduledChurnReconfiguration{action: "join", node: joiner}
+			joinQuota--
+			nextEpoch = epoch + churnJoinDelay() + churnQuietEpochs()
+		}
+	}
+	backfillAttempts := 0
+	for len(schedule) < target && backfillAttempts < target*4 {
+		if nextEpoch > planningEpochs {
+			break
+		}
+		backfillAttempts++
+		span := max(1, planningEpochs-churnInitialQuietEpoch()+1)
+		bucket := max(1, span/target)
+		epoch := churnInitialQuietEpoch() + (len(schedule)*span)/target + rng.Intn(bucket)
+		if epoch < nextEpoch {
+			epoch = nextEpoch
+		}
+		var ok bool
+		epoch, ok = findOpenChurnEpochAtOrAfter(schedule, epoch, planningEpochs)
+		if !ok {
+			break
+		}
+		canStop := stopQuota > 0 && epoch <= latestStopEpoch && len(members) > minN
+		canJoin := joinQuota > 0 && len(members) < maxN && len(standby) > 0
+		if !canStop && !canJoin {
+			break
+		}
+		action := "stop"
+		if canStop && canJoin {
+			if rng.Intn(stopQuota+joinQuota) >= stopQuota {
+				action = "join"
+			}
+		} else if canJoin {
+			action = "join"
+		}
+		switch action {
+		case "stop":
+			victim := randomChurnMember(rng, initialIDs, members)
+			if victim == "" {
+				continue
+			}
+			delete(members, victim)
+			schedule[epoch] = scheduledChurnReconfiguration{action: "stop", node: victim}
+			stopQuota--
+			nextEpoch = epoch + churnRemovalDelay(initialN)
+		case "join":
+			joiner := popChurnNode(&standby)
+			if joiner == "" {
+				continue
+			}
+			members[joiner] = true
+			schedule[epoch] = scheduledChurnReconfiguration{action: "join", node: joiner}
+			joinQuota--
+			nextEpoch = epoch + churnJoinDelay() + churnQuietEpochs()
+		}
+	}
+	return schedule
+}
+
+func popChurnNode(ids *[]p2p.NodeID) p2p.NodeID {
+	if len(*ids) == 0 {
+		return ""
+	}
+	id := (*ids)[0]
+	*ids = (*ids)[1:]
+	return id
+}
+
+func randomChurnMember(rng *rand.Rand, ordered []p2p.NodeID, members map[p2p.NodeID]bool) p2p.NodeID {
+	var candidates []p2p.NodeID
+	for _, id := range ordered {
+		if members[id] {
+			candidates = append(candidates, id)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[rng.Intn(len(candidates))]
+}
+
+func findOpenChurnEpoch(schedule map[int]scheduledChurnReconfiguration, epoch int, maxEpoch int) int {
+	if epoch < 1 {
+		epoch = 1
+	}
+	if epoch > maxEpoch {
+		epoch = maxEpoch
+	}
+	for candidate := epoch; candidate <= maxEpoch; candidate++ {
+		if _, ok := schedule[candidate]; !ok {
+			return candidate
+		}
+	}
+	for candidate := epoch - 1; candidate >= 1; candidate-- {
+		if _, ok := schedule[candidate]; !ok {
+			return candidate
+		}
+	}
+	return epoch
+}
+
+func findOpenChurnEpochAtOrAfter(schedule map[int]scheduledChurnReconfiguration, epoch int, maxEpoch int) (int, bool) {
+	if epoch < 1 {
+		epoch = 1
+	}
+	if epoch > maxEpoch {
+		epoch = maxEpoch
+	}
+	for candidate := epoch; candidate <= maxEpoch; candidate++ {
+		if _, ok := schedule[candidate]; !ok {
+			return candidate, true
+		}
+	}
+	return 0, false
+}
+
+func churnJoinDelay() int {
+	return 10
+}
+
+func churnRemovalDelay(initialN int) int {
+	return max(6, initialN+4)
+}
+
+func churnQuietEpochs() int {
+	return 4
+}
+
+func churnInitialQuietEpoch() int {
+	return 12
 }
 
 func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnCluster {
@@ -511,6 +760,55 @@ func (c *churnCluster) randomChurn(t *testing.T, parent context.Context, rng *ra
 	return true
 }
 
+func (c *churnCluster) applyScheduledReconfiguration(t *testing.T, parent context.Context, event scheduledChurnReconfiguration, epoch uint64, minN int, maxN int) bool {
+	t.Helper()
+	switch event.action {
+	case "stop":
+		if len(c.stoppedActiveIDs()) > 0 || len(c.members()) <= minN {
+			t.Logf("epoch=%d event=stop_deferred node=%s reason=pending_or_min_n stopped=%v active=%v members=%v race=%s", epoch, event.node, c.stoppedActiveIDs(), c.activeIDs(), c.members(), event.race)
+			return false
+		}
+		victim := event.node
+		if event.race == "remove_before_join_activation" {
+			source, _ := nextSourceSeq(c.reference(t))
+			if source != "" {
+				victim = source
+			}
+		}
+		if !c.active[victim] || c.stopped[victim] {
+			t.Logf("epoch=%d event=stop_deferred node=%s race=%s active=%v members=%v", epoch, victim, event.race, c.activeIDs(), c.members())
+			return false
+		}
+		beforeMembers := c.members()
+		beforeF := c.currentF(t)
+		t.Logf("epoch=%d event=stop_produce node=%s n_before=%d f_before=%d active_before=%v members_before=%v race=%s", epoch, victim, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers, event.race)
+		c.stopProducer(victim)
+		afterMembers := c.members()
+		t.Logf("epoch=%d event=stopped_produce node=%s n_after=%d f_after=%d stopped=%v active_after=%v members_after=%v race=%s", epoch, victim, len(afterMembers), c.currentF(t), c.stoppedActiveIDs(), c.activeIDs(), afterMembers, event.race)
+		return true
+	case "join":
+		if len(c.stoppedActiveIDs()) > 0 || len(c.pendingJoins) > 0 || len(c.members()) >= maxN {
+			t.Logf("epoch=%d event=join_deferred node=%s reason=pending_or_max_n stopped=%v pending_joins=%d active=%v members=%v race=%s", epoch, event.node, c.stoppedActiveIDs(), len(c.pendingJoins), c.activeIDs(), c.members(), event.race)
+			return false
+		}
+		if contains(c.members(), event.node) {
+			t.Logf("epoch=%d event=join_stale node=%s reason=already_member active=%v members=%v race=%s", epoch, event.node, c.activeIDs(), c.members(), event.race)
+			return false
+		}
+		beforeMembers := c.members()
+		beforeF := c.currentF(t)
+		t.Logf("epoch=%d event=joining_proposal node=%s n_before=%d f_before=%d active_before=%v members_before=%v race=%s", epoch, event.node, len(beforeMembers), beforeF, c.activeIDs(), beforeMembers, event.race)
+		joined := c.join(t, parent, event.node)
+		afterMembers := c.members()
+		if !joined {
+			t.Logf("epoch=%d event=join_stale node=%s n_after=%d f_after=%d active_after=%v members_after=%v race=%s", epoch, event.node, len(afterMembers), c.currentF(t), c.activeIDs(), afterMembers, event.race)
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *churnCluster) stopProducer(id p2p.NodeID) {
 	if c.active[id] {
 		c.stopped[id] = true
@@ -585,6 +883,27 @@ func sameNodeIDs(a []p2p.NodeID, b []p2p.NodeID) bool {
 		}
 	}
 	return true
+}
+
+func initialRemovedCount(members []p2p.NodeID, initialN int) int {
+	present := make(map[int]bool, len(members))
+	for _, id := range members {
+		raw := strings.TrimPrefix(string(id), "node")
+		if raw == string(id) {
+			continue
+		}
+		index, err := strconv.Atoi(raw)
+		if err == nil {
+			present[index] = true
+		}
+	}
+	removed := 0
+	for i := 0; i < initialN; i++ {
+		if !present[i] {
+			removed++
+		}
+	}
+	return removed
 }
 
 func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.NodeID) bool {

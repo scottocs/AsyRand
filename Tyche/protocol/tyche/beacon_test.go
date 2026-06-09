@@ -460,6 +460,8 @@ func TestJoinCertificateActivatesMember(t *testing.T) {
 	}
 	for _, n := range nodes {
 		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
+	}
+	for _, n := range nodes {
 		if err := n.InstallJoinCertificate(cert); err != nil {
 			t.Fatal(err)
 		}
@@ -528,6 +530,8 @@ func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
 	}
 	for _, n := range nodes {
 		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
+	}
+	for _, n := range nodes {
 		if err := n.InstallJoinCertificate(cert); err != nil {
 			t.Fatal(err)
 		}
@@ -627,6 +631,8 @@ func TestJoinCertificateStaleWhenRemovalHasPriority(t *testing.T) {
 
 	for _, n := range nodes {
 		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
+	}
+	for _, n := range nodes {
 		n.mu.Lock()
 		n.State.RmMark["n0"] = 3
 		n.mu.Unlock()

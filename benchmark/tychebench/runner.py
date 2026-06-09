@@ -25,6 +25,7 @@ from .errors import BenchError
 @dataclass(frozen=True)
 class LocalOptions:
     n: int
+    reconfig_total_nodes: int
     epochs: int
     protocols: list[str]
     out_root: Path
@@ -54,6 +55,8 @@ class AwsHost:
 @dataclass(frozen=True)
 class AwsOptions:
     n: int
+    host_count: int
+    reconfig_total_nodes: int
     epochs: int
     protocols: list[str]
     out_root: Path
@@ -186,18 +189,22 @@ def _rows_protocols(rows):
 def _merge_run_config(final, staging, protocols):
     final_config_path = final / "run_config.json"
     staging_config_path = staging / "run_config.json"
-    config = {}
+    final_config = {}
+    staging_config = {}
     if final_config_path.exists():
         try:
-            config = json.loads(final_config_path.read_text(encoding="utf-8"))
+            final_config = json.loads(final_config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            config = {}
-    if not config and staging_config_path.exists():
+            final_config = {}
+    if staging_config_path.exists():
         try:
-            config = json.loads(staging_config_path.read_text(encoding="utf-8"))
+            staging_config = json.loads(staging_config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            config = {}
-    existing = config.get("protocols") if isinstance(config.get("protocols"), list) else []
+            staging_config = {}
+    config = staging_config or final_config
+    existing = final_config.get("protocols") if isinstance(final_config.get("protocols"), list) else []
+    if not existing:
+        existing = config.get("protocols") if isinstance(config.get("protocols"), list) else []
     config["protocols"] = existing + [protocol for protocol in protocols if protocol not in existing]
     if config:
         _write_run_config(final, config)
@@ -487,8 +494,30 @@ def _default_protocol_success_threshold(protocol, nodes):
     return nodes - fault_threshold
 
 
+def _is_reconfig_protocol(protocol):
+    return protocol in {"tyche-reconfig", "tyche-scrape-reconfig"}
+
+
+def _default_reconfig_spare_nodes(nodes):
+    return max(1, nodes // 2)
+
+
+def _reconfig_total_nodes_for(nodes):
+    raw_total = os.environ.get("TYCHE_RECONFIG_TOTAL_N")
+    if raw_total:
+        return max(nodes, int(raw_total))
+    spare_nodes = int(os.environ.get("TYCHE_RECONFIG_SPARE_NODES", str(_default_reconfig_spare_nodes(nodes))))
+    return nodes + max(0, spare_nodes)
+
+
+def _protocol_node_count(protocol, options):
+    if _is_reconfig_protocol(protocol):
+        return options.reconfig_total_nodes
+    return options.n
+
+
 def _aws_protocol_node_indices(protocol, options):
-    return list(range(options.n))
+    return list(range(_protocol_node_count(protocol, options)))
 
 
 def _tyche_queue_len_for_protocol(protocol, options):
@@ -498,7 +527,7 @@ def _tyche_queue_len_for_protocol(protocol, options):
 
 
 def _default_reconfig_events(epochs):
-    return max(1, epochs // 50)
+    return max(1, round(epochs / 16))
 
 
 def _reconfig_events_value(options):
@@ -518,11 +547,20 @@ def _reconfig_min_n_value(options):
 
 
 def _reconfig_max_n_value(options):
-    return os.environ.get("TYCHE_RECONFIG_MAX_N", str(options.n + options.fault_threshold))
+    default = getattr(options, "reconfig_total_nodes", options.n + options.fault_threshold)
+    return os.environ.get("TYCHE_RECONFIG_MAX_N", str(default))
+
+
+_DEFAULT_RECONFIG_SEED = None
 
 
 def _reconfig_seed_value():
-    return os.environ.get("TYCHE_RECONFIG_SEED", "20260521")
+    global _DEFAULT_RECONFIG_SEED
+    if os.environ.get("TYCHE_RECONFIG_SEED"):
+        return os.environ["TYCHE_RECONFIG_SEED"]
+    if _DEFAULT_RECONFIG_SEED is None:
+        _DEFAULT_RECONFIG_SEED = str(int(time.time()))
+    return _DEFAULT_RECONFIG_SEED
 
 
 def _reconfig_crash_grace_ms_value():
@@ -632,6 +670,7 @@ def _run_protocol(protocol, options):
                 "TYCHE_CHURN_PVSS": "scrape" if protocol == "tyche-scrape-reconfig" else "o1",
                 "TYCHE_CHURN_EPOCHS": str(options.epochs),
                 "TYCHE_CHURN_INITIAL_N": str(options.n),
+                "TYCHE_CHURN_TOTAL_N": str(options.reconfig_total_nodes),
                 "TYCHE_CHURN_INITIAL_F": str(options.fault_threshold),
                 "TYCHE_CHURN_RECONFIG_EVENTS": _reconfig_events_value(options),
                 "TYCHE_CHURN_QUEUE_LEN": _local_reconfig_queue_len_value(options),
@@ -805,9 +844,11 @@ def _parse_results(options, elapsed_by_protocol):
 
 def _local_run_config(n, epochs, protocol_list, fault_threshold):
     bft_f = (n - 1) // 3 if fault_threshold is None else fault_threshold
+    reconfig_total_nodes = _reconfig_total_nodes_for(n)
     return {
         "kind": "local",
         "nodes": n,
+        "tyche_reconfig_total_n": reconfig_total_nodes,
         "epochs": epochs,
         "protocols": protocol_list,
         "fault_threshold": bft_f,
@@ -824,8 +865,8 @@ def _local_run_config(n, epochs, protocol_list, fault_threshold):
         "gomaxprocs": int(os.environ.get("GOMAXPROCS_LOCAL", "8")),
         "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", str(_default_reconfig_events(epochs))),
         "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", str(n - bft_f)),
-        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(n + bft_f)),
-        "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(reconfig_total_nodes)),
+        "tyche_reconfig_seed": _reconfig_seed_value(),
         "tyche_reconfig_queue_len": os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "8"),
         "tyche_reconfig_crash_grace_ms": _reconfig_crash_grace_ms_value(),
         "tyche_lookahead_expiration_ms": _lookahead_expiration_ms_value(),
@@ -853,6 +894,7 @@ def run_local(n, epochs, protocols, out_root=None, fault_threshold=None):
         final_output, output = _prepare_default_run_dir(config)
     options = LocalOptions(
         n=n,
+        reconfig_total_nodes=config["tyche_reconfig_total_n"],
         epochs=epochs,
         protocols=protocol_list,
         out_root=Path(output).resolve(),
@@ -903,12 +945,12 @@ def _discover_aws_hosts(options, settings):
     total_candidates = sum(len(items) for items in candidates_by_region.values())
     counts = ", ".join(f"{region}={len(candidates_by_region.get(region, []))}" for region in settings.regions)
     print(f"[{time.strftime('%H:%M:%S')}] found {total_candidates} running AWS host candidate(s): {counts}")
-    if total_candidates < options.n:
+    if total_candidates < options.host_count:
         raise BenchError(
-            f"not enough running AWS hosts: found={total_candidates} need={options.n}. "
+            f"not enough running AWS hosts: found={total_candidates} need={options.host_count}. "
             "Run `fab create --nodes=...` or `fab start` first."
         )
-    targets = _region_host_targets(options.n, settings.regions)
+    targets = _region_host_targets(options.host_count, settings.regions)
     target_counts = ", ".join(f"{region}={targets[region]}" for region in settings.regions if targets[region] > 0)
     print(f"[{time.strftime('%H:%M:%S')}] target AWS host distribution: {target_counts}")
     for region, target in targets.items():
@@ -980,7 +1022,7 @@ def _discover_aws_hosts(options, settings):
             hosts.append(host)
             print(
                 f"[{time.strftime('%H:%M:%S')}] selected AWS host "
-                f"{len(hosts)}/{options.n}: {region} {ip}"
+                f"{len(hosts)}/{options.host_count}: {region} {ip}"
             )
     return hosts
 
@@ -1004,6 +1046,10 @@ def _connect(host, options):
     conn.open()
     transport = getattr(conn, "transport", None)
     if transport is not None:
+        io_timeout = int(os.environ.get("AWS_SSH_IO_TIMEOUT_SEC", "0"))
+        sock = getattr(transport, "sock", None)
+        if io_timeout > 0 and sock is not None:
+            sock.settimeout(io_timeout)
         keepalive = int(os.environ.get("AWS_SSH_KEEPALIVE_SEC", "10"))
         if keepalive > 0:
             transport.set_keepalive(keepalive)
@@ -1166,6 +1212,14 @@ def _write_aws_configs(options, hosts):
         peer_items.append(f"node{node}={host.ip}:{options.base_port + node}")
     peers_file.write_text(",".join(peer_items), encoding="utf-8")
 
+    if any(_is_reconfig_protocol(protocol) for protocol in options.protocols):
+        reconfig_peers_file = options.generated_dir / "tyche_reconfig_peers.txt"
+        reconfig_peer_items = []
+        for node in range(options.reconfig_total_nodes):
+            host = hosts[node]
+            reconfig_peer_items.append(f"node{node}={host.ip}:{options.base_port + node}")
+        reconfig_peers_file.write_text(",".join(reconfig_peer_items), encoding="utf-8")
+
     for protocol in options.protocols:
         if protocol in {"tyche", "tyche-scrape", "tyche-reconfig", "tyche-scrape-reconfig"}:
             continue
@@ -1196,7 +1250,8 @@ def _remote_command_for_node(protocol, node, options):
     port = options.base_port + node
     log_file = f"runlogs/{protocol}/node{node}.log"
     if protocol in {"tyche", "tyche-scrape", "tyche-reconfig", "tyche-scrape-reconfig"}:
-        peers = (options.generated_dir / "tyche_peers.txt").read_text(encoding="utf-8")
+        peers_name = "tyche_reconfig_peers.txt" if _is_reconfig_protocol(protocol) else "tyche_peers.txt"
+        peers = (options.generated_dir / peers_name).read_text(encoding="utf-8")
         tyche_env = f"GOMAXPROCS={options.gomaxprocs}"
         if os.environ.get("TYCHE_EPOCH_ATTEMPT_MS"):
             tyche_env += f" TYCHE_EPOCH_ATTEMPT_MS={_remote_quote(os.environ['TYCHE_EPOCH_ATTEMPT_MS'])}"
@@ -1216,6 +1271,7 @@ def _remote_command_for_node(protocol, node, options):
             reconfig_seed = _reconfig_seed_value()
             reconfig_crash_grace_ms = _reconfig_crash_grace_ms_value()
             reconfig_arg = (
+                f" -initial-n {options.n}"
                 f" -reconfig-events {_remote_quote(reconfig_events)}"
                 f" -reconfig-min-n {_remote_quote(reconfig_min_n)}"
                 f" -reconfig-max-n {_remote_quote(reconfig_max_n)}"
@@ -1223,6 +1279,7 @@ def _remote_command_for_node(protocol, node, options):
                 f" -reconfig-crash-grace-ms {_remote_quote(reconfig_crash_grace_ms)}"
             )
             linger_arg = f" -linger-ms {options.reconfig_linger_ms}"
+        protocol_n = _protocol_node_count(protocol, options)
         queue_len = _tyche_queue_len_for_protocol(protocol, options)
         removal_expiration_ms = options.removal_expiration_ms
         if protocol in {"tyche-reconfig", "tyche-scrape-reconfig"}:
@@ -1232,7 +1289,7 @@ def _remote_command_for_node(protocol, node, options):
             "export PATH=/usr/local/go/bin:$PATH && "
             f"export {tyche_env} && "
             f"/usr/bin/time -v ./bin/tyche -transport tcp -node node{node} "
-            f"-n {options.n} -f {options.fault_threshold} -epochs {options.epochs} "
+            f"-n {protocol_n} -f {options.fault_threshold} -epochs {options.epochs} "
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
             f"-queue-len {queue_len} -max-pool {options.max_pool} "
             f"-transport-buffer {options.transport_buffer} "
@@ -1599,7 +1656,10 @@ def _parse_aws_results(options, hosts, protocol_failures=None, preserve_protocol
             continue
         protocol_rows = []
         protocol_parse_errors = []
-        nodes_to_parse = sorted(completed_nodes.get(protocol, _aws_protocol_node_indices(protocol, options)))
+        nodes_to_parse = set(completed_nodes.get(protocol, _aws_protocol_node_indices(protocol, options)))
+        if _is_reconfig_protocol(protocol):
+            nodes_to_parse.update(_aws_nodes_with_final_metrics(options, protocol))
+        nodes_to_parse = sorted(nodes_to_parse)
         for node in nodes_to_parse:
             try:
                 row = _aws_result_row(options, hosts, protocol, node)
@@ -1628,11 +1688,30 @@ def _parse_aws_results(options, hosts, protocol_failures=None, preserve_protocol
     return results_path
 
 
+def _aws_nodes_with_final_metrics(options, protocol):
+    nodes = set()
+    protocol_dir = options.out_root / protocol
+    if not protocol_dir.exists():
+        return nodes
+    for log_file in protocol_dir.glob("node*.log"):
+        match = re.fullmatch(r"node(\d+)\.log", log_file.name)
+        if not match:
+            continue
+        try:
+            text = log_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "\nfinal metrics " in "\n" + text or "\nreconfig_final " in "\n" + text:
+            nodes.add(int(match.group(1)))
+    return nodes
+
+
 def _write_aws_state(options, hosts):
     state = options.out_root / "aws_state.env"
     lines = [
-        f"M={options.n}",
+        f"M={options.host_count}",
         f"N={options.n}",
+        f"RECONFIG_TOTAL_N={options.reconfig_total_nodes}",
         f"EPOCHS={options.epochs}",
         f"BFT_F={options.fault_threshold}",
         f"GRANDLINE_F={options.grandline_fault_threshold}",
@@ -1652,7 +1731,7 @@ def _write_aws_state(options, hosts):
 def _hosts_from_state(path, options):
     state = _read_env_file(path)
     hosts = []
-    for index in range(options.n):
+    for index in range(options.host_count):
         region = state.get(f"SERVER_{index}_REGION")
         ip = state.get(f"SERVER_{index}_IP")
         user = state.get(f"SERVER_{index}_USER")
@@ -1681,11 +1760,23 @@ def _parallel(label, items, fn, max_workers=None):
         raise BenchError(f"{label} failed for {item}: {exc}") from exc
 
 
+def _aws_upload_workers(host_count):
+    configured = int(os.environ.get("AWS_UPLOAD_WORKERS", "8"))
+    return max(1, min(host_count, configured))
+
+
 def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
     bft_f = int(os.environ.get("F", str((nodes - 1) // 3)))
+    reconfig_total_nodes = _reconfig_total_nodes_for(nodes)
+    host_count = max(
+        reconfig_total_nodes if any(_is_reconfig_protocol(protocol) for protocol in protocol_list) else nodes,
+        nodes,
+    )
     return {
         "kind": "aws",
         "nodes": nodes,
+        "host_count": host_count,
+        "tyche_reconfig_total_n": reconfig_total_nodes,
         "epochs": epochs,
         "protocols": protocol_list,
         "fault_threshold": bft_f,
@@ -1716,8 +1807,8 @@ def _aws_run_config(nodes, epochs, protocol_list, epoch_timeout_ms):
         "tyche_debug": os.environ.get("TYCHE_DEBUG", ""),
         "tyche_reconfig_events": os.environ.get("TYCHE_RECONFIG_EVENTS", str(_default_reconfig_events(epochs))),
         "tyche_reconfig_min_n": os.environ.get("TYCHE_RECONFIG_MIN_N", str(nodes - bft_f)),
-        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(nodes + bft_f)),
-        "tyche_reconfig_seed": os.environ.get("TYCHE_RECONFIG_SEED", "20260521"),
+        "tyche_reconfig_max_n": os.environ.get("TYCHE_RECONFIG_MAX_N", str(reconfig_total_nodes)),
+        "tyche_reconfig_seed": _reconfig_seed_value(),
         "tyche_reconfig_queue_len": os.environ.get("TYCHE_RECONFIG_QUEUE_LEN", "8"),
         "tyche_reconfig_crash_grace_ms": _reconfig_crash_grace_ms_value(),
         "tyche_lookahead_expiration_ms": _lookahead_expiration_ms_value(),
@@ -1992,6 +2083,8 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
         final_output, output = _prepare_default_run_dir(config, resume=resume_run is not None)
     options = AwsOptions(
         n=nodes,
+        host_count=config["host_count"],
+        reconfig_total_nodes=config["tyche_reconfig_total_n"],
         epochs=epochs,
         protocols=protocol_list,
         out_root=Path(output).resolve(),
@@ -2053,7 +2146,7 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
     print(f"[{time.strftime('%H:%M:%S')}] installing remote tools on {len(hosts)} AWS hosts")
     _parallel("install remote tools", hosts, lambda host: _install_remote_tools(host, options))
     print(f"[{time.strftime('%H:%M:%S')}] uploading binaries and configs to {len(hosts)} AWS hosts")
-    _parallel("upload benchmark payload", hosts, lambda host: _upload_payload_to_host(host, options), max_workers=len(hosts))
+    _parallel("upload benchmark payload", hosts, lambda host: _upload_payload_to_host(host, options), max_workers=_aws_upload_workers(len(hosts)))
 
     protocol_failures = {}
     completed_nodes = {}
@@ -2068,6 +2161,7 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
             _parallel("stop remote processes", hosts, lambda host: _stop_remote_processes(host, options))
             run_error = None
             success_threshold = _protocol_success_threshold(protocol, options)
+            allow_quorum_stop = not _is_reconfig_protocol(protocol)
             successful_hosts = set()
             failed_hosts = {}
             protocol_hosts = [hosts[node] for node in _aws_protocol_node_indices(protocol, options)]
@@ -2106,7 +2200,7 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
                                 f"{len(successful_hosts)}/{len(future_hosts)} successful, "
                                 f"{len(failed_hosts)} failed, {len(pending)} pending"
                             )
-                            if len(successful_hosts) >= success_threshold:
+                            if allow_quorum_stop and len(successful_hosts) >= success_threshold:
                                 if pending:
                                     stragglers = [future_hosts[future] for future in pending]
                                     print(
@@ -2131,7 +2225,7 @@ def run_aws(nodes, epochs, protocols, out_root=None, key_path=None, remote_dir="
                             successful_hosts.add(host.index)
                         except Exception as exc:
                             failed_hosts[host.index] = exc
-                    if len(successful_hosts) >= success_threshold:
+                    if allow_quorum_stop and len(successful_hosts) >= success_threshold:
                         if pending:
                             stragglers = [future_hosts[future] for future in pending]
                             print(

@@ -51,6 +51,7 @@ const transportBuffer = 262144
 
 func main() {
 	n := flag.Int("n", 8, "number of local memory nodes")
+	initialN := flag.Int("initial-n", 0, "initial Tyche membership size when -n includes standby reconfiguration nodes")
 	epochs := flag.Int("epochs", 1000, "number of beacon epochs")
 	f := flag.Int("f", -1, "Byzantine fault threshold; defaults to (n-1)/3")
 	transport := flag.String("transport", "memory", "transport type: memory or tcp")
@@ -76,7 +77,7 @@ func main() {
 	flag.Parse()
 
 	opts := runOptions{
-		n: *n, epochs: *epochs, f: *f, transport: strings.ToLower(*transport),
+		n: *n, initialN: *initialN, epochs: *epochs, f: *f, transport: strings.ToLower(*transport),
 		nodeID: p2p.NodeID(*nodeID), peersRaw: *peersRaw, listenAddr: *listenAddr, listenIP: *listenIP,
 		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
 		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS, lingerMS: *lingerMS, maxPool: *maxPool,
@@ -92,6 +93,7 @@ func main() {
 
 type runOptions struct {
 	n                    int
+	initialN             int
 	epochs               int
 	f                    int
 	transport            string
@@ -126,14 +128,20 @@ func run(opts runOptions) error {
 	if opts.n <= 0 {
 		return fmt.Errorf("-n must be positive")
 	}
+	if opts.initialN <= 0 {
+		opts.initialN = opts.n
+	}
+	if opts.initialN <= 0 || opts.initialN > opts.n {
+		return fmt.Errorf("-initial-n must be in [1, -n]: initial_n=%d n=%d", opts.initialN, opts.n)
+	}
 	if opts.epochs <= 0 {
 		return fmt.Errorf("-epochs must be positive")
 	}
 	if opts.f < 0 {
-		opts.f = (opts.n - 1) / 3
+		opts.f = (opts.initialN - 1) / 3
 	}
-	if 3*opts.f+1 > opts.n {
-		return fmt.Errorf("invalid fault threshold: need n >= 3f+1, got n=%d f=%d", opts.n, opts.f)
+	if 3*opts.f+1 > opts.initialN {
+		return fmt.Errorf("invalid fault threshold: need initial_n >= 3f+1, got initial_n=%d f=%d", opts.initialN, opts.f)
 	}
 	if opts.queueLen <= 0 {
 		opts.queueLen = 8
@@ -148,19 +156,22 @@ func run(opts runOptions) error {
 		opts.epochTimeoutMS = 10000
 	}
 	if opts.reconfigMinN <= 0 {
-		opts.reconfigMinN = opts.n - opts.f
+		opts.reconfigMinN = opts.initialN - opts.f
 	}
 	if opts.reconfigMaxN <= 0 {
-		opts.reconfigMaxN = opts.n + opts.f
+		opts.reconfigMaxN = opts.n
 	}
 	if opts.reconfigMinN < 1 {
 		opts.reconfigMinN = 1
 	}
-	if opts.reconfigMinN > opts.n {
-		return fmt.Errorf("-reconfig-min-n must be <= -n: min=%d n=%d", opts.reconfigMinN, opts.n)
+	if opts.reconfigMinN > opts.initialN {
+		return fmt.Errorf("-reconfig-min-n must be <= -initial-n: min=%d initial_n=%d", opts.reconfigMinN, opts.initialN)
 	}
 	if opts.reconfigMaxN < opts.reconfigMinN {
 		return fmt.Errorf("-reconfig-max-n must be >= -reconfig-min-n: max=%d min=%d", opts.reconfigMaxN, opts.reconfigMinN)
+	}
+	if opts.reconfigMaxN > opts.n {
+		return fmt.Errorf("-reconfig-max-n must be <= -n: max=%d n=%d", opts.reconfigMaxN, opts.n)
 	}
 	if opts.reconfigEvents < 0 {
 		return fmt.Errorf("-reconfig-events must be non-negative")
@@ -181,7 +192,7 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
 
-	ids, pp, keys, err := setupRuntime(opts.n, opts.f, opts.pvss)
+	ids, initialIDs, pp, keys, err := setupRuntime(opts.n, opts.initialN, opts.f, opts.pvss)
 	if err != nil {
 		return err
 	}
@@ -189,13 +200,18 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 	net := p2p.NewMemoryNetwork()
 	nodes := make([]*tyche.Node, 0, len(ids))
 	for _, id := range ids {
-		scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
+		key := keys[id]
+		private := key.Private
+		if private == nil {
+			private = crypto.KeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/observer-pvss"), []byte(id), []byte(pp.Epoch()))).Private
+		}
+		scheme, err := crypto.NewPVSSScheme(id, private, pp)
 		if err != nil {
 			return err
 		}
 		node, err := tyche.NewNode(tyche.Config{
 			ID:                    id,
-			Members:               ids,
+			Members:               initialIDs,
 			F:                     opts.f,
 			QueueLen:              opts.queueLen,
 			PVSS:                  scheme,
@@ -210,22 +226,25 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 		if err != nil {
 			return err
 		}
+		if !containsID(initialIDs, id) {
+			node.SetProducing(false)
+		}
 		node.Start(runCtx)
 		node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 		nodes = append(nodes, node)
 	}
 
 	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
-	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d lookahead_expiration_ms=%d pvss=%s\n",
-		opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, lookaheadExpirationMS, opts.pvss)
+	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d initial_n=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d lookahead_expiration_ms=%d pvss=%s\n",
+		opts.n, opts.initialN, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, lookaheadExpirationMS, opts.pvss)
 
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
 	time.Sleep(time.Duration(opts.prefillMS) * time.Millisecond)
 	var finalWindow finalMetricWindow
-	reconfigSchedule := buildReconfigSchedule(ids, opts)
-	stopped := make(map[p2p.NodeID]bool)
+	reconfigSchedule := buildReconfigSchedule(initialIDs, ids[opts.initialN:], opts)
+	stopped := make(stoppedReconfigNodes)
 	reportedRemoved := make(map[p2p.NodeID]bool)
 	localStops := 0
 
@@ -246,7 +265,7 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 		}
 		for _, node := range activeNodes {
 			snapshot := node.DebugSnapshot()
-			if stopped[snapshot.Source] {
+			if stoppedReady(stopped, snapshot.Source, epoch) {
 				seq, applied, err := node.ForceReconfigurationRemoval(uint64(epoch), snapshot.Source)
 				if err != nil {
 					return fmt.Errorf("epoch %d: force reconfiguration removal for %s: %w", epoch, snapshot.Source, err)
@@ -313,7 +332,7 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 	if _, ok := peers[opts.nodeID]; !ok {
 		return fmt.Errorf("-peers does not contain -node %s", opts.nodeID)
 	}
-	ids, pp, keys, err := setupRuntime(opts.n, opts.f, opts.pvss)
+	ids, initialIDs, pp, keys, err := setupRuntime(opts.n, opts.initialN, opts.f, opts.pvss)
 	if err != nil {
 		return err
 	}
@@ -331,13 +350,18 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 
 	runCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.epochs+10)*time.Duration(opts.epochTimeoutMS)*time.Millisecond)
 	defer cancel()
-	scheme, err := crypto.NewPVSSScheme(opts.nodeID, keys[opts.nodeID].Private, pp)
+	key := keys[opts.nodeID]
+	private := key.Private
+	if private == nil {
+		private = crypto.KeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/observer-pvss"), []byte(opts.nodeID), []byte(pp.Epoch()))).Private
+	}
+	scheme, err := crypto.NewPVSSScheme(opts.nodeID, private, pp)
 	if err != nil {
 		return err
 	}
 	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, opts.transportBuffer)
 	node, err := tyche.NewNode(tyche.Config{
-		ID: opts.nodeID, Members: ids, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool,
+		ID: opts.nodeID, Members: initialIDs, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool,
 		RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond, LookaheadExpiration: time.Duration(lookaheadExpirationMS) * time.Millisecond, CurrentMissingRemoval: opts.reconfigEvents > 0, ExplicitRemovalOnly: opts.reconfigEvents > 0, Transport: transport,
 	})
 	if err != nil {
@@ -350,13 +374,16 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 		return err
 	}
 	fmt.Printf("node=%s tcp_peers_ready peers=%d\n", opts.nodeID, len(peers)-1)
+	if !containsID(initialIDs, opts.nodeID) {
+		node.SetProducing(false)
+	}
 	node.Start(runCtx)
 	node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 
 	nodes := []*tyche.Node{node}
 	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
-	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d lookahead_expiration_ms=%d pvss=%s peers=%v\n",
-		opts.nodeID, listen, opts.n, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, lookaheadExpirationMS, opts.pvss, peers)
+	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d initial_n=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d lookahead_expiration_ms=%d pvss=%s peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.initialN, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, lookaheadExpirationMS, opts.pvss, peers)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
@@ -371,13 +398,14 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 		fmt.Printf("node=%s prefilled_epochs=%d counted=%d\n", opts.nodeID, completed, startCount)
 	}
 	var finalWindow finalMetricWindow
-	reconfigSchedule := buildReconfigSchedule(ids, opts)
-	stopped := make(map[p2p.NodeID]bool)
+	reconfigSchedule := buildReconfigSchedule(initialIDs, ids[opts.initialN:], opts)
+	stopped := make(stoppedReconfigNodes)
 	reportedRemoved := make(map[p2p.NodeID]bool)
 	localStops := 0
 	var selfJoinCatchupTarget uint64
 
-	for counted := startCount; counted < opts.epochs; counted++ {
+	counted := startCount
+	for counted < opts.epochs {
 		epoch := counted + 1
 		event, hasEvent := reconfigSchedule[epoch]
 		if err := node.ActivatePendingJoins(runCtx, uint64(epoch)); err != nil {
@@ -388,12 +416,48 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 			snapshot := node.DebugSnapshot()
 			fmt.Printf("reconfig_self_removed epoch=%d node=%s completed=%d config_version=%d\n", epoch, opts.nodeID, snapshot.Completed, snapshot.ConfigVersion)
 			urgentJoin := hasEvent && event.Action == reconfigJoin && event.Node == opts.nodeID
-			catchupTarget := uint64(max(0, epoch-1))
+			var eventJoinActivation uint64
+			if hasEvent {
+				switch event.Action {
+				case reconfigStop:
+					if _, _, err := handleReconfigEvent(runCtx, node, event, stopped, opts, epochAttemptTimeout); err != nil {
+						return err
+					}
+					if err := forceStoppedSourceRemoval(node, stopped, opts.nodeID, uint64(epoch), "observer-scheduled"); err != nil {
+						return err
+					}
+				case reconfigJoin:
+					var err error
+					_, eventJoinActivation, err = handleReconfigEvent(runCtx, node, event, stopped, opts, epochAttemptTimeout)
+					if err != nil {
+						return err
+					}
+				}
+			}
+			if urgentJoin {
+				target := uint64(epoch + reconfigEventJoinDelay(event))
+				if eventJoinActivation > 0 {
+					target = eventJoinActivation
+				}
+				if target > selfJoinCatchupTarget {
+					selfJoinCatchupTarget = target
+				}
+			}
+			if selfJoinCatchupTarget > 0 && uint64(epoch) > selfJoinCatchupTarget {
+				selfJoinCatchupTarget = 0
+			}
+			futureJoin := hasFutureJoin(reconfigSchedule, opts.nodeID, epoch)
+			if !urgentJoin && !futureJoin && selfJoinCatchupTarget == 0 {
+				break
+			}
+			catchupTarget := uint64(epoch)
 			if selfJoinCatchupTarget > catchupTarget {
-				catchupTarget = selfJoinCatchupTarget
 				urgentJoin = true
 			}
-			waitTimeout := reconfigRemovedCatchupTimeout(epochAttemptTimeout, urgentJoin)
+			if err := forceStoppedSourceRemoval(node, stopped, opts.nodeID, catchupTarget, "observer-catchup"); err != nil {
+				return err
+			}
+			waitTimeout := reconfigRemovedCatchupTimeout(epochAttemptTimeout, urgentJoin || futureJoin)
 			if err := waitForCompletedEpoch(runCtx, node, catchupTarget, waitTimeout); err != nil {
 				if urgentJoin {
 					fmt.Printf("reconfig_removed_wait_timeout epoch=%d node=%s completed=%d config_version=%d target=%d err=%v\n",
@@ -402,6 +466,11 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 			} else if err := node.ActivatePendingJoins(runCtx, uint64(epoch)); err != nil {
 				return fmt.Errorf("node %s activating pending joins after catchup for epoch %d: %w", opts.nodeID, epoch, err)
 			}
+			logReconfigRemovalProgress(node, stopped, reportedRemoved, epoch)
+			if completed := node.CompletedEpoch(); completed > uint64(counted) {
+				counted = int(completed)
+			}
+			continue
 		}
 		if hasEvent {
 			stoppedNow, joinActivation, err := handleReconfigEvent(runCtx, node, event, stopped, opts, epochAttemptTimeout)
@@ -410,6 +479,19 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 			}
 			if stoppedNow {
 				localStops++
+				if event.Action == reconfigStop {
+					fmt.Printf("reconfig_stop_node epoch=%d node=%s crash_grace_ms=%d completed=%d config_version=%d\n",
+						epoch, opts.nodeID, opts.reconfigCrashGraceMS, node.CompletedEpoch(), node.DebugSnapshot().ConfigVersion)
+					if opts.reconfigCrashGraceMS > 0 {
+						timer := time.NewTimer(time.Duration(opts.reconfigCrashGraceMS) * time.Millisecond)
+						select {
+						case <-runCtx.Done():
+						case <-timer.C:
+						}
+						timer.Stop()
+					}
+					break
+				}
 			}
 			if joinActivation > 0 && event.Action == reconfigJoin && event.Node == opts.nodeID {
 				selfJoinCatchupTarget = joinActivation - 1
@@ -443,6 +525,11 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 		fmt.Printf("ts=%s node=%s epoch=%d source=%s seq=%d random=%x\n", logTimestamp(), opts.nodeID, beacon.Epoch, beacon.Source, beacon.Seq, beacon.Random[:8])
 		finalWindow.recordBeacon(nodes)
 		logReconfigRemovalProgress(node, stopped, reportedRemoved, epoch)
+		if completed := node.CompletedEpoch(); completed > uint64(counted) {
+			counted = int(completed)
+		} else {
+			counted++
+		}
 	}
 	queueTotal, queueMax := collectQueue(nodes)
 	stopReport()
@@ -484,9 +571,11 @@ const (
 )
 
 type reconfigEvent struct {
-	Epoch  int
-	Action reconfigAction
-	Node   p2p.NodeID
+	Epoch     int
+	Action    reconfigAction
+	Node      p2p.NodeID
+	Race      string
+	JoinDelay int
 }
 
 type pendingRejoinCandidate struct {
@@ -494,7 +583,9 @@ type pendingRejoinCandidate struct {
 	availableEpoch int
 }
 
-func buildReconfigSchedule(ids []p2p.NodeID, opts runOptions) map[int]reconfigEvent {
+type stoppedReconfigNodes map[p2p.NodeID]int
+
+func buildReconfigSchedule(initialIDs []p2p.NodeID, standbyIDs []p2p.NodeID, opts runOptions) map[int]reconfigEvent {
 	schedule := make(map[int]reconfigEvent)
 	maxEvents := reconfigEventLimit(opts)
 	if maxEvents == 0 {
@@ -505,28 +596,135 @@ func buildReconfigSchedule(ids []p2p.NodeID, opts runOptions) map[int]reconfigEv
 	if planningEpochs < 1 {
 		planningEpochs = opts.epochs
 	}
-	members := make(map[p2p.NodeID]bool, len(ids))
-	for _, id := range ids {
+	latestStopEpoch := opts.epochs - reconfigRemovalModelDelay(opts.initialN)
+	if latestStopEpoch < reconfigInitialQuietEpoch() {
+		latestStopEpoch = reconfigInitialQuietEpoch()
+	}
+	members := make(map[p2p.NodeID]bool, len(initialIDs))
+	for _, id := range initialIDs {
 		members[id] = true
 	}
-	var removed []pendingRejoinCandidate
+	standby := append([]p2p.NodeID(nil), standbyIDs...)
+	shuffleNodeIDs(rng, standby)
+
+	stopQuota := maxEvents / 2
+	joinQuota := maxEvents - stopQuota
+	eventCap := maxEvents
+	var lastAction reconfigAction
 	nextEligibleEpoch := reconfigInitialQuietEpoch()
-	for epoch := 1; epoch <= planningEpochs && len(schedule) < maxEvents; epoch++ {
-		if epoch < nextEligibleEpoch {
-			continue
+	if maxEvents >= 4 && len(standby) > 0 && stopQuota > 0 && joinQuota > 1 {
+		joiner := popNodeID(&standby)
+		joinEpoch := clampEpoch(nextEligibleEpoch, planningEpochs)
+		joinEpoch = findOpenEpoch(schedule, joinEpoch, planningEpochs)
+		schedule[joinEpoch] = reconfigEvent{Epoch: joinEpoch, Action: reconfigJoin, Node: joiner, Race: "proposal_before_remove", JoinDelay: reconfigRaceJoinModelDelay(opts.initialN)}
+		eventCap++
+
+		victim := randomMember(rng, initialIDs, standbyIDs, members)
+		if victim != "" {
+			stopEpoch := clampEpoch(joinEpoch+max(2, reconfigJoinModelDelay()/2), planningEpochs)
+			stopEpoch = findOpenEpoch(schedule, stopEpoch, planningEpochs)
+			delete(members, victim)
+			schedule[stopEpoch] = reconfigEvent{Epoch: stopEpoch, Action: reconfigStop, Node: victim, Race: "remove_before_join_activation"}
+			stopQuota--
+
+			followEpoch := clampEpoch(stopEpoch+reconfigRemovalModelDelay(opts.initialN)+reconfigReconfigurationQuietEpochs(), planningEpochs)
+			followEpoch = findOpenEpoch(schedule, followEpoch, planningEpochs)
+			members[joiner] = true
+			schedule[followEpoch] = reconfigEvent{Epoch: followEpoch, Action: reconfigJoin, Node: joiner, Race: "join_after_remove"}
+			joinQuota--
+			lastAction = reconfigJoin
+			nextEligibleEpoch = followEpoch + reconfigReconfigurationQuietEpochs()
+		} else {
+			standby = append(standby, joiner)
+			eventCap--
 		}
-		if !shouldRunReconfiguration(rng, epoch, planningEpochs, len(schedule), maxEvents) {
-			continue
+	}
+
+	for len(schedule) < eventCap && (stopQuota > 0 || joinQuota > 0) && nextEligibleEpoch <= planningEpochs {
+		remainingSlots := max(1, planningEpochs-nextEligibleEpoch+1)
+		remainingEvents := max(1, stopQuota+joinQuota)
+		stride := min(4, max(1, remainingSlots/remainingEvents))
+		epoch := nextEligibleEpoch + rng.Intn(stride)
+		if epoch > planningEpochs {
+			epoch = planningEpochs
 		}
-		canStop := len(members) > opts.reconfigMinN
-		joinCandidates := availableRejoinCandidates(removed, epoch)
-		canJoin := len(members) < opts.reconfigMaxN && len(joinCandidates) > 0
+		epoch = findOpenEpoch(schedule, epoch, planningEpochs)
+
+		canStop := stopQuota > 0 && epoch <= latestStopEpoch && len(members) > opts.reconfigMinN
+		canJoin := joinQuota > 0 && len(members) < opts.reconfigMaxN && len(standby) > 0
 		if !canStop && !canJoin {
-			continue
+			break
 		}
 		action := reconfigStop
 		if canStop && canJoin {
-			if rng.Intn(2) == 1 {
+			if lastAction == reconfigStop {
+				action = reconfigJoin
+			} else if lastAction == reconfigJoin {
+				action = reconfigStop
+			} else {
+				stopWeight := stopQuota
+				joinWeight := joinQuota
+				if rng.Intn(stopWeight+joinWeight) >= stopWeight {
+					action = reconfigJoin
+				}
+			}
+		} else if canJoin {
+			action = reconfigJoin
+		}
+		switch action {
+		case reconfigStop:
+			victim := randomMember(rng, initialIDs, standbyIDs, members)
+			if victim == "" {
+				nextEligibleEpoch = epoch + 1
+				continue
+			}
+			delete(members, victim)
+			schedule[epoch] = reconfigEvent{Epoch: epoch, Action: reconfigStop, Node: victim}
+			stopQuota--
+			lastAction = reconfigStop
+			nextEligibleEpoch = epoch + reconfigStopScheduleGap(opts.initialN)
+		case reconfigJoin:
+			joiner := popNodeID(&standby)
+			if joiner == "" {
+				nextEligibleEpoch = epoch + 1
+				continue
+			}
+			members[joiner] = true
+			schedule[epoch] = reconfigEvent{Epoch: epoch, Action: reconfigJoin, Node: joiner}
+			joinQuota--
+			lastAction = reconfigJoin
+			nextEligibleEpoch = epoch + reconfigJoinModelDelay() + reconfigReconfigurationQuietEpochs()
+		}
+	}
+	backfillAttempts := 0
+	for len(schedule) < eventCap && (stopQuota > 0 || joinQuota > 0) && backfillAttempts < eventCap*4 {
+		if nextEligibleEpoch > planningEpochs {
+			break
+		}
+		backfillAttempts++
+		span := max(1, planningEpochs-reconfigInitialQuietEpoch()+1)
+		bucket := min(4, max(1, span/maxEvents))
+		epoch := reconfigInitialQuietEpoch() + (len(schedule)*span)/maxEvents + rng.Intn(bucket)
+		if epoch < nextEligibleEpoch {
+			epoch = nextEligibleEpoch
+		}
+		var ok bool
+		epoch, ok = findOpenEpochAtOrAfter(schedule, epoch, planningEpochs)
+		if !ok {
+			break
+		}
+		canStop := stopQuota > 0 && epoch <= latestStopEpoch && len(members) > opts.reconfigMinN
+		canJoin := joinQuota > 0 && len(members) < opts.reconfigMaxN && len(standby) > 0
+		if !canStop && !canJoin {
+			break
+		}
+		action := reconfigStop
+		if canStop && canJoin {
+			if lastAction == reconfigStop {
+				action = reconfigJoin
+			} else if lastAction == reconfigJoin {
+				action = reconfigStop
+			} else if rng.Intn(stopQuota+joinQuota) >= stopQuota {
 				action = reconfigJoin
 			}
 		} else if canJoin {
@@ -534,29 +732,102 @@ func buildReconfigSchedule(ids []p2p.NodeID, opts runOptions) map[int]reconfigEv
 		}
 		switch action {
 		case reconfigStop:
-			candidates := make([]p2p.NodeID, 0, len(members))
-			for _, id := range ids {
-				if members[id] {
-					candidates = append(candidates, id)
-				}
-			}
-			if len(candidates) == 0 {
+			victim := randomMember(rng, initialIDs, standbyIDs, members)
+			if victim == "" {
 				continue
 			}
-			victim := candidates[rng.Intn(len(candidates))]
 			delete(members, victim)
-			removed = append(removed, pendingRejoinCandidate{id: victim, availableEpoch: epoch + reconfigJoinModelDelay()})
 			schedule[epoch] = reconfigEvent{Epoch: epoch, Action: reconfigStop, Node: victim}
-			nextEligibleEpoch = epoch + reconfigReconfigurationQuietEpochs()
+			stopQuota--
+			lastAction = reconfigStop
+			nextEligibleEpoch = epoch + reconfigStopScheduleGap(opts.initialN)
 		case reconfigJoin:
-			joiner := joinCandidates[rng.Intn(len(joinCandidates))]
+			joiner := popNodeID(&standby)
+			if joiner == "" {
+				continue
+			}
 			members[joiner] = true
-			removed = removeRejoinCandidate(removed, joiner)
 			schedule[epoch] = reconfigEvent{Epoch: epoch, Action: reconfigJoin, Node: joiner}
-			nextEligibleEpoch = epoch + reconfigReconfigurationQuietEpochs()
+			joinQuota--
+			lastAction = reconfigJoin
+			nextEligibleEpoch = epoch + reconfigJoinModelDelay() + reconfigReconfigurationQuietEpochs()
 		}
 	}
 	return schedule
+}
+
+func hasFutureJoin(schedule map[int]reconfigEvent, node p2p.NodeID, epoch int) bool {
+	for scheduledEpoch, event := range schedule {
+		if scheduledEpoch >= epoch && event.Action == reconfigJoin && event.Node == node {
+			return true
+		}
+	}
+	return false
+}
+
+func randomMember(rng *rand.Rand, initialIDs []p2p.NodeID, standbyIDs []p2p.NodeID, members map[p2p.NodeID]bool) p2p.NodeID {
+	ordered := append([]p2p.NodeID(nil), initialIDs...)
+	ordered = append(ordered, standbyIDs...)
+	candidates := make([]p2p.NodeID, 0, len(members))
+	for _, id := range ordered {
+		if members[id] {
+			candidates = append(candidates, id)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[rng.Intn(len(candidates))]
+}
+
+func shuffleNodeIDs(rng *rand.Rand, ids []p2p.NodeID) {
+	rng.Shuffle(len(ids), func(i, j int) {
+		ids[i], ids[j] = ids[j], ids[i]
+	})
+}
+
+func popNodeID(ids *[]p2p.NodeID) p2p.NodeID {
+	if len(*ids) == 0 {
+		return ""
+	}
+	id := (*ids)[0]
+	*ids = (*ids)[1:]
+	return id
+}
+
+func clampEpoch(epoch int, maxEpoch int) int {
+	if epoch < 1 {
+		return 1
+	}
+	if epoch > maxEpoch {
+		return maxEpoch
+	}
+	return epoch
+}
+
+func findOpenEpoch(schedule map[int]reconfigEvent, epoch int, maxEpoch int) int {
+	epoch = clampEpoch(epoch, maxEpoch)
+	for candidate := epoch; candidate <= maxEpoch; candidate++ {
+		if _, ok := schedule[candidate]; !ok {
+			return candidate
+		}
+	}
+	for candidate := epoch - 1; candidate >= 1; candidate-- {
+		if _, ok := schedule[candidate]; !ok {
+			return candidate
+		}
+	}
+	return epoch
+}
+
+func findOpenEpochAtOrAfter(schedule map[int]reconfigEvent, epoch int, maxEpoch int) (int, bool) {
+	epoch = clampEpoch(epoch, maxEpoch)
+	for candidate := epoch; candidate <= maxEpoch; candidate++ {
+		if _, ok := schedule[candidate]; !ok {
+			return candidate, true
+		}
+	}
+	return 0, false
 }
 
 func availableRejoinCandidates(removed []pendingRejoinCandidate, epoch int) []p2p.NodeID {
@@ -583,12 +854,31 @@ func reconfigJoinModelDelay() int {
 	return 10
 }
 
+func reconfigRaceJoinModelDelay(initialN int) int {
+	return reconfigRemovalModelDelay(initialN) + reconfigJoinModelDelay()
+}
+
+func reconfigEventJoinDelay(event reconfigEvent) int {
+	if event.JoinDelay > 0 {
+		return event.JoinDelay
+	}
+	return reconfigJoinModelDelay()
+}
+
+func reconfigRemovalModelDelay(initialN int) int {
+	return max(6, initialN+4)
+}
+
+func reconfigStopScheduleGap(initialN int) int {
+	return max(12, reconfigRemovalModelDelay(initialN)-4)
+}
+
 func reconfigReconfigurationQuietEpochs() int {
-	return 20
+	return 4
 }
 
 func reconfigInitialQuietEpoch() int {
-	return 20
+	return 12
 }
 
 func sortedNodeIDs(ids []p2p.NodeID) []p2p.NodeID {
@@ -620,7 +910,17 @@ func currentMemberSet(node *tyche.Node) map[p2p.NodeID]bool {
 	return out
 }
 
-func stoppedMemberPending(node *tyche.Node, stopped map[p2p.NodeID]bool) bool {
+func markStoppedReconfigNode(stopped stoppedReconfigNodes, id p2p.NodeID, event reconfigEvent) {
+	readyEpoch := event.Epoch + 1
+	stopped[id] = readyEpoch
+}
+
+func stoppedReady(stopped stoppedReconfigNodes, id p2p.NodeID, epoch int) bool {
+	readyEpoch, ok := stopped[id]
+	return ok && epoch >= readyEpoch
+}
+
+func stoppedMemberPending(node *tyche.Node, stopped stoppedReconfigNodes) bool {
 	for id := range stopped {
 		if node.IsMember(id) {
 			return true
@@ -633,10 +933,13 @@ func currentMembersContain(node *tyche.Node, id p2p.NodeID) bool {
 	return currentMemberSet(node)[id]
 }
 
-func ensureJoinKey(node *tyche.Node, joiner p2p.NodeID, eventEpoch int, opts runOptions) (tyche.JoinRequest, bool, error) {
+func ensureJoinKey(node *tyche.Node, joiner p2p.NodeID, eventEpoch int, joinDelay int, opts runOptions) (tyche.JoinRequest, bool, error) {
 	members, f, version, completed := node.MembershipSnapshot()
 	if containsID(members, joiner) {
 		return tyche.JoinRequest{}, false, nil
+	}
+	if joinDelay <= 0 {
+		joinDelay = reconfigJoinModelDelay()
 	}
 	targetMembers := normalizeNodeIDs(append(members, joiner))
 	targetF := (len(targetMembers) - 1) / 3
@@ -644,8 +947,11 @@ func ensureJoinKey(node *tyche.Node, joiner p2p.NodeID, eventEpoch int, opts run
 	if err != nil {
 		return tyche.JoinRequest{}, false, err
 	}
-	if key, ok := keys[node.ID]; ok {
+	if key, ok := keys[node.ID]; ok && key.Private != nil {
 		node.RegisterPVSSKey(pp.Epoch(), key.Private)
+	} else {
+		private := crypto.KeyPairFromSeed(crypto.HashBytes([]byte("Tyche-v1/observer-pvss"), []byte(node.ID), []byte(pp.Epoch()))).Private
+		node.RegisterPVSSKey(pp.Epoch(), private)
 	}
 	key, ok := keys[joiner]
 	if !ok {
@@ -666,8 +972,8 @@ func ensureJoinKey(node *tyche.Node, joiner p2p.NodeID, eventEpoch int, opts run
 		PublicKey:       string(joiner) + "-pk",
 		CandidateParams: pp,
 		Object:          tyche.Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
-		FirstCoinEpoch:  completed + 10,
-		ActivationEpoch: completed + 30,
+		FirstCoinEpoch:  completed + uint64(max(3, joinDelay/2)),
+		ActivationEpoch: completed + uint64(joinDelay),
 	}
 	if f < 0 {
 		return tyche.JoinRequest{}, false, fmt.Errorf("invalid current fault threshold %d", f)
@@ -700,30 +1006,31 @@ func join(parts []string, sep string) string {
 	return strings.Join(parts, sep)
 }
 
-func handleReconfigEvent(ctx context.Context, node *tyche.Node, event reconfigEvent, stopped map[p2p.NodeID]bool, opts runOptions, epochAttemptTimeout time.Duration) (bool, uint64, error) {
+func handleReconfigEvent(ctx context.Context, node *tyche.Node, event reconfigEvent, stopped stoppedReconfigNodes, opts runOptions, epochAttemptTimeout time.Duration) (bool, uint64, error) {
 	switch event.Action {
 	case reconfigStop:
 		snapshot := node.DebugSnapshot()
+		target := reconfigStopTarget(event, snapshot.Source)
 		members, _, version, completed := node.MembershipSnapshot()
 		if stoppedMemberPending(node, stopped) {
 			fmt.Printf("reconfig_stop_deferred epoch=%d node=%s completed=%d config_version=%d reason=pending_removal\n",
-				event.Epoch, event.Node, completed, version)
+				event.Epoch, target, completed, version)
 			return false, 0, nil
 		}
 		if len(members) <= opts.reconfigMinN {
 			fmt.Printf("reconfig_stop_deferred epoch=%d node=%s completed=%d config_version=%d reason=min_n current_n=%d min_n=%d\n",
-				event.Epoch, event.Node, completed, version, len(members), opts.reconfigMinN)
+				event.Epoch, target, completed, version, len(members), opts.reconfigMinN)
 			return false, 0, nil
 		}
-		if !containsID(members, event.Node) {
+		if !containsID(members, target) {
 			fmt.Printf("reconfig_stop_deferred epoch=%d node=%s completed=%d config_version=%d reason=not_member current_n=%d min_n=%d\n",
-				event.Epoch, event.Node, completed, version, len(members), opts.reconfigMinN)
+				event.Epoch, target, completed, version, len(members), opts.reconfigMinN)
 			return false, 0, nil
 		}
-		stopped[event.Node] = true
-		fmt.Printf("reconfig_schedule epoch=%d action=stop_producing node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d max_n=%d seed=%d\n",
-			event.Epoch, event.Node, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigMaxN, opts.reconfigSeed)
-		if event.Node != node.ID {
+		markStoppedReconfigNode(stopped, target, event)
+		fmt.Printf("reconfig_schedule epoch=%d action=stop_producing node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d max_n=%d seed=%d race=%s\n",
+			event.Epoch, target, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigMaxN, opts.reconfigSeed, event.Race)
+		if target != node.ID {
 			return false, 0, nil
 		}
 		ensureCtx, cancelEnsure := context.WithTimeout(ctx, epochAttemptTimeout)
@@ -734,7 +1041,7 @@ func handleReconfigEvent(ctx context.Context, node *tyche.Node, event reconfigEv
 		}
 		node.SetProducing(false)
 		fmt.Printf("reconfig_stop_producing epoch=%d node=%s seq=%d completed=%d config_version=%d\n",
-			event.Epoch, event.Node, seq, node.CompletedEpoch(), snapshot.ConfigVersion)
+			event.Epoch, target, seq, node.CompletedEpoch(), snapshot.ConfigVersion)
 		return true, 0, nil
 	case reconfigJoin:
 		if stoppedMemberPending(node, stopped) {
@@ -749,14 +1056,14 @@ func handleReconfigEvent(ctx context.Context, node *tyche.Node, event reconfigEv
 				event.Epoch, event.Node, snapshot.Completed, snapshot.ConfigVersion)
 			return false, 0, nil
 		}
-		req, proposer, err := ensureJoinKey(node, event.Node, event.Epoch, opts)
+		req, proposer, err := ensureJoinKey(node, event.Node, event.Epoch, reconfigEventJoinDelay(event), opts)
 		if err != nil {
 			return false, 0, fmt.Errorf("prepare reconfiguration join for %s: %w", event.Node, err)
 		}
 		if proposer {
 			members, f, version, completed := node.MembershipSnapshot()
-			fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s completed=%d config_version=%d n_before=%d f_before=%d activation_epoch=%d members_before=%v\n",
-				event.Epoch, event.Node, completed, version, len(members), f, req.ActivationEpoch, sortedNodeIDs(members))
+			fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s completed=%d config_version=%d n_before=%d f_before=%d activation_epoch=%d members_before=%v race=%s\n",
+				event.Epoch, event.Node, completed, version, len(members), f, req.ActivationEpoch, sortedNodeIDs(members), event.Race)
 			if err := node.ProposeJoin(ctx, req); err != nil {
 				return false, 0, fmt.Errorf("propose reconfiguration join for %s: %w", event.Node, err)
 			}
@@ -768,7 +1075,7 @@ func handleReconfigEvent(ctx context.Context, node *tyche.Node, event reconfigEv
 	}
 }
 
-func handleMemoryReconfigEvent(ctx context.Context, nodes []*tyche.Node, event reconfigEvent, stopped map[p2p.NodeID]bool, opts runOptions, epochAttemptTimeout time.Duration) (int, error) {
+func handleMemoryReconfigEvent(ctx context.Context, nodes []*tyche.Node, event reconfigEvent, stopped stoppedReconfigNodes, opts runOptions, epochAttemptTimeout time.Duration) (int, error) {
 	localStops := 0
 	switch event.Action {
 	case reconfigStop:
@@ -777,39 +1084,41 @@ func handleMemoryReconfigEvent(ctx context.Context, nodes []*tyche.Node, event r
 			refNodes = nodes
 		}
 		ref := refNodes[0]
+		refSnapshot := ref.DebugSnapshot()
+		target := reconfigStopTarget(event, refSnapshot.Source)
 		members, _, version, completed := ref.MembershipSnapshot()
 		if stoppedMemberPending(ref, stopped) {
 			fmt.Printf("reconfig_stop_deferred epoch=%d node=%s completed=%d config_version=%d reason=pending_removal\n",
-				event.Epoch, event.Node, completed, version)
+				event.Epoch, target, completed, version)
 			return 0, nil
 		}
 		if len(members) <= opts.reconfigMinN {
 			fmt.Printf("reconfig_stop_deferred epoch=%d node=%s completed=%d config_version=%d reason=min_n current_n=%d min_n=%d\n",
-				event.Epoch, event.Node, completed, version, len(members), opts.reconfigMinN)
+				event.Epoch, target, completed, version, len(members), opts.reconfigMinN)
 			return 0, nil
 		}
-		if !containsID(members, event.Node) {
+		if !containsID(members, target) {
 			fmt.Printf("reconfig_stop_deferred epoch=%d node=%s completed=%d config_version=%d reason=not_member current_n=%d min_n=%d\n",
-				event.Epoch, event.Node, completed, version, len(members), opts.reconfigMinN)
+				event.Epoch, target, completed, version, len(members), opts.reconfigMinN)
 			return 0, nil
 		}
 		for _, node := range nodes {
-			stopped[event.Node] = true
-			if node.ID != event.Node {
+			markStoppedReconfigNode(stopped, target, event)
+			if node.ID != target {
 				continue
 			}
 			snapshot := node.DebugSnapshot()
-			fmt.Printf("reconfig_schedule epoch=%d action=stop_producing node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d max_n=%d seed=%d\n",
-				event.Epoch, event.Node, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigMaxN, opts.reconfigSeed)
+			fmt.Printf("reconfig_schedule epoch=%d action=stop_producing node=%s source=%s seq=%d completed=%d config_version=%d min_n=%d max_n=%d seed=%d race=%s\n",
+				event.Epoch, target, snapshot.Source, snapshot.Seq, snapshot.Completed, snapshot.ConfigVersion, opts.reconfigMinN, opts.reconfigMaxN, opts.reconfigSeed, event.Race)
 			ensureCtx, cancelEnsure := context.WithTimeout(ctx, epochAttemptTimeout)
 			seq, err := node.EnsureCurrentObject(ensureCtx)
 			cancelEnsure()
 			if err != nil {
-				return 0, fmt.Errorf("node %s failed to prepare current object before reconfiguration stop at epoch %d seq=%d: %w", event.Node, event.Epoch, seq, err)
+				return 0, fmt.Errorf("node %s failed to prepare current object before reconfiguration stop at epoch %d seq=%d: %w", target, event.Epoch, seq, err)
 			}
 			node.SetProducing(false)
 			localStops++
-			fmt.Printf("reconfig_stop_producing epoch=%d node=%s seq=%d\n", event.Epoch, event.Node, seq)
+			fmt.Printf("reconfig_stop_producing epoch=%d node=%s seq=%d\n", event.Epoch, target, seq)
 			return localStops, nil
 		}
 	case reconfigJoin:
@@ -819,14 +1128,14 @@ func handleMemoryReconfigEvent(ctx context.Context, nodes []*tyche.Node, event r
 			if stoppedMemberPending(node, stopped) || currentMembersContain(node, event.Node) {
 				continue
 			}
-			req, isProposer, err := ensureJoinKey(node, event.Node, event.Epoch, opts)
+			req, isProposer, err := ensureJoinKey(node, event.Node, event.Epoch, reconfigEventJoinDelay(event), opts)
 			if err != nil {
 				return 0, fmt.Errorf("prepare reconfiguration join for %s: %w", event.Node, err)
 			}
 			if isProposer {
 				members, f, version, completed := node.MembershipSnapshot()
-				fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s observer=%s completed=%d config_version=%d n_before=%d f_before=%d activation_epoch=%d members_before=%v\n",
-					event.Epoch, event.Node, node.ID, completed, version, len(members), f, req.ActivationEpoch, sortedNodeIDs(members))
+				fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s observer=%s completed=%d config_version=%d n_before=%d f_before=%d activation_epoch=%d members_before=%v race=%s\n",
+					event.Epoch, event.Node, node.ID, completed, version, len(members), f, req.ActivationEpoch, sortedNodeIDs(members), event.Race)
 				proposerReq = req
 				proposer = node
 			}
@@ -838,6 +1147,13 @@ func handleMemoryReconfigEvent(ctx context.Context, nodes []*tyche.Node, event r
 		}
 	}
 	return localStops, nil
+}
+
+func reconfigStopTarget(event reconfigEvent, currentSource p2p.NodeID) p2p.NodeID {
+	if currentSource != "" {
+		return currentSource
+	}
+	return event.Node
 }
 
 func shouldRunReconfiguration(rng *rand.Rand, epoch int, epochs int, completed int, target int) bool {
@@ -858,7 +1174,7 @@ func printReconfigFinal(node *tyche.Node, scheduled int, localStops int, opts ru
 	}
 	members, f, version, completed := node.MembershipSnapshot()
 	sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
-	removed := opts.n - len(members)
+	removed := opts.initialN - initialMemberCount(members, opts.initialN)
 	if removed < 0 {
 		removed = 0
 	}
@@ -878,7 +1194,27 @@ func printReconfigFinal(node *tyche.Node, scheduled int, localStops int, opts ru
 	)
 }
 
-func logReconfigRemovalProgress(node *tyche.Node, stopped map[p2p.NodeID]bool, reportedRemoved map[p2p.NodeID]bool, epoch int) {
+func initialMemberCount(members []p2p.NodeID, initialN int) int {
+	count := 0
+	for _, id := range members {
+		index, ok := nodeIndex(id)
+		if ok && index >= 0 && index < initialN {
+			count++
+		}
+	}
+	return count
+}
+
+func nodeIndex(id p2p.NodeID) (int, bool) {
+	raw := strings.TrimPrefix(string(id), "node")
+	if raw == string(id) || raw == "" {
+		return 0, false
+	}
+	value, err := strconv.Atoi(raw)
+	return value, err == nil
+}
+
+func logReconfigRemovalProgress(node *tyche.Node, stopped stoppedReconfigNodes, reportedRemoved map[p2p.NodeID]bool, epoch int) {
 	for id := range stopped {
 		if node.IsMember(id) {
 			continue
@@ -897,7 +1233,7 @@ func logReconfigRemovalProgress(node *tyche.Node, stopped map[p2p.NodeID]bool, r
 	}
 }
 
-func drainJoinEvents(node *tyche.Node, stopped map[p2p.NodeID]bool, epoch int) {
+func drainJoinEvents(node *tyche.Node, stopped stoppedReconfigNodes, epoch int) {
 	for {
 		select {
 		case cert := <-node.Joins:
@@ -915,7 +1251,7 @@ func drainJoinEvents(node *tyche.Node, stopped map[p2p.NodeID]bool, epoch int) {
 	}
 }
 
-func activatePendingReconfigurationJoins(ctx context.Context, nodes []*tyche.Node, stopped map[p2p.NodeID]bool, epoch int) error {
+func activatePendingReconfigurationJoins(ctx context.Context, nodes []*tyche.Node, stopped stoppedReconfigNodes, epoch int) error {
 	for _, node := range nodes {
 		if err := node.ActivatePendingJoins(ctx, uint64(epoch)); err != nil {
 			return fmt.Errorf("node %s activating pending joins before epoch %d: %w", node.ID, epoch, err)
@@ -925,7 +1261,7 @@ func activatePendingReconfigurationJoins(ctx context.Context, nodes []*tyche.Nod
 	return nil
 }
 
-func catchUpRejoinedNode(ctx context.Context, node *tyche.Node, stopped map[p2p.NodeID]bool, reportedRemoved map[p2p.NodeID]bool, observer p2p.NodeID, target uint64, timeout time.Duration) error {
+func catchUpRejoinedNode(ctx context.Context, node *tyche.Node, stopped stoppedReconfigNodes, reportedRemoved map[p2p.NodeID]bool, observer p2p.NodeID, target uint64, timeout time.Duration) error {
 	node.ApplyPendingBeaconCertificatesUntil(target)
 	if node.CompletedEpoch() >= target {
 		return nil
@@ -948,9 +1284,9 @@ func catchUpRejoinedNode(ctx context.Context, node *tyche.Node, stopped map[p2p.
 	return nil
 }
 
-func forceStoppedSourceRemoval(node *tyche.Node, stopped map[p2p.NodeID]bool, observer p2p.NodeID, epoch uint64, reason string) error {
+func forceStoppedSourceRemoval(node *tyche.Node, stopped stoppedReconfigNodes, observer p2p.NodeID, epoch uint64, reason string) error {
 	snapshot := node.DebugSnapshot()
-	if snapshot.NextEpoch != epoch || snapshot.Source == "" || !stopped[snapshot.Source] {
+	if snapshot.NextEpoch != epoch || snapshot.Source == "" || !stoppedReady(stopped, snapshot.Source, int(epoch)) {
 		return nil
 	}
 	seq, applied, err := node.ForceReconfigurationRemoval(epoch, snapshot.Source)
@@ -1061,14 +1397,15 @@ func resolveLookaheadExpirationMS(opts runOptions) int {
 	return opts.removalExpirationMS
 }
 
-func setupRuntime(n int, f int, pvss string) ([]p2p.NodeID, crypto.PVSSParams, map[p2p.NodeID]crypto.KeyPair, error) {
+func setupRuntime(n int, initialN int, f int, pvss string) ([]p2p.NodeID, []p2p.NodeID, crypto.PVSSParams, map[p2p.NodeID]crypto.KeyPair, error) {
 	ids := make([]p2p.NodeID, n)
 	for i := range ids {
 		ids[i] = p2p.NodeID(fmt.Sprintf("node%d", i))
 	}
-	epoch := fmt.Sprintf("tyche-runner-n%d-f%d", n, f)
-	pp, keys, err := crypto.SetupPVSS(pvss, epoch, f+1, ids)
-	return ids, pp, keys, err
+	initialIDs := append([]p2p.NodeID(nil), ids[:initialN]...)
+	epoch := fmt.Sprintf("tyche-runner-n%d-initial%d-f%d", n, initialN, f)
+	pp, keys, err := crypto.SetupPVSS(pvss, epoch, f+1, initialIDs)
+	return ids, initialIDs, pp, keys, err
 }
 
 func parsePeers(raw string) (map[p2p.NodeID]string, error) {

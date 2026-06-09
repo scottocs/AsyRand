@@ -190,6 +190,7 @@ type Node struct {
 	joinCoinWait          map[string]uint64
 	armSent               map[string]bool
 	commitSent            map[string]bool
+	joinCertSent          map[string]bool
 	abaInputSent          map[string]bool
 	abaInputs             map[string]bool
 	lockedFrom            uint64
@@ -340,7 +341,7 @@ func NewNode(cfg Config) (*Node, error) {
 		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
 		joinRequests: make(map[string]JoinRequest), pendingJoins: make(map[string]JoinCertificate),
 		joinCoinWait: make(map[string]uint64),
-		armSent:      make(map[string]bool), commitSent: make(map[string]bool),
+		armSent:      make(map[string]bool), commitSent: make(map[string]bool), joinCertSent: make(map[string]bool),
 		abaInputSent:          make(map[string]bool),
 		abaInputs:             make(map[string]bool),
 		beaconSeeds:           make(map[uint64][]byte),
@@ -1674,7 +1675,7 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate, broadcastCert bool) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.joinLockBlocksEpochLocked(epoch, source, seq) {
 		n.mu.Unlock()
 		return
 	}
@@ -1690,7 +1691,7 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate, broadcastCert bool) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.joinLockBlocksEpochLocked(epoch, source, seq) {
 		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
@@ -1712,7 +1713,7 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	}
 
 	n.mu.Lock()
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || (n.lockedFrom != 0 && epoch >= n.lockedFrom) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.joinLockBlocksEpochLocked(epoch, source, seq) {
 		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
@@ -1791,7 +1792,7 @@ func (n *Node) handleBeaconCert(b BeaconCertificate) error {
 func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 	key := epochKey(b.Epoch, b.Source, b.Seq)
 	n.mu.Lock()
-	if n.State.Epoch >= b.Epoch || n.State.Epoch+1 != b.Epoch || b.ConfigVersion != n.State.ConfigVersion || (n.lockedFrom != 0 && b.Epoch >= n.lockedFrom) {
+	if n.State.Epoch >= b.Epoch || n.State.Epoch+1 != b.Epoch || b.ConfigVersion != n.State.ConfigVersion || n.joinLockBlocksEpochLocked(b.Epoch, b.Source, b.Seq) {
 		if n.State.Epoch < b.Epoch && b.ConfigVersion == n.State.ConfigVersion {
 			n.pendingCerts[key] = b
 		}
@@ -1839,6 +1840,13 @@ func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 	n.mu.Unlock()
 	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, state, certificateSigners(b.Signature), b.Signature, false)
 	return true
+}
+
+func (n *Node) joinLockBlocksEpochLocked(epoch uint64, source p2p.NodeID, seq uint64) bool {
+	if n.lockedFrom == 0 || epoch < n.lockedFrom {
+		return false
+	}
+	return n.State.RmMark[source] == -1 || seq != uint64(n.State.RmMark[source])
 }
 
 type coinFeed struct {
@@ -2120,6 +2128,14 @@ func (n *Node) installRemovalPVSSLocked() {
 func (n *Node) resetConfigurationCachesLocked() {
 	n.State.ProducerSeq = n.State.Seqs[n.ID]
 	n.producerBusy = make(map[uint64]bool)
+	for id, q := range n.State.ComQ {
+		consumed := n.State.Seqs[id]
+		for seq, obj := range q {
+			if seq <= consumed || obj.ConfigVersion != n.State.ConfigVersion {
+				delete(q, seq)
+			}
+		}
+	}
 	n.recon = make(map[string]map[p2p.NodeID]crypto.DecryptedShare)
 	n.reconSecret = make(map[string][]byte)
 	n.reconDone = make(map[string]bool)

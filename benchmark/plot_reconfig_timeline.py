@@ -110,12 +110,7 @@ def event_dedupe_key(kind: str, epoch: int, node: str, line: str) -> tuple[objec
         if completed is not None:
             return kind, node, completed + 1
     if kind == "joining_proposal":
-        activation_epoch = parse_int_field(line, "activation_epoch")
-        if activation_epoch is not None:
-            return kind, node, activation_epoch
-        config_version = parse_int_field(line, "config_version")
-        if config_version is not None:
-            return kind, node, config_version
+        return kind, epoch, node
     if kind == "aba_deleted":
         config_version = parse_int_field(line, "config_version")
         if config_version is not None:
@@ -146,7 +141,7 @@ def extract_log_events(log_dir: Path) -> tuple[dict[str, list[tuple[int, str]]],
     event_node_pattern = re.compile(r"\bnode=([^ ]+)\b")
     schedule_pattern = re.compile(r"reconfig_schedule epoch=(\d+) action=stop_producing node=([^ ]+)")
     config_pattern = re.compile(
-        r"config protocol=.*?nodes=(\d+).*?epochs=(\d+).*?queue_len=(\d+).*?"
+        r"config protocol=.*?nodes=(\d+)(?:\s+initial_n=(\d+))?.*?epochs=(\d+).*?queue_len=(\d+).*?"
         r"removal_expiration_ms=(\d+).*?lookahead_expiration_ms=(\d+)"
     )
     epoch_pattern = re.compile(r"\bepoch=(\d+)\b")
@@ -154,8 +149,15 @@ def extract_log_events(log_dir: Path) -> tuple[dict[str, list[tuple[int, str]]],
     for log in sorted(log_dir.glob("*.log")):
         for line in log.read_text(errors="replace").splitlines():
             if match := config_pattern.search(line):
-                nodes, epochs, queue_len, removal_ms, lookahead_ms = map(int, match.groups())
+                nodes_raw, initial_n_raw, epochs_raw, queue_len_raw, removal_ms_raw, lookahead_ms_raw = match.groups()
+                nodes = int(nodes_raw)
+                initial_n = int(initial_n_raw) if initial_n_raw else nodes
+                epochs = int(epochs_raw)
+                queue_len = int(queue_len_raw)
+                removal_ms = int(removal_ms_raw)
+                lookahead_ms = int(lookahead_ms_raw)
                 meta.setdefault("nodes", nodes)
+                meta.setdefault("initial_n", initial_n)
                 meta.setdefault("epochs", epochs)
                 meta.setdefault("queue_len", queue_len)
                 meta.setdefault("removal_expiration_ms", removal_ms)
@@ -202,7 +204,7 @@ def extract_log_events(log_dir: Path) -> tuple[dict[str, list[tuple[int, str]]],
 
 
 def node_universe(meta: dict[str, int | str]) -> list[str]:
-    n = meta.get("nodes")
+    n = meta.get("initial_n") or meta.get("nodes")
     if isinstance(n, int) and n > 0:
         return [f"node{i}" for i in range(n)]
     final_members = str(meta.get("final_members", "")).split()
@@ -274,7 +276,7 @@ def render_svg(
     labels = {
         "stop_produce": "scheduled stop",
         "aba_deleted": "removal applied",
-        "joining_proposal": "joining proposal",
+        "joining_proposal": "join proposal (not active)",
         "joined": "join activated",
     }
     colors = {
@@ -292,7 +294,8 @@ def render_svg(
         f"N={meta.get('nodes', '?')} queue_len={meta.get('queue_len', '?')} "
         f"epochs={max_epoch} scheduled={visible_event_count(events, 'stop_produce', max_epoch)} "
         f"removals={visible_event_count(events, 'aba_deleted', max_epoch)} final_removed={final_removed} "
-        f"joins={visible_event_count(events, 'joined', max_epoch)} final_n={meta.get('final_n', '?')}"
+        f"join_proposals={visible_event_count(events, 'joining_proposal', max_epoch)} "
+        f"activated_joins={visible_event_count(events, 'joined', max_epoch)} final_n={meta.get('final_n', '?')}"
     )
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">']
@@ -320,10 +323,11 @@ def render_svg(
                 svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
             elif kind == "aba_deleted":
                 svg.append(f'<g stroke="{colors[kind]}" stroke-width="2.5" stroke-linecap="round">{title}<line x1="{xx-5:.1f}" y1="{y-5}" x2="{xx+5:.1f}" y2="{y+5}"/><line x1="{xx+5:.1f}" y1="{y-5}" x2="{xx-5:.1f}" y2="{y+5}"/></g>')
+            elif kind == "joining_proposal":
+                svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="5" fill="white" stroke="{colors[kind]}" stroke-width="2">{title}</circle>')
+                svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
             else:
                 svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="5" fill="{colors[kind]}">{title}</circle>')
-                if kind == "joining_proposal":
-                    svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
 
     svg.append("</svg>")
     return "\n".join(svg)
@@ -376,7 +380,7 @@ def render_membership_svg(
     svg.append(f'<text x="{left}" y="30" font-family="Arial" font-size="20" font-weight="700">{title} membership size</text>')
     svg.append(
         f'<text x="{left}" y="52" font-family="Arial" font-size="12" fill="#4b5563">'
-        f'epochs={max_epoch} initial_n={meta.get("nodes", "?")} final_n={meta.get("final_n", "?")} final_f={meta.get("final_f", "?")} '
+        f'epochs={max_epoch} initial_n={meta.get("initial_n", meta.get("nodes", "?"))} final_n={meta.get("final_n", "?")} final_f={meta.get("final_f", "?")} '
         f'membership_changes={meta.get("membership_changes", "?")}</text>'
     )
     for tick in range(y_min, y_max + 1):
@@ -409,7 +413,7 @@ def summary_rows(events: dict[str, list[tuple[int, str]]], meta: dict[str, int |
     active_ns = [int(row["active_n"]) for row in series if int(row["epoch"]) <= max_epoch]
     rows: list[tuple[str, int | str]] = [
         ("epochs_drawn", max_epoch),
-        ("initial_n", meta.get("nodes", "")),
+        ("initial_n", meta.get("initial_n", meta.get("nodes", ""))),
         ("queue_len", meta.get("queue_len", "")),
         ("scheduled_stop_count", len(visible["stop_produce"])),
         ("removal_count", len(visible["aba_deleted"])),

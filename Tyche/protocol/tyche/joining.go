@@ -178,21 +178,19 @@ func (n *Node) HandleJoinCommit(ctx context.Context, commit JoinCommit) error {
 	}
 	n.joinCommits[key][commit.Signer] = commit
 	req, hasReq := n.joinRequests[commit.RequestDigest]
-	ready := len(n.joinCommits[key]) >= 2*n.State.F+1 && hasReq
 	commitCount := len(n.joinCommits[key])
-	commitNeed := 2*n.State.F + 1
-	cert2 := collectCommits(n.joinCommits[key], 2*n.State.F+1)
-	cert1 := collectAcks(n.joinAcks[commit.Transition.String()+"/"+commit.RequestDigest], 2*n.State.F+1)
+	certNeed := 2*n.State.F + 1
+	ackCount := len(n.joinAcks[commit.Transition.String()+"/"+commit.RequestDigest])
+	ready := commitCount >= certNeed && ackCount >= certNeed && hasReq
+	cert2 := collectCommits(n.joinCommits[key], certNeed)
+	cert1 := collectAcks(n.joinAcks[commit.Transition.String()+"/"+commit.RequestDigest], certNeed)
 	n.mu.Unlock()
 	if !ready {
-		debugf("node=%s join_commit_wait transition=%s digest=%s commits=%d has_req=%t need=%d", n.ID, commit.Transition.String(), commit.RequestDigest, commitCount, hasReq, commitNeed)
+		debugf("node=%s join_commit_wait transition=%s digest=%s commits=%d acks=%d has_req=%t need=%d", n.ID, commit.Transition.String(), commit.RequestDigest, commitCount, ackCount, hasReq, certNeed)
 		return nil
 	}
 	cert := JoinCertificate{Request: req, Cert1: cert1, Cert2: cert2}
-	msg, err := p2p.NewMessage(Protocol, "JOIN_CERT", key, n.ID, "", cert)
-	if err == nil {
-		_ = n.Transport.Broadcast(ctx, msg)
-	}
+	n.relayJoinCertificate(ctx, cert)
 	return n.InstallJoinCertificate(cert)
 }
 
@@ -216,9 +214,17 @@ func (n *Node) InstallJoinCertificate(cert JoinCertificate) error {
 		return err
 	}
 	if len(cert.Cert2) == 0 || !n.verifyAckCert(cert.Cert1, rho) || !n.verifyCommitCert(cert.Cert2, rho, cert.Request.ActivationEpoch) {
+		n.mu.Lock()
+		if contains(n.State.Members, cert.Request.Joiner) || cert.Request.ConfigVersion != n.State.ConfigVersion {
+			n.discardStaleJoinLocked(cert)
+			n.mu.Unlock()
+			return nil
+		}
+		n.mu.Unlock()
 		debugf("node=%s reject join_cert joiner=%s reason=invalid_cert cert1=%d cert2=%d activation=%d", n.ID, cert.Request.Joiner, len(cert.Cert1), len(cert.Cert2), cert.Request.ActivationEpoch)
-		return errors.New("invalid join certificate")
+		return fmt.Errorf("invalid join certificate: cert1=%d cert2=%d activation=%d", len(cert.Cert1), len(cert.Cert2), cert.Request.ActivationEpoch)
 	}
+	n.relayJoinCertificate(context.Background(), cert)
 	scheme, err := n.schemeForCandidate(cert.Request.CandidateParams)
 	if err != nil {
 		debugf("node=%s reject join_cert joiner=%s reason=scheme err=%v", n.ID, cert.Request.Joiner, err)
@@ -266,10 +272,13 @@ func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme crypto.
 		n.State.TransitionSeq = cert.Cert2[0].Transition.Seq
 	}
 	n.PVSS = scheme
-	n.verified = make(map[string]verifiedObject)
+	if n.ID == cert.Request.Joiner {
+		n.producing = true
+	}
 	n.State.F = (len(n.State.Members) - 1) / 3
 	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
 	n.ABA.N, n.ABA.F = len(n.State.Members), n.State.F
+	n.resetConfigurationCachesLocked()
 	delete(n.pendingJoins, transitionCertKey(cert))
 	if n.lockedFrom == cert.Request.ActivationEpoch {
 		n.lockedFrom = 0
@@ -279,6 +288,34 @@ func (n *Node) installJoinCertificateLocked(cert JoinCertificate, scheme crypto.
 	default:
 	}
 	return nil
+}
+
+func (n *Node) relayJoinCertificate(ctx context.Context, cert JoinCertificate) {
+	key := transitionCertKey(cert)
+	if key == "" {
+		return
+	}
+	n.mu.Lock()
+	if n.joinCertSent[key] {
+		n.mu.Unlock()
+		return
+	}
+	n.joinCertSent[key] = true
+	recipients := append([]p2p.NodeID(nil), n.State.Members...)
+	if cert.Request.Joiner != "" && !contains(recipients, cert.Request.Joiner) {
+		recipients = append(recipients, cert.Request.Joiner)
+	}
+	n.mu.Unlock()
+	msg, err := p2p.NewMessage(Protocol, "JOIN_CERT", key, n.ID, "", cert)
+	if err != nil {
+		return
+	}
+	for _, recipient := range recipients {
+		if recipient == n.ID {
+			continue
+		}
+		_ = n.Transport.Send(ctx, recipient, msg)
+	}
 }
 
 func (n *Node) noPendingRemovalLocked() bool {
