@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"tyche.local/Tyche/asyrand/crypto"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/asyrand/crypto"
+	"Tyche/utils/p2p"
 )
 
 const Protocol = "rbc"

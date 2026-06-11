@@ -4,8 +4,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	asig "tyche.local/Tyche/spurt/crypto"
-	"tyche.local/Tyche/utils/p2p"
+	asig "Tyche/spurt/crypto"
+	"Tyche/utils/p2p"
 )
 
 type countingPVSSScheme struct {

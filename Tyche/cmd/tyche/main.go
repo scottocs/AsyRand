@@ -15,9 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tyche.local/Tyche/Tyche/crypto"
-	"tyche.local/Tyche/Tyche/protocol/tyche"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/Tyche/crypto"
+	"Tyche/Tyche/protocol/tyche"
+	"Tyche/utils/p2p"
 )
 
 type runStats struct {

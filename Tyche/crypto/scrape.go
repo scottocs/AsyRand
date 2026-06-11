@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/pairing/bn256"
 )

@@ -1,3 +1,3 @@
-module tyche.local/Tyche/utils
+module Tyche/utils
 
 go 1.24.0

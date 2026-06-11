@@ -1,4 +1,4 @@
-module tyche.local/Tyche/grandline
+module Tyche/grandline
 
 go 1.24.0
 
@@ -11,6 +11,6 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 )
 
-require tyche.local/Tyche/utils v0.0.0
+require Tyche/utils v0.0.0
 
-replace tyche.local/Tyche/utils => ../utils
+replace Tyche/utils => ../utils

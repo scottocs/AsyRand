@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"tyche.local/Tyche/Tyche/crypto"
-	"tyche.local/Tyche/Tyche/protocol/aba"
-	"tyche.local/Tyche/Tyche/protocol/rbc"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/Tyche/crypto"
+	"Tyche/Tyche/protocol/aba"
+	"Tyche/Tyche/protocol/rbc"
+	"Tyche/utils/p2p"
 )
 
 func TestPVSSOperationProfile(t *testing.T) {

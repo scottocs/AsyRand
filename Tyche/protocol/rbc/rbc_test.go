@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/utils/p2p"
 )
 
 func TestRBCBroadcastDeliversSameValue(t *testing.T) {

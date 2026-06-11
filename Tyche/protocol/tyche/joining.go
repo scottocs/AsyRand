@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"sort"
 
-	"tyche.local/Tyche/Tyche/crypto"
-	"tyche.local/Tyche/Tyche/protocol/aba"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/Tyche/crypto"
+	"Tyche/Tyche/protocol/aba"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

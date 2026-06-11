@@ -8,7 +8,7 @@ import (
 	"sort"
 	"sync"
 
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/pairing/bn256"
 	"go.dedis.ch/kyber/v3/proof/dleq"

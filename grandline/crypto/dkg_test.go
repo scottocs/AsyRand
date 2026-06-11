@@ -3,7 +3,7 @@ package crypto
 import (
 	"testing"
 
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/utils/p2p"
 )
 
 func TestPedersenDKGFeedsThresholdCoin(t *testing.T) {

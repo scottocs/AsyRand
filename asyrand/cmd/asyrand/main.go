@@ -5,7 +5,7 @@ import (
 	"crypto/ed25519"
 	"flag"
 	"fmt"
-	asig "tyche.local/Tyche/asyrand/crypto"
+	asig "Tyche/asyrand/crypto"
 	"log"
 	"net"
 	"sort"
@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tyche.local/Tyche/asyrand/config"
-	asyrand "tyche.local/Tyche/asyrand/protocol"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/asyrand/config"
+	asyrand "Tyche/asyrand/protocol"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

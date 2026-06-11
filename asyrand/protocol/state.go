@@ -3,8 +3,8 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
-	asig "tyche.local/Tyche/asyrand/crypto"
-	"tyche.local/Tyche/utils/p2p"
+	asig "Tyche/asyrand/crypto"
+	"Tyche/utils/p2p"
 	"sort"
 	"sync"
 )

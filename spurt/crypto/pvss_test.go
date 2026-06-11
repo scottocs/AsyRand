@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

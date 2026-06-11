@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"tyche.local/Tyche/Tyche/crypto"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/Tyche/crypto"
+	"Tyche/utils/p2p"
 )
 
 const Protocol = "rbc"

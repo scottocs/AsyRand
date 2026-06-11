@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"tyche.local/Tyche/Tyche/crypto"
-	"tyche.local/Tyche/Tyche/protocol/aba"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/Tyche/crypto"
+	"Tyche/Tyche/protocol/aba"
+	"Tyche/utils/p2p"
 )
 
 func TestBeaconChurnCrashAndJoin10000Epochs(t *testing.T) {

@@ -1,10 +1,10 @@
-module tyche.local/Tyche/Tyche
+module Tyche/Tyche
 
 go 1.24.0
 
 require go.dedis.ch/kyber/v3 v3.1.0
 
-require tyche.local/Tyche/utils v0.0.0
+require Tyche/utils v0.0.0
 
 require (
 	go.dedis.ch/fixbuf v1.0.3 // indirect
@@ -13,4 +13,4 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 )
 
-replace tyche.local/Tyche/utils => ../utils
+replace Tyche/utils => ../utils

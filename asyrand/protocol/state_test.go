@@ -3,8 +3,8 @@ package protocol
 import (
 	"context"
 	"crypto/ed25519"
-	asig "tyche.local/Tyche/asyrand/crypto"
-	"tyche.local/Tyche/utils/p2p"
+	asig "Tyche/asyrand/crypto"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 	"testing"
 	"time"

@@ -14,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"tyche.local/Tyche/Tyche/crypto"
-	"tyche.local/Tyche/Tyche/protocol/aba"
-	"tyche.local/Tyche/Tyche/protocol/rbc"
-	"tyche.local/Tyche/utils/cryptoexec"
-	"tyche.local/Tyche/utils/p2p"
+	"Tyche/Tyche/crypto"
+	"Tyche/Tyche/protocol/aba"
+	"Tyche/Tyche/protocol/rbc"
+	"Tyche/utils/cryptoexec"
+	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 
