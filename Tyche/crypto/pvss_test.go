@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 func TestSilentSetupPVSSVerifyPreReconAndRecon(t *testing.T) {

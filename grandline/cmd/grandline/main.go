@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	config "github.com/scottocs/Tyche/grandline/config"
-	asig "github.com/scottocs/Tyche/grandline/crypto"
-	grandline "github.com/scottocs/Tyche/grandline/protocol"
-	"github.com/scottocs/Tyche/utils/p2p"
+	config "tyche.local/Tyche/grandline/config"
+	asig "tyche.local/Tyche/grandline/crypto"
+	grandline "tyche.local/Tyche/grandline/protocol"
+	"tyche.local/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

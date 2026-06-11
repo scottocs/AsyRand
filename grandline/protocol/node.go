@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	asig "github.com/scottocs/Tyche/grandline/crypto"
-	"github.com/scottocs/Tyche/utils/cryptoexec"
-	"github.com/scottocs/Tyche/utils/p2p"
+	asig "tyche.local/Tyche/grandline/crypto"
+	"tyche.local/Tyche/utils/cryptoexec"
+	"tyche.local/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

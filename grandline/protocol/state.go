@@ -6,8 +6,8 @@ import (
 	"sort"
 	"sync"
 
-	asig "github.com/scottocs/Tyche/grandline/crypto"
-	"github.com/scottocs/Tyche/utils/p2p"
+	asig "tyche.local/Tyche/grandline/crypto"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 type Beacon struct {

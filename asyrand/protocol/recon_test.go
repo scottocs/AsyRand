@@ -5,9 +5,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	asig "github.com/scottocs/Tyche/asyrand/crypto"
-	"github.com/scottocs/Tyche/utils/cryptoexec"
-	"github.com/scottocs/Tyche/utils/p2p"
+	asig "tyche.local/Tyche/asyrand/crypto"
+	"tyche.local/Tyche/utils/cryptoexec"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 type countingPVSS struct {

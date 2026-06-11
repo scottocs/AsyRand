@@ -265,18 +265,18 @@ def render_svg(
 ) -> str:
     max_epoch = resolved_epoch_limit(events, meta, epoch_limit)
 
-    width, height = 1280, 305
+    width, height = 1280, 255
     left, right = 145, 35
     rows = {
-        "stop_produce": 75,
-        "aba_deleted": 125,
-        "joining_proposal": 175,
-        "joined": 225,
+        "stop_produce": 35,
+        "aba_deleted": 85,
+        "joining_proposal": 135,
+        "joined": 185,
     }
     labels = {
         "stop_produce": "scheduled stop",
         "aba_deleted": "removal applied",
-        "joining_proposal": "join proposal (not active)",
+        "joining_proposal": "join proposal",
         "joined": "join activated",
     }
     colors = {
@@ -289,28 +289,17 @@ def render_svg(
     def x(epoch: int) -> float:
         return left + (width - left - right) * epoch / max_epoch
 
-    final_removed = meta.get("removed", "?")
-    subtitle = (
-        f"N={meta.get('nodes', '?')} queue_len={meta.get('queue_len', '?')} "
-        f"epochs={max_epoch} scheduled={visible_event_count(events, 'stop_produce', max_epoch)} "
-        f"removals={visible_event_count(events, 'aba_deleted', max_epoch)} final_removed={final_removed} "
-        f"join_proposals={visible_event_count(events, 'joining_proposal', max_epoch)} "
-        f"activated_joins={visible_event_count(events, 'joined', max_epoch)} final_n={meta.get('final_n', '?')}"
-    )
-
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">']
     svg.append('<rect width="100%" height="100%" fill="white"/>')
-    svg.append(f'<text x="145" y="30" font-family="Arial" font-size="20" font-weight="700">{title}</text>')
-    svg.append(f'<text x="145" y="52" font-family="Arial" font-size="12" fill="#4b5563">{subtitle}</text>')
 
     tick_step = max(20, max_epoch // 10)
     for tick in range(0, max_epoch + 1, tick_step):
         xx = x(tick)
-        svg.append(f'<line x1="{xx:.1f}" y1="60" x2="{xx:.1f}" y2="255" stroke="#e5e7eb"/>')
-        svg.append(f'<text x="{xx:.1f}" y="280" text-anchor="middle" font-family="Arial" font-size="11">{tick}</text>')
+        svg.append(f'<line x1="{xx:.1f}" y1="20" x2="{xx:.1f}" y2="215" stroke="#e5e7eb"/>')
+        svg.append(f'<text x="{xx:.1f}" y="240" text-anchor="middle" font-family="Arial" font-size="11">{tick}</text>')
 
     for kind, y in rows.items():
-        svg.append(f'<text x="12" y="{y+4}" font-family="Arial" font-size="12">{labels[kind]}</text>')
+        svg.append(f'<text x="42" y="{y+4}" font-family="Arial" font-size="12">{labels[kind]}</text>')
         svg.append(f'<line x1="{left}" y1="{y}" x2="{width-right}" y2="{y}" stroke="#d1d5db"/>')
         for epoch, node in events[kind]:
             if epoch > max_epoch:
@@ -318,16 +307,16 @@ def render_svg(
             xx = x(epoch)
             title = f"<title>{labels[kind]} epoch {epoch}: {node}</title>"
             if kind == "stop_produce":
-                points = f"{xx:.1f},{y-7} {xx-6:.1f},{y+5} {xx+6:.1f},{y+5}"
+                points = f"{xx:.1f},{y-12} {xx-10:.1f},{y+8} {xx+10:.1f},{y+8}"
                 svg.append(f'<polygon points="{points}" fill="{colors[kind]}">{title}</polygon>')
-                svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
+                svg.append(f'<text x="{xx+14:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
             elif kind == "aba_deleted":
-                svg.append(f'<g stroke="{colors[kind]}" stroke-width="2.5" stroke-linecap="round">{title}<line x1="{xx-5:.1f}" y1="{y-5}" x2="{xx+5:.1f}" y2="{y+5}"/><line x1="{xx+5:.1f}" y1="{y-5}" x2="{xx-5:.1f}" y2="{y+5}"/></g>')
+                svg.append(f'<g stroke="{colors[kind]}" stroke-width="3.5" stroke-linecap="round">{title}<line x1="{xx-8:.1f}" y1="{y-8}" x2="{xx+8:.1f}" y2="{y+8}"/><line x1="{xx+8:.1f}" y1="{y-8}" x2="{xx-8:.1f}" y2="{y+8}"/></g>')
             elif kind == "joining_proposal":
-                svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="5" fill="white" stroke="{colors[kind]}" stroke-width="2">{title}</circle>')
-                svg.append(f'<text x="{xx+8:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
+                svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="9" fill="white" stroke="{colors[kind]}" stroke-width="3">{title}</circle>')
+                svg.append(f'<text x="{xx+14:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
             else:
-                svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="5" fill="{colors[kind]}">{title}</circle>')
+                svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="9" fill="{colors[kind]}">{title}</circle>')
 
     svg.append("</svg>")
     return "\n".join(svg)
@@ -341,8 +330,8 @@ def render_membership_svg(
     epoch_limit: int | None = None,
 ) -> str:
     max_epoch = resolved_epoch_limit(events, meta, epoch_limit)
-    width, height = 1280, 300
-    left, right, top, bottom = 80, 35, 65, 45
+    width, height = 1280, 245
+    left, right, top, bottom = 80, 35, 20, 45
     plot_w = width - left - right
     plot_h = height - top - bottom
     max_n = max([int(row["active_n"]) for row in series] + [int(meta.get("nodes", 0) or 0), 1])
@@ -377,12 +366,6 @@ def render_membership_svg(
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">']
     svg.append('<rect width="100%" height="100%" fill="white"/>')
-    svg.append(f'<text x="{left}" y="30" font-family="Arial" font-size="20" font-weight="700">{title} membership size</text>')
-    svg.append(
-        f'<text x="{left}" y="52" font-family="Arial" font-size="12" fill="#4b5563">'
-        f'epochs={max_epoch} initial_n={meta.get("initial_n", meta.get("nodes", "?"))} final_n={meta.get("final_n", "?")} final_f={meta.get("final_f", "?")} '
-        f'membership_changes={meta.get("membership_changes", "?")}</text>'
-    )
     for tick in range(y_min, y_max + 1):
         yy = y(tick)
         svg.append(f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" y2="{yy:.1f}" stroke="#eef2f7"/>')

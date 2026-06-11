@@ -9,8 +9,8 @@ import (
 	"os"
 	"sort"
 
-	asig "github.com/scottocs/Tyche/spurt/crypto"
-	"github.com/scottocs/Tyche/utils/p2p"
+	asig "tyche.local/Tyche/spurt/crypto"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 type Peer struct {

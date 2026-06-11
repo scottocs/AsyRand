@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scottocs/Tyche/Tyche/crypto"
-	"github.com/scottocs/Tyche/Tyche/protocol/aba"
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/Tyche/crypto"
+	"tyche.local/Tyche/Tyche/protocol/aba"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 type beaconTestResult struct {

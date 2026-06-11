@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/scottocs/Tyche/spurt/crypto"
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/spurt/crypto"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 const Protocol = "rbc"

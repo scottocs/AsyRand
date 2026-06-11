@@ -3,7 +3,7 @@ package crypto
 import (
 	"bytes"
 	"fmt"
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/share"
 	"testing"

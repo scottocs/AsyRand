@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 func TestPVSSShareVerifyCostScales(t *testing.T) {

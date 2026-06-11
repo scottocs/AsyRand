@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 func TestScrapeDDHVerifyPreReconAndRecon(t *testing.T) {

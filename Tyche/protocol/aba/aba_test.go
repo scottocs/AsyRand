@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 func TestOptimisticPathDecidesTrue(t *testing.T) {

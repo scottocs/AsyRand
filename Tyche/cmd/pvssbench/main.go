@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scottocs/Tyche/Tyche/crypto"
-	"github.com/scottocs/Tyche/utils/p2p"
+	"tyche.local/Tyche/Tyche/crypto"
+	"tyche.local/Tyche/utils/p2p"
 )
 
 type sampleResult struct {
