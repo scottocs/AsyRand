@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 from pathlib import Path
 
@@ -10,8 +11,8 @@ from pathlib import Path
 EVENT_KEYS = ("stop_produce", "aba_deleted", "joining_proposal", "joined")
 RECONFIG_LOG_DIRS = ("tyche-reconfig", "tyche-scrape-reconfig")
 PROTOCOL_TITLES = {
-    "tyche-reconfig": "Tyche AWS reconfiguration timeline",
-    "tyche-scrape-reconfig": "Tyche-Scrape AWS reconfiguration timeline",
+    "tyche-reconfig": "Tyche reconfiguration timeline",
+    "tyche-scrape-reconfig": "Tyche-Scrape reconfiguration timeline",
 }
 
 
@@ -203,6 +204,43 @@ def extract_log_events(log_dir: Path) -> tuple[dict[str, list[tuple[int, str]]],
     return {key: sorted(value.values(), key=node_sort_key) for key, value in events.items()}, meta
 
 
+def enrich_meta_from_run_config(run_dir: Path, meta: dict[str, int]) -> None:
+    config_path = run_dir / "run_config.json"
+    if not config_path.is_file():
+        return
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    mappings = {
+        "nodes": "nodes",
+        "initial_n": "initial_n",
+        "epochs": "epochs",
+        "queue_len": "queue_len",
+        "removal_expiration_ms": "removal_expiration_ms",
+    }
+    for meta_key, config_key in mappings.items():
+        value = config.get(config_key)
+        if isinstance(value, int) and value >= 0:
+            meta.setdefault(meta_key, value)
+    if "initial_n" not in meta and isinstance(config.get("nodes"), int):
+        meta["initial_n"] = config["nodes"]
+
+
+def run_title(run_dir: Path, log_dir: Path) -> str:
+    base = PROTOCOL_TITLES.get(log_dir.name, f"{log_dir.name} reconfiguration timeline")
+    config_path = run_dir / "run_config.json"
+    if not config_path.is_file():
+        return base
+    try:
+        kind = json.loads(config_path.read_text(encoding="utf-8")).get("kind")
+    except (OSError, json.JSONDecodeError):
+        return base
+    if isinstance(kind, str) and kind:
+        return f"{base} ({kind})"
+    return base
+
+
 def node_universe(meta: dict[str, int | str]) -> list[str]:
     n = meta.get("initial_n") or meta.get("nodes")
     if isinstance(n, int) and n > 0:
@@ -301,7 +339,7 @@ def render_svg(
     for kind, y in rows.items():
         svg.append(f'<text x="42" y="{y+4}" font-family="Arial" font-size="12">{labels[kind]}</text>')
         svg.append(f'<line x1="{left}" y1="{y}" x2="{width-right}" y2="{y}" stroke="#d1d5db"/>')
-        for epoch, node in events[kind]:
+        for event_index, (epoch, node) in enumerate(events[kind]):
             if epoch > max_epoch:
                 continue
             xx = x(epoch)
@@ -314,7 +352,8 @@ def render_svg(
                 svg.append(f'<g stroke="{colors[kind]}" stroke-width="3.5" stroke-linecap="round">{title}<line x1="{xx-8:.1f}" y1="{y-8}" x2="{xx+8:.1f}" y2="{y+8}"/><line x1="{xx+8:.1f}" y1="{y-8}" x2="{xx-8:.1f}" y2="{y+8}"/></g>')
             elif kind == "joining_proposal":
                 svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="9" fill="white" stroke="{colors[kind]}" stroke-width="3">{title}</circle>')
-                svg.append(f'<text x="{xx+14:.1f}" y="{y+4}" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
+                label_y = y - 14 if event_index % 2 == 0 else y + 22
+                svg.append(f'<text x="{xx:.1f}" y="{label_y}" text-anchor="middle" font-family="Arial" font-size="10" fill="{colors[kind]}">{node_label(node)}</text>')
             else:
                 svg.append(f'<circle cx="{xx:.1f}" cy="{y}" r="9" fill="{colors[kind]}">{title}</circle>')
 
@@ -450,9 +489,10 @@ def main() -> None:
     args = parse_args()
     run_dir, log_dir = resolve_dirs(args.path)
     events, meta = extract_log_events(log_dir)
+    enrich_meta_from_run_config(run_dir, meta)
     output = args.output.resolve() if args.output else default_output_path(run_dir, log_dir)
     output.parent.mkdir(parents=True, exist_ok=True)
-    title = PROTOCOL_TITLES.get(log_dir.name, f"{log_dir.name} AWS reconfiguration timeline")
+    title = run_title(run_dir, log_dir)
     output.write_text(render_svg(events, meta, title, args.epochs), encoding="utf-8")
     series = membership_series(events, meta)
     max_epoch = resolved_epoch_limit(events, meta, args.epochs)

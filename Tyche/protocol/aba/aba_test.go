@@ -2,9 +2,11 @@ package aba
 
 import (
 	"context"
+	"crypto/ed25519"
 	"testing"
 	"time"
 
+	tychecrypto "Tyche/Tyche/crypto"
 	"Tyche/utils/p2p"
 )
 
@@ -150,6 +152,66 @@ func TestBValSendsAuxOncePerRound(t *testing.T) {
 			t.Fatalf("AUX broadcast count = %d, want 1", stats.SentMessages)
 		case <-time.After(time.Millisecond):
 		}
+	}
+}
+
+func TestAuthenticatedABARejectsForgedAndCrossConfigInput(t *testing.T) {
+	ctx := context.Background()
+	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
+	private := make(map[p2p.NodeID]ed25519.PrivateKey)
+	public := make(map[string]ed25519.PublicKey)
+	for _, id := range ids {
+		key, err := tychecrypto.GenerateIdentityKeyPair(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		private[id], public[string(id)] = key.Private, key.Public
+	}
+	a, err := NewAuthenticated("n0", 4, "control", ids, 1, p2p.NewMemoryNetwork().NewTransport("n0", 32), private["n0"], public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := EpochInstanceFor(4, 1, "n2", 1)
+	body := InputMessage{Value: true}
+	body.Signature, err = tychecrypto.SignTranscript("n1", private["n1"], a.payloadTranscript("INPUT", instance, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := p2p.NewMessage(Protocol, "INPUT", instance, "n1", "n0", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Handle(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Status(instance).Inputs; got != 1 {
+		t.Fatalf("valid authenticated input count=%d", got)
+	}
+
+	replayedInstance := EpochInstanceFor(5, 1, "n2", 1)
+	replay, err := p2p.NewMessage(Protocol, "INPUT", replayedInstance, "n1", "n0", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Handle(ctx, replay); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Status(replayedInstance).Inputs; got != 0 {
+		t.Fatalf("cross-configuration replay counted: %d", got)
+	}
+
+	forged := body
+	forged.Value = false
+	forgedMsg, err := p2p.NewMessage(Protocol, "INPUT", instance, "n1", "n0", forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Handle(ctx, forgedMsg); err != nil {
+		t.Fatal(err)
+	}
+	status := a.Status(instance)
+	if status.InputFalse != 0 || status.Inputs != 1 {
+		t.Fatalf("tampered payload counted: %+v", status)
 	}
 }
 

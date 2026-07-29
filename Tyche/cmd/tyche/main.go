@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -67,7 +68,6 @@ func main() {
 	lingerMS := flag.Int("linger-ms", 0, "milliseconds to keep the node alive after final metrics before exiting")
 	maxPool := flag.Int("max-pool", 4, "maximum concurrent cryptographic worker tasks per node")
 	transportBufferFlag := flag.Int("transport-buffer", 0, "transport inbox buffer length; defaults to a size scaled by n")
-	removalExpirationMS := flag.Int("removal-expiration-ms", 0, "epoch-control ABA false-input timeout in milliseconds; defaults to a size scaled by n")
 	pvss := flag.String("pvss", "o1", "PVSS backend: o1 or scrape")
 	reconfigEvents := flag.Int("reconfig-events", 0, "number of deterministic reconfiguration events")
 	reconfigMinN := flag.Int("reconfig-min-n", 0, "minimum membership size for stop-producing reconfiguration events")
@@ -81,9 +81,9 @@ func main() {
 		nodeID: p2p.NodeID(*nodeID), peersRaw: *peersRaw, listenAddr: *listenAddr, listenIP: *listenIP,
 		queueLen: *queueLen, producerMS: *producerMS, prefillMS: *prefillMS,
 		epochTimeoutMS: *epochTimeoutMS, reportMS: *reportMS, lingerMS: *lingerMS, maxPool: *maxPool,
-		transportBuffer: *transportBufferFlag, removalExpirationMS: *removalExpirationMS,
-		pvss:           strings.ToLower(*pvss),
-		reconfigEvents: *reconfigEvents, reconfigMinN: *reconfigMinN, reconfigMaxN: *reconfigMaxN, reconfigSeed: *reconfigSeed,
+		transportBuffer: *transportBufferFlag,
+		pvss:            strings.ToLower(*pvss),
+		reconfigEvents:  *reconfigEvents, reconfigMinN: *reconfigMinN, reconfigMaxN: *reconfigMaxN, reconfigSeed: *reconfigSeed,
 		reconfigCrashGraceMS: *reconfigCrashGraceMS,
 	}
 	if err := run(opts); err != nil {
@@ -109,7 +109,6 @@ type runOptions struct {
 	lingerMS             int
 	maxPool              int
 	transportBuffer      int
-	removalExpirationMS  int
 	pvss                 string
 	reconfigEvents       int
 	reconfigMinN         int
@@ -180,7 +179,6 @@ func run(opts runOptions) error {
 		return fmt.Errorf("-reconfig-crash-grace-ms must be non-negative")
 	}
 	opts.transportBuffer = resolveTransportBuffer(opts)
-	opts.removalExpirationMS = resolveRemovalExpirationMS(opts)
 	lookaheadExpirationMS := resolveLookaheadExpirationMS(opts)
 	if opts.transport == "tcp" {
 		return runTCP(opts, lookaheadExpirationMS)
@@ -210,18 +208,17 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 			return err
 		}
 		node, err := tyche.NewNode(tyche.Config{
-			ID:                    id,
-			Members:               initialIDs,
-			F:                     opts.f,
-			QueueLen:              opts.queueLen,
-			PVSS:                  scheme,
-			PVSSBackend:           opts.pvss,
-			CryptoWorkers:         opts.maxPool,
-			RemovalExpiration:     time.Duration(opts.removalExpirationMS) * time.Millisecond,
-			LookaheadExpiration:   time.Duration(lookaheadExpirationMS) * time.Millisecond,
-			CurrentMissingRemoval: opts.reconfigEvents > 0,
-			ExplicitRemovalOnly:   opts.reconfigEvents > 0,
-			Transport:             net.NewTransport(id, opts.transportBuffer),
+			ID:                            id,
+			Members:                       initialIDs,
+			Learner:                       !containsID(initialIDs, id),
+			F:                             opts.f,
+			QueueLen:                      opts.queueLen,
+			PVSS:                          scheme,
+			PVSSBackend:                   opts.pvss,
+			CryptoWorkers:                 opts.maxPool,
+			LookaheadExpiration:           time.Duration(lookaheadExpirationMS) * time.Millisecond,
+			Transport:                     net.NewTransport(id, opts.transportBuffer),
+			InsecureDeterministicIdentity: true,
 		})
 		if err != nil {
 			return err
@@ -229,14 +226,21 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 		if !containsID(initialIDs, id) {
 			node.SetProducing(false)
 		}
-		node.Start(runCtx)
-		node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 		nodes = append(nodes, node)
+	}
+	// Register every in-memory transport before any producer broadcasts its
+	// first RBC VAL. Starting producers inside the construction loop can strand
+	// early sequence numbers before an n-f receiver quorum exists.
+	for _, node := range nodes {
+		node.Start(runCtx)
+	}
+	for _, node := range nodes {
+		node.StartProducer(runCtx, time.Duration(opts.producerMS)*time.Millisecond)
 	}
 
 	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
-	fmt.Printf("config protocol=tyche-v1 transport=memory nodes=%d initial_n=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d lookahead_expiration_ms=%d pvss=%s\n",
-		opts.n, opts.initialN, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, lookaheadExpirationMS, opts.pvss)
+	fmt.Printf("config protocol=tyche-v2 transport=memory nodes=%d initial_n=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d lookahead_expiration_ms=%d pvss=%s\n",
+		opts.n, opts.initialN, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, lookaheadExpirationMS, opts.pvss)
 
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
@@ -262,19 +266,6 @@ func runMemory(opts runOptions, lookaheadExpirationMS int) error {
 		activeNodes := currentMemberNodes(nodes)
 		if len(activeNodes) == 0 {
 			return fmt.Errorf("epoch %d: no active member nodes remain", epoch)
-		}
-		for _, node := range activeNodes {
-			snapshot := node.DebugSnapshot()
-			if stoppedReady(stopped, snapshot.Source, epoch) {
-				seq, applied, err := node.ForceReconfigurationRemoval(uint64(epoch), snapshot.Source)
-				if err != nil {
-					return fmt.Errorf("epoch %d: force reconfiguration removal for %s: %w", epoch, snapshot.Source, err)
-				}
-				if applied {
-					fmt.Printf("reconfig_aba_false event=aba_false epoch=%d node=%s seq=%d removal_seq=%d observer=%s completed=%d config_version=%d\n",
-						epoch, snapshot.Source, seq, seq, node.ID, snapshot.Completed, snapshot.ConfigVersion)
-				}
-			}
 		}
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
 		results := make(chan result, len(activeNodes))
@@ -361,8 +352,9 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 	}
 	transport := p2p.NewTCPTransport(opts.nodeID, listen, peers, opts.transportBuffer)
 	node, err := tyche.NewNode(tyche.Config{
-		ID: opts.nodeID, Members: initialIDs, F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool,
-		RemovalExpiration: time.Duration(opts.removalExpirationMS) * time.Millisecond, LookaheadExpiration: time.Duration(lookaheadExpirationMS) * time.Millisecond, CurrentMissingRemoval: opts.reconfigEvents > 0, ExplicitRemovalOnly: opts.reconfigEvents > 0, Transport: transport,
+		ID: opts.nodeID, Members: initialIDs, Learner: !containsID(initialIDs, opts.nodeID), F: opts.f, QueueLen: opts.queueLen, PVSS: scheme, PVSSBackend: opts.pvss, CryptoWorkers: opts.maxPool,
+		LookaheadExpiration: time.Duration(lookaheadExpirationMS) * time.Millisecond, Transport: transport,
+		InsecureDeterministicIdentity: true,
 	})
 	if err != nil {
 		return err
@@ -382,8 +374,8 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 
 	nodes := []*tyche.Node{node}
 	epochAttemptTimeout := tycheEpochAttemptTimeout(opts)
-	fmt.Printf("config protocol=tyche-v1 transport=tcp node=%s listen=%s nodes=%d initial_n=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d removal_expiration_ms=%d lookahead_expiration_ms=%d pvss=%s peers=%v\n",
-		opts.nodeID, listen, opts.n, opts.initialN, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, opts.removalExpirationMS, lookaheadExpirationMS, opts.pvss, peers)
+	fmt.Printf("config protocol=tyche-v2 transport=tcp node=%s listen=%s nodes=%d initial_n=%d f=%d epochs=%d queue_len=%d producer_ms=%d epoch_timeout_ms=%d epoch_attempt_timeout_ms=%d report_ms=%d crypto_workers=%d transport_buffer=%d lookahead_expiration_ms=%d pvss=%s peers=%v\n",
+		opts.nodeID, listen, opts.n, opts.initialN, opts.f, opts.epochs, opts.queueLen, opts.producerMS, opts.epochTimeoutMS, int(epochAttemptTimeout/time.Millisecond), opts.reportMS, opts.maxPool, opts.transportBuffer, lookaheadExpirationMS, opts.pvss, peers)
 	stats := &runStats{}
 	stopReport := startReporter(runCtx, nodes, stats, time.Duration(opts.reportMS)*time.Millisecond)
 	defer stopReport()
@@ -423,9 +415,6 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 					if _, _, err := handleReconfigEvent(runCtx, node, event, stopped, opts, epochAttemptTimeout); err != nil {
 						return err
 					}
-					if err := forceStoppedSourceRemoval(node, stopped, opts.nodeID, uint64(epoch), "observer-scheduled"); err != nil {
-						return err
-					}
 				case reconfigJoin:
 					var err error
 					_, eventJoinActivation, err = handleReconfigEvent(runCtx, node, event, stopped, opts, epochAttemptTimeout)
@@ -453,9 +442,6 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 			catchupTarget := uint64(epoch)
 			if selfJoinCatchupTarget > catchupTarget {
 				urgentJoin = true
-			}
-			if err := forceStoppedSourceRemoval(node, stopped, opts.nodeID, catchupTarget, "observer-catchup"); err != nil {
-				return err
 			}
 			waitTimeout := reconfigRemovedCatchupTimeout(epochAttemptTimeout, urgentJoin || futureJoin)
 			if err := waitForCompletedEpoch(runCtx, node, catchupTarget, waitTimeout); err != nil {
@@ -510,9 +496,6 @@ func runTCP(opts runOptions, lookaheadExpirationMS int) error {
 				return fmt.Errorf("node %s failed to catch up after rejoin before epoch %d: completed=%d target=%d: %w",
 					opts.nodeID, epoch, node.CompletedEpoch(), catchupTarget, err)
 			}
-		}
-		if err := forceStoppedSourceRemoval(node, stopped, opts.nodeID, uint64(epoch), "scheduled"); err != nil {
-			return err
 		}
 		epochCtx, cancelEpoch := context.WithTimeout(runCtx, epochAttemptTimeout)
 		targetEpoch := uint64(epoch)
@@ -934,7 +917,7 @@ func currentMembersContain(node *tyche.Node, id p2p.NodeID) bool {
 }
 
 func ensureJoinKey(node *tyche.Node, joiner p2p.NodeID, eventEpoch int, joinDelay int, opts runOptions) (tyche.JoinRequest, bool, error) {
-	members, f, version, completed := node.MembershipSnapshot()
+	members, f, version, _ := node.MembershipSnapshot()
 	if containsID(members, joiner) {
 		return tyche.JoinRequest{}, false, nil
 	}
@@ -965,15 +948,24 @@ func ensureJoinKey(node *tyche.Node, joiner p2p.NodeID, eventEpoch int, joinDela
 	if err != nil {
 		return tyche.JoinRequest{}, false, err
 	}
+	identitySeed := crypto.DomainHash("Tyche/InsecureTestIdentity/v1", []byte(joiner))
+	identity, err := crypto.IdentityKeyPairFromSeed(identitySeed[:32])
+	if err != nil {
+		return tyche.JoinRequest{}, false, err
+	}
+	checkpoint := node.Checkpoint()
 	req := tyche.JoinRequest{
 		ConfigVersion:   version,
-		ContextEpoch:    completed,
+		ParentHash:      tyche.HashCertifiedState(checkpoint.State),
 		Joiner:          joiner,
-		PublicKey:       string(joiner) + "-pk",
+		PublicKey:       hex.EncodeToString(identity.Public),
 		CandidateParams: pp,
 		Object:          tyche.Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
-		FirstCoinEpoch:  completed + uint64(max(3, joinDelay/2)),
-		ActivationEpoch: completed + uint64(joinDelay),
+		Checkpoint:      checkpoint,
+	}
+	req, err = tyche.SignLearnerReady(req, identity.Private)
+	if err != nil {
+		return tyche.JoinRequest{}, false, err
 	}
 	if f < 0 {
 		return tyche.JoinRequest{}, false, fmt.Errorf("invalid current fault threshold %d", f)
@@ -1062,12 +1054,12 @@ func handleReconfigEvent(ctx context.Context, node *tyche.Node, event reconfigEv
 		}
 		if proposer {
 			members, f, version, completed := node.MembershipSnapshot()
-			fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s completed=%d config_version=%d n_before=%d f_before=%d activation_epoch=%d members_before=%v race=%s\n",
-				event.Epoch, event.Node, completed, version, len(members), f, req.ActivationEpoch, sortedNodeIDs(members), event.Race)
+			fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s completed=%d config_version=%d n_before=%d f_before=%d checkpoint=%s members_before=%v race=%s\n",
+				event.Epoch, event.Node, completed, version, len(members), f, req.Checkpoint.Digest(), sortedNodeIDs(members), event.Race)
 			if err := node.ProposeJoin(ctx, req); err != nil {
 				return false, 0, fmt.Errorf("propose reconfiguration join for %s: %w", event.Node, err)
 			}
-			return false, req.ActivationEpoch, nil
+			return false, completed + 1, nil
 		}
 		return false, 0, nil
 	default:
@@ -1134,8 +1126,8 @@ func handleMemoryReconfigEvent(ctx context.Context, nodes []*tyche.Node, event r
 			}
 			if isProposer {
 				members, f, version, completed := node.MembershipSnapshot()
-				fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s observer=%s completed=%d config_version=%d n_before=%d f_before=%d activation_epoch=%d members_before=%v race=%s\n",
-					event.Epoch, event.Node, node.ID, completed, version, len(members), f, req.ActivationEpoch, sortedNodeIDs(members), event.Race)
+				fmt.Printf("reconfig_joining event=joining_proposal epoch=%d node=%s observer=%s completed=%d config_version=%d n_before=%d f_before=%d checkpoint=%s members_before=%v race=%s\n",
+					event.Epoch, event.Node, node.ID, completed, version, len(members), f, req.Checkpoint.Digest(), sortedNodeIDs(members), event.Race)
 				proposerReq = req
 				proposer = node
 			}
@@ -1270,9 +1262,6 @@ func catchUpRejoinedNode(ctx context.Context, node *tyche.Node, stopped stoppedR
 	defer cancel()
 	for node.CompletedEpoch() < target {
 		next := node.CompletedEpoch() + 1
-		if err := forceStoppedSourceRemoval(node, stopped, observer, next, "catchup"); err != nil {
-			return err
-		}
 		beacon, err := node.RunEpochAt(catchupCtx, next)
 		if err != nil {
 			return fmt.Errorf("catch up epoch %d: %w", next, err)
@@ -1280,22 +1269,6 @@ func catchUpRejoinedNode(ctx context.Context, node *tyche.Node, stopped stoppedR
 		fmt.Printf("reconfig_catchup epoch=%d node=%s source=%s seq=%d completed=%d\n",
 			beacon.Epoch, observer, beacon.Source, beacon.Seq, node.CompletedEpoch())
 		logReconfigRemovalProgress(node, stopped, reportedRemoved, int(next))
-	}
-	return nil
-}
-
-func forceStoppedSourceRemoval(node *tyche.Node, stopped stoppedReconfigNodes, observer p2p.NodeID, epoch uint64, reason string) error {
-	snapshot := node.DebugSnapshot()
-	if snapshot.NextEpoch != epoch || snapshot.Source == "" || !stoppedReady(stopped, snapshot.Source, int(epoch)) {
-		return nil
-	}
-	seq, applied, err := node.ForceReconfigurationRemoval(epoch, snapshot.Source)
-	if err != nil {
-		return fmt.Errorf("epoch %d: force reconfiguration removal for %s: %w", epoch, snapshot.Source, err)
-	}
-	if applied {
-		fmt.Printf("reconfig_aba_false event=aba_false epoch=%d node=%s seq=%d removal_seq=%d observer=%s completed=%d config_version=%d reason=%s\n",
-			epoch, snapshot.Source, seq, seq, observer, snapshot.Completed, snapshot.ConfigVersion, reason)
 	}
 	return nil
 }
@@ -1367,23 +1340,6 @@ func resolveTransportBuffer(opts runOptions) int {
 	return scaled
 }
 
-func resolveRemovalExpirationMS(opts runOptions) int {
-	if opts.removalExpirationMS > 0 {
-		return opts.removalExpirationMS
-	}
-	raw := strings.TrimSpace(os.Getenv("TYCHE_REMOVAL_EXPIRATION_MS"))
-	if raw != "" {
-		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
-			return value
-		}
-	}
-	// The lookahead object is delivered through RBC and SCRAPE verification.
-	// At large n, the fixed 5s default can fire during startup even though the
-	// next object is already in flight, forcing the epoch-control ABA down the
-	// slow false-input path. Scale conservatively with n.
-	return 5000 * max(1, (opts.n+31)/32)
-}
-
 func resolveLookaheadExpirationMS(opts runOptions) int {
 	raw := strings.TrimSpace(os.Getenv("TYCHE_LOOKAHEAD_EXPIRATION_MS"))
 	if raw != "" {
@@ -1394,7 +1350,7 @@ func resolveLookaheadExpirationMS(opts runOptions) int {
 	if opts.reconfigEvents > 0 {
 		return 10000
 	}
-	return opts.removalExpirationMS
+	return 5000 * max(1, (opts.n+31)/32)
 }
 
 func setupRuntime(n int, initialN int, f int, pvss string) ([]p2p.NodeID, []p2p.NodeID, crypto.PVSSParams, map[p2p.NodeID]crypto.KeyPair, error) {

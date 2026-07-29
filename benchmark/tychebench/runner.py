@@ -655,8 +655,6 @@ def _run_protocol(protocol, options):
             str(options.max_pool),
             "-transport-buffer",
             str(options.transport_buffer),
-            "-removal-expiration-ms",
-            str(options.removal_expiration_ms),
         ]
         if protocol == "tyche-scrape":
             command.extend(["-pvss", "scrape"])
@@ -1293,7 +1291,6 @@ def _remote_command_for_node(protocol, node, options):
             f"-peers {_remote_quote(peers)} -listen 0.0.0.0:{port} "
             f"-queue-len {queue_len} -max-pool {options.max_pool} "
             f"-transport-buffer {options.transport_buffer} "
-            f"-removal-expiration-ms {removal_expiration_ms} "
             f"-producer-ms {options.producer_ms} -prefill-ms {options.prefill_ms} "
             f"-epoch-timeout-ms {options.epoch_timeout_ms} -report-ms {options.report_ms} "
             f"{pvss_arg}{reconfig_arg}{linger_arg} "

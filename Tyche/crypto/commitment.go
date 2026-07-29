@@ -136,6 +136,17 @@ type PVSSScheme interface {
 	ReconFromVerifiedShares(c Commitment, shares []DecryptedShare) ([]byte, error)
 }
 
+func ParamsOf(scheme PVSSScheme) (PVSSParams, error) {
+	switch value := scheme.(type) {
+	case interface{ Params() PublicParams }:
+		return WrapPVSSParams(value.Params()), nil
+	case interface{ Params() ScrapeDDHParams }:
+		return WrapPVSSParams(value.Params()), nil
+	default:
+		return PVSSParams{}, fmt.Errorf("PVSS scheme %T does not expose public parameters", scheme)
+	}
+}
+
 func NewPVSSScheme(id p2p.NodeID, private kyber.Scalar, params any) (PVSSScheme, error) {
 	switch pp := params.(type) {
 	case PVSSParams:

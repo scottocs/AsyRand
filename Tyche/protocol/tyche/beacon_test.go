@@ -3,6 +3,7 @@ package tyche
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"strconv"
 	"testing"
 	"time"
@@ -15,6 +16,22 @@ import (
 type beaconTestResult struct {
 	beacon Beacon
 	err    error
+}
+
+func waitUntil(t *testing.T, ctx context.Context, predicate func() bool) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if predicate() {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
 }
 
 type countingPVSSScheme struct {
@@ -48,6 +65,11 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitStored(t, ctx, nodes, source, obj.Seq)
+	lookahead, err := producer.Produce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStored(t, ctx, nodes, source, lookahead.Seq)
 
 	results := make(chan Beacon, len(nodes))
 	for _, n := range nodes {
@@ -74,10 +96,10 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 				t.Fatalf("weak ready certificate: %+v", b.ReadySenders)
 			}
 			nodes[0].mu.Lock()
-			members := nodes[0].memberSetLocked()
+			parentConfig := nodes[0].Configurations[b.StateQC.ParentConfigVersion]
 			nodes[0].mu.Unlock()
-			if err := crypto.VerifyQuorumCertificate(b.Signature, members, 3); err != nil {
-				t.Fatalf("invalid ready quorum certificate: %v", err)
+			if len(b.StateQC.Signature.Votes) < parentConfig.Q {
+				t.Fatalf("invalid StateQC quorum size: %d", len(b.StateQC.Signature.Votes))
 			}
 		case <-ctx.Done():
 			t.Fatalf("timed out waiting for certified beacon\n%s", dumpNodes(nodes))
@@ -113,6 +135,9 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 	target := nodes[0]
 	counter := &countingPVSSScheme{PVSSScheme: target.PVSS}
 	target.PVSS = counter
+	target.mu.Lock()
+	target.PVSSContexts[target.State.ConfigVersion].Scheme = counter
+	target.mu.Unlock()
 	for i := 0; i < obj.Commitment.Threshold+1; i++ {
 		holder := nodes[i]
 		share, err := holder.PVSS.PreReconVerified(obj.Commitment, holder.ID)
@@ -277,7 +302,7 @@ func TestBeaconAutoProducerRunnerIDsCertifiesEpochsN4(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, PVSS: s, Transport: net.NewTransport(id, 16384)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, PVSS: s, Transport: net.NewTransport(id, 16384), InsecureDeterministicIdentity: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -309,26 +334,6 @@ func TestBeaconAutoProducerRunnerIDsCertifiesEpochsN4(t *testing.T) {
 	}
 }
 
-func TestInstallCertifiedStatePreservesLocalRemovalMarks(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	node := newTestNodes(t, ctx)[0]
-	node.mu.Lock()
-	state := node.stateDigestLocked()
-	state.RmMark["n2"] = -1
-	node.State.RmMark["n2"] = 3
-	marks := copyRemovalMarks(node.State.RmMark)
-	node.installCertifiedStateLocked(state)
-	node.mergeRemovalMarksLocked(marks)
-	got := node.State.RmMark["n2"]
-	node.mu.Unlock()
-
-	if got != 3 {
-		t.Fatalf("removal mark was lost after installing certified state: got %d", got)
-	}
-}
-
 func TestBeaconAutoProducerRunnerIDsCertifiesEpochN16(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -348,7 +353,7 @@ func TestBeaconAutoProducerRunnerIDsCertifiesEpochN16(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: 5, QueueLen: 32, PVSS: s, Transport: net.NewTransport(id, 32768)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: 5, QueueLen: 32, PVSS: s, Transport: net.NewTransport(id, 32768), InsecureDeterministicIdentity: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -402,7 +407,7 @@ func TestRunnerIDNode1ObjectStores(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, PVSS: s, Transport: net.NewTransport(id, 16384)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, PVSS: s, Transport: net.NewTransport(id, 16384), InsecureDeterministicIdentity: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -422,293 +427,208 @@ func TestRunnerIDNode1ObjectStores(t *testing.T) {
 	waitStored(t, ctx, nodes, "node1", 1)
 }
 
-func TestJoinCertificateActivatesMember(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func TestJoinUsesCertifiedJReadyAndStateQC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	nodes := newTestNodes(t, ctx)
-	oldMembers := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	targetMembers := append(append([]p2p.NodeID(nil), oldMembers...), "theta")
-	candidate, targetKeys, err := crypto.Setup("join-epoch", 2, targetMembers)
+	parent := nodes[0].Checkpoint()
+	targetMembers := []p2p.NodeID{"n0", "n1", "n2", "n3", "theta"}
+	params, targetKeys, err := crypto.SetupPVSS(crypto.PVSSO1, "join-v2", 2, targetMembers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	joinerScheme, err := crypto.NewScheme("theta", targetKeys["theta"].Private, candidate)
+	for _, node := range nodes {
+		node.RegisterPVSSKey(params.Epoch(), targetKeys[node.ID].Private)
+	}
+	seed := crypto.DomainHash("Tyche/JoinTestIdentity/v1", []byte("theta"))
+	identity, err := crypto.IdentityKeyPairFromSeed(seed[:32])
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, _, err := joinerScheme.Share("theta", 1, nil)
+	joinerScheme, err := crypto.NewPVSSScheme("theta", targetKeys["theta"].Private, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitment, _, err := joinerScheme.Share("theta", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := JoinRequest{
-		ConfigVersion:   0,
-		ContextEpoch:    0,
+		ConfigVersion:   parent.State.ConfigVersion,
+		ParentHash:      HashCertifiedState(parent.State),
 		Joiner:          "theta",
-		PublicKey:       "theta-pk",
-		CandidateParams: crypto.WrapPVSSParams(candidate),
-		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
-		FirstCoinEpoch:  0,
-		ActivationEpoch: 1,
+		PublicKey:       hex.EncodeToString(identity.Public),
+		CandidateParams: params,
+		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: commitment},
+		Checkpoint:      parent,
 	}
-	rho := JoinDigest(req)
-	tau := TransitionIndex{ConfigVersion: 0, Seq: 1}
-	cert := JoinCertificate{Request: req}
-	for _, n := range nodes[:3] {
-		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, n, tau, rho))
-		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, n, tau, rho, 1))
+	req, err = SignLearnerReady(req, identity.Private)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, n := range nodes {
-		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
+	parentSetup := nodes[0].ConfigurationSetups[parent.State.ConfigVersion]
+	observerPrivate := crypto.KeyPairFromSeed(crypto.DomainHash("Tyche/JoinTestObserver/v1", []byte("theta"))).Private
+	observerScheme, err := crypto.NewPVSSScheme("theta", observerPrivate, parentSetup.Params)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, n := range nodes {
-		if err := n.InstallJoinCertificate(cert); err != nil {
-			t.Fatal(err)
-		}
-		if !contains(n.State.Members, "theta") || !contains(n.State.SCL, "theta") || n.State.ComQ["theta"][1].Producer != "theta" || n.State.ConfigVersion != 1 {
-			t.Fatalf("join not installed on %s: %+v", n.ID, n.State)
-		}
-		if n.State.Seqs["theta"] != 0 || n.State.RmMark["theta"] != -1 {
-			t.Fatalf("joiner state not initialized on %s: seq=%d rm=%d", n.ID, n.State.Seqs["theta"], n.State.RmMark["theta"])
-		}
-		if n.RBC.N != len(targetMembers) || n.ABA.N != len(targetMembers) || n.RBC.F != n.State.F || n.ABA.F != n.State.F {
-			t.Fatalf("protocol thresholds not updated on %s: stateF=%d rbc=(%d,%d) aba=(%d,%d)",
-				n.ID, n.State.F, n.RBC.N, n.RBC.F, n.ABA.N, n.ABA.F)
-		}
-		select {
-		case got := <-n.Joins:
-			if got.Request.Joiner != "theta" {
-				t.Fatalf("unexpected join event on %s: %+v", n.ID, got.Request)
+	parentIdentityKeys := identityKeysForMembers(nodes[0].Configurations[parent.State.ConfigVersion], parent.State.Members)
+	parentIdentityKeys["theta"] = identity.Public
+	learner, err := NewNode(Config{
+		ID: "theta", Members: parent.State.Members, Learner: true, F: parent.State.F,
+		QueueLen: 8, PVSS: observerScheme, Transport: p2p.NewMemoryNetwork().NewTransport("theta", 1024),
+		IdentityPrivate: identity.Private, IdentityPublicKeys: parentIdentityKeys,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	learner.RegisterPVSSKey(params.Epoch(), targetKeys["theta"].Private)
+	if err := learner.HandleJoinRequest(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodes[0].ProposeJoin(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, ctx, func() bool {
+		for _, node := range nodes {
+			node.mu.Lock()
+			ready := node.pendingJReady != nil
+			node.mu.Unlock()
+			if !ready {
+				return false
 			}
-		default:
-			t.Fatalf("missing join event on %s", n.ID)
 		}
-		if err := n.InstallJoinCertificate(cert); err != nil {
+		return true
+	})
+
+	parentState := CloneCertifiedState(nodes[0].Certified)
+	var child CertifiedState
+	for i, node := range nodes {
+		node.mu.Lock()
+		next, err := node.entropySuccessorWithControlLocked(node.Certified, []byte("join-ready-random"), "n0", 1)
+		node.mu.Unlock()
+		if err != nil {
 			t.Fatal(err)
 		}
-		if n.State.ConfigVersion != 1 {
-			t.Fatalf("duplicate join changed config version on %s: %d", n.ID, n.State.ConfigVersion)
+		if i == 0 {
+			child = next
+		} else if HashCertifiedState(next) != HashCertifiedState(child) {
+			t.Fatal("nodes constructed different JReady states")
 		}
+	}
+	config := nodes[0].Configurations[parentState.ConfigVersion]
+	var votes []crypto.SignedVote
+	for _, node := range nodes[:config.Q] {
+		vote, err := SignStateVote(node.ID, node.IdentityPrivate, config, TransitionEntropy, HashCertifiedState(parentState), HashCertifiedState(child))
+		if err != nil {
+			t.Fatal(err)
+		}
+		votes = append(votes, vote)
+	}
+	qc, err := BuildStateQC(config, TransitionEntropy, HashCertifiedState(parentState), HashCertifiedState(child), votes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range nodes {
+		node.mu.Lock()
+		node.installCertifiedEntropyLocked(child, qc)
+		node.mu.Unlock()
+	}
+	if err := learner.InstallCheckpoint(nodes[0].Checkpoint()); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, len(nodes))
+	for _, node := range nodes {
+		go func(node *Node) { results <- node.runCertifiedJoin(ctx) }(node)
+	}
+	for range nodes {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, node := range nodes {
+		if !contains(node.State.Members, "theta") || node.State.ConfigVersion != 1 || node.State.Epoch != child.Epoch {
+			t.Fatalf("JOIN StateQC not installed on %s: version=%d epoch=%d members=%v", node.ID, node.State.ConfigVersion, node.State.Epoch, node.State.Members)
+		}
+	}
+	nodes[0].mu.Lock()
+	installed := StateCertificateMessage{Child: CloneCertifiedState(nodes[0].Certified), QC: *nodes[0].StateCertificate}
+	nodes[0].mu.Unlock()
+	if err := learner.InstallStateCertificate(installed); err != nil {
+		t.Fatal(err)
+	}
+	learner.mu.Lock()
+	activated := learner.RBC != nil && learner.ABA != nil && contains(learner.Certified.Members, learner.ID)
+	learner.mu.Unlock()
+	if !activated {
+		t.Fatal("learner did not activate from JOIN StateQC")
 	}
 }
 
-func TestJoinCertificateActivatesOnlyAtFutureEpoch(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	oldMembers := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	targetMembers := append(append([]p2p.NodeID(nil), oldMembers...), "theta")
-	candidate, targetKeys, err := crypto.Setup("join-future-epoch", 2, targetMembers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	joinerScheme, err := crypto.NewScheme("theta", targetKeys["theta"].Private, candidate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, _, err := joinerScheme.Share("theta", 1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := JoinRequest{
-		ConfigVersion:   0,
-		ContextEpoch:    0,
-		Joiner:          "theta",
-		PublicKey:       "theta-pk",
-		CandidateParams: crypto.WrapPVSSParams(candidate),
-		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
-		FirstCoinEpoch:  1,
-		ActivationEpoch: 3,
-	}
-	rho := JoinDigest(req)
-	tau := TransitionIndex{ConfigVersion: 0, Seq: 1}
-	cert := JoinCertificate{Request: req}
-	for _, n := range nodes[:3] {
-		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, n, tau, rho))
-		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, n, tau, rho, 3))
-	}
-	for _, n := range nodes {
-		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
-	}
-	for _, n := range nodes {
-		if err := n.InstallJoinCertificate(cert); err != nil {
-			t.Fatal(err)
-		}
-		if contains(n.State.Members, "theta") || n.State.ConfigVersion != 0 {
-			t.Fatalf("future join activated early on %s: members=%v version=%d", n.ID, n.State.Members, n.State.ConfigVersion)
-		}
-	}
-
-	runTestEpoch := func(epoch uint64) {
-		source, seq := nextSourceSeq(nodes[0])
-		var producer *Node
-		for _, n := range nodes {
-			if n.ID == source {
-				producer = n
-				break
-			}
-		}
-		if _, err := producer.Produce(ctx); err != nil {
-			t.Fatal(err)
-		}
-		waitStored(t, ctx, nodes, source, seq)
-		if _, err := producer.Produce(ctx); err != nil {
-			t.Fatal(err)
-		}
-		waitStored(t, ctx, nodes, source, seq+1)
-		results := make(chan beaconTestResult, len(nodes))
-		for _, n := range nodes {
-			go func(n *Node) {
-				b, err := n.RunEpochAt(ctx, epoch)
-				results <- beaconTestResult{beacon: b, err: err}
-			}(n)
-		}
-		for range nodes {
-			select {
-			case res := <-results:
-				if res.err != nil {
-					t.Fatalf("RunEpochAt(%d): %v", epoch, res.err)
-				}
-			case <-ctx.Done():
-				t.Fatalf("timed out before future activation\n%s", dumpNodes(nodes))
-			}
-		}
-	}
-	runTestEpoch(1)
-	for _, n := range nodes {
-		if contains(n.State.Members, "theta") || n.State.ConfigVersion != 0 {
-			t.Fatalf("join activated before E2 on %s: members=%v version=%d", n.ID, n.State.Members, n.State.ConfigVersion)
-		}
-	}
-	runTestEpoch(2)
-	for _, n := range nodes {
-		if err := n.activatePendingJoins(ctx, 3); err != nil {
-			t.Fatal(err)
-		}
-		if !contains(n.State.Members, "theta") || n.State.ConfigVersion != 1 {
-			t.Fatalf("join did not activate at E2 on %s: members=%v version=%d", n.ID, n.State.Members, n.State.ConfigVersion)
-		}
-	}
-}
-
-func TestJoinCertificateStaleWhenRemovalHasPriority(t *testing.T) {
+func TestCertifiedRemovalMarkerSuppressesPendingJReady(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	oldMembers := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	targetMembers := append(append([]p2p.NodeID(nil), oldMembers...), "theta")
-	candidate, targetKeys, err := crypto.Setup("join-removal-priority", 2, targetMembers)
+	node := newTestNodes(t, ctx)[0]
+	node.mu.Lock()
+	node.pendingJReady = &JoinReady{ParentHash: HashCertifiedState(node.Certified), RequestDigest: "join", Joiner: "theta"}
+	node.State.RmMark["n1"] = 1
+	child, err := node.entropySuccessorWithControlLocked(node.Certified, []byte("r"), "n0", 1)
+	node.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	joinerScheme, err := crypto.NewScheme("theta", targetKeys["theta"].Private, candidate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, _, err := joinerScheme.Share("theta", 1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := JoinRequest{
-		ConfigVersion:   0,
-		ContextEpoch:    0,
-		Joiner:          "theta",
-		PublicKey:       "theta-pk",
-		CandidateParams: crypto.WrapPVSSParams(candidate),
-		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
-		FirstCoinEpoch:  1,
-		ActivationEpoch: 3,
-	}
-	rho := JoinDigest(req)
-	tau := TransitionIndex{ConfigVersion: 0, Seq: 1}
-	cert := JoinCertificate{Request: req}
-	for _, n := range nodes[:3] {
-		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, n, tau, rho))
-		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, n, tau, rho, 3))
-	}
-
-	for _, n := range nodes {
-		n.RegisterPVSSKey(candidate.Epoch, targetKeys[n.ID].Private)
-	}
-	for _, n := range nodes {
-		n.mu.Lock()
-		n.State.RmMark["n0"] = 3
-		n.mu.Unlock()
-		if err := n.InstallJoinCertificate(cert); err != nil {
-			t.Fatal(err)
-		}
-		n.mu.Lock()
-		joined := contains(n.State.Members, "theta")
-		version := n.State.ConfigVersion
-		lockedFrom := n.lockedFrom
-		n.mu.Unlock()
-		if joined || version != 0 || lockedFrom != 0 {
-			t.Fatalf("stale join installed on %s: joined=%t version=%d lockedFrom=%d", n.ID, joined, version, lockedFrom)
-		}
-	}
-}
-
-func TestPendingJoinClearsLockWhenConfigurationChanges(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	oldMembers := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	targetMembers := append(append([]p2p.NodeID(nil), oldMembers...), "theta")
-	candidate, targetKeys, err := crypto.Setup("join-stale-config-change", 2, targetMembers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	joinerScheme, err := crypto.NewScheme("theta", targetKeys["theta"].Private, candidate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, _, err := joinerScheme.Share("theta", 1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := JoinRequest{
-		ConfigVersion:   0,
-		ContextEpoch:    0,
-		Joiner:          "theta",
-		PublicKey:       "theta-pk",
-		CandidateParams: crypto.WrapPVSSParams(candidate),
-		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: c},
-		FirstCoinEpoch:  1,
-		ActivationEpoch: 3,
-	}
-	rho := JoinDigest(req)
-	tau := TransitionIndex{ConfigVersion: 0, Seq: 1}
-	cert := JoinCertificate{Request: req}
-	for _, n := range nodes[:3] {
-		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, n, tau, rho))
-		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, n, tau, rho, 3))
-	}
-
-	node := nodes[0]
-	node.RegisterPVSSKey(candidate.Epoch, targetKeys[node.ID].Private)
-	if err := node.InstallJoinCertificate(cert); err != nil {
-		t.Fatal(err)
+	if child.JReady != nil || child.RmMark["n1"] != 1 {
+		t.Fatalf("removal did not take priority: ready=%+v marks=%v", child.JReady, child.RmMark)
 	}
 	node.mu.Lock()
-	if node.lockedFrom != 3 {
-		t.Fatalf("future join did not lock activation: lockedFrom=%d", node.lockedFrom)
-	}
-	node.removeMemberLocked("n3")
+	node.Certified = CloneCertifiedState(child)
+	node.pendingJReady = &JoinReady{ParentHash: HashCertifiedState(node.Certified), RequestDigest: "later-join", Joiner: "theta"}
+	next, err := node.entropySuccessorWithControlLocked(node.Certified, []byte("r2"), "n0", 2)
 	node.mu.Unlock()
-
-	if err := node.activatePendingJoins(ctx, 3); err != nil {
+	if err != nil {
 		t.Fatal(err)
 	}
-	node.mu.Lock()
-	joined := contains(node.State.Members, "theta")
-	version := node.State.ConfigVersion
-	lockedFrom := node.lockedFrom
-	node.mu.Unlock()
-	if joined || version != 1 || lockedFrom != 0 {
-		t.Fatalf("stale pending join not cleared: joined=%t version=%d lockedFrom=%d", joined, version, lockedFrom)
+	if next.JReady != nil {
+		t.Fatal("an already-certified removal marker did not retain priority over JOIN")
+	}
+}
+
+func TestCertifiedRemovalUsesStateQCAcrossNodes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	nodes := newTestNodes(t, ctx)
+	for _, node := range nodes {
+		node.mu.Lock()
+		node.Certified.RmMark["n3"] = 1
+		node.State.RmMark["n3"] = 1
+		node.mu.Unlock()
+	}
+	results := make(chan error, len(nodes))
+	for _, node := range nodes {
+		go func(node *Node) {
+			results <- node.runCertifiedRemoval(ctx, "n3")
+		}(node)
+	}
+	for range nodes {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, node := range nodes {
+		node.mu.Lock()
+		state := CloneCertifiedState(node.Certified)
+		qc := node.StateCertificate
+		activeRBC := node.RBC
+		node.mu.Unlock()
+		if state.ConfigVersion != 1 || state.Epoch != 0 || contains(state.Members, "n3") {
+			t.Fatalf("node %s installed invalid REMOVE state: %+v", node.ID, state)
+		}
+		if qc == nil || qc.Transition != TransitionRemove || qc.ParentConfigVersion != 0 {
+			t.Fatalf("node %s lacks exact REMOVE StateQC: %+v", node.ID, qc)
+		}
+		if node.ID == "n3" && activeRBC != nil {
+			t.Fatal("removed process retained an active child RBC engine")
+		}
 	}
 }
 
@@ -717,7 +637,7 @@ func TestCoinBarrierIgnoresCurrentABA(t *testing.T) {
 	defer cancel()
 
 	nodes := newTestNodes(t, ctx)
-	current := aba.EpochInstance(1, "n0")
+	current := aba.EpochInstanceFor(0, 1, "n0", 1)
 	nodes[0].mu.Lock()
 	nodes[0].State.PendingABAs[current] = &PendingABA{Instance: current, Epoch: 1, Source: "n0", Seq: 1}
 	nodes[0].mu.Unlock()
@@ -732,7 +652,7 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 	defer cancel()
 
 	nodes := newTestNodes(t, ctx)
-	inst := aba.EpochInstance(1, "n0")
+	inst := aba.EpochInstanceFor(0, 1, "n0", 1)
 	nodes[0].mu.Lock()
 	nodes[0].State.PendingABAs[inst] = &PendingABA{Instance: inst, Epoch: 1, Source: "n0", Seq: 1}
 	nodes[0].mu.Unlock()
@@ -765,109 +685,9 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 	}
 }
 
-func TestJoinABAFeedsCoinFromConfiguredBeaconEpoch(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	inst := aba.JoinInstance("0/1", "rho", 2)
-	for _, node := range nodes {
-		if err := node.ABA.Propose(ctx, inst, false); err != nil {
-			t.Fatal(err)
-		}
-	}
-	waitABAStatus(t, ctx, nodes[0], inst, func(st aba.Status) bool { return st.CoinWait })
-
-	st := nodes[0].ABA.Status(inst)
-	seed := []byte("join-certified-beacon-seed")
-	for i := 0; aba.CoinFromSeed(inst, st.Round, seed); i++ {
-		seed = []byte("join-certified-beacon-seed-" + strconv.Itoa(i))
-	}
-	target := uint64(2) + st.Round
-	nodes[0].mu.Lock()
-	nodes[0].beaconSeeds[target] = seed
-	nodes[0].mu.Unlock()
-
-	nodes[0].handleCoinRequest(aba.CoinRequest{Instance: inst, Round: st.Round})
-	waitABAStatus(t, ctx, nodes[0], inst, func(st aba.Status) bool { return st.Decided && !st.Value })
-}
-
 func TestBeaconIndexUsesFullRandomValue(t *testing.T) {
 	if got := beaconIndex([]byte{1, 0}, 257); got != 256 {
 		t.Fatalf("beaconIndex used only a suffix byte: got=%d", got)
-	}
-}
-
-func TestMarkedSelectedSourceRemovedAtMarkedSequence(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	node := nodes[0]
-
-	node.mu.Lock()
-	node.State.RSQ = []p2p.NodeID{"n2", "n3"}
-	node.State.SCL = []p2p.NodeID{"n0", "n1"}
-	node.State.RmMark["n0"] = 2
-	node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
-	node.State.Seqs["n0"] = 1
-	state := node.certifiedStateDigestForBeaconLocked("n0", 2)
-	node.installCertifiedStateLocked(state)
-	members := append([]p2p.NodeID(nil), node.State.Members...)
-	scl := append([]p2p.NodeID(nil), node.State.SCL...)
-	rsq := append([]p2p.NodeID(nil), node.State.RSQ...)
-	_, hasComQ := node.State.ComQ["n0"]
-	_, hasSeq := node.State.Seqs["n0"]
-	_, hasRm := node.State.RmMark["n0"]
-	f, rbcF, abaF := node.State.F, node.RBC.F, node.ABA.F
-	rbcN, abaN := node.RBC.N, node.ABA.N
-	node.mu.Unlock()
-
-	if contains(members, "n0") || contains(scl, "n0") || contains(rsq, "n0") {
-		t.Fatalf("marked member still present: members=%v scl=%v rsq=%v", members, scl, rsq)
-	}
-	if hasComQ || hasSeq || hasRm {
-		t.Fatalf("marked member state not deleted: comq=%v seq=%v rm=%v", hasComQ, hasSeq, hasRm)
-	}
-	if f != 0 || rbcF != 0 || abaF != 0 || rbcN != 3 || abaN != 3 {
-		t.Fatalf("thresholds not updated after removal: stateF=%d rbc=(%d,%d) aba=(%d,%d)", f, rbcN, rbcF, abaN, abaF)
-	}
-}
-
-func TestCertifiedStateDigestIgnoresUnconsumedRemovalMarks(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	left := nodes[0]
-	right := nodes[1]
-
-	for _, node := range []*Node{left, right} {
-		node.mu.Lock()
-		node.State.RSQ = []p2p.NodeID{"n2", "n3"}
-		node.State.SCL = []p2p.NodeID{"n0", "n1"}
-		node.State.ComQ["n0"][1] = Object{Producer: "n0", Seq: 1}
-		node.mu.Unlock()
-	}
-
-	left.mu.Lock()
-	left.State.RmMark["n2"] = 4
-	leftDigest := left.certifiedStateDigestForBeaconLocked("n0", 1)
-	leftHash := stateDigestHash(leftDigest)
-	leftRm := leftDigest.RmMark["n2"]
-	left.mu.Unlock()
-
-	right.mu.Lock()
-	rightDigest := right.certifiedStateDigestForBeaconLocked("n0", 1)
-	rightHash := stateDigestHash(rightDigest)
-	rightRm := rightDigest.RmMark["n2"]
-	right.mu.Unlock()
-
-	if leftHash != rightHash {
-		t.Fatalf("unconsumed removal mark changed certified state hash: left=%s right=%s", leftHash, rightHash)
-	}
-	if leftRm != -1 || rightRm != -1 {
-		t.Fatalf("unconsumed removal marks leaked into certified digest: left=%d right=%d", leftRm, rightRm)
 	}
 }
 
@@ -885,13 +705,14 @@ func TestQueueLenOneSkipsLookaheadABA(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, err := NewNode(Config{
-		ID:                  "n0",
-		Members:             ids,
-		F:                   1,
-		QueueLen:            1,
-		LookaheadExpiration: time.Hour,
-		PVSS:                s,
-		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+		ID:                            "n0",
+		Members:                       ids,
+		F:                             1,
+		QueueLen:                      1,
+		LookaheadExpiration:           time.Hour,
+		PVSS:                          s,
+		Transport:                     p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+		InsecureDeterministicIdentity: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -915,183 +736,7 @@ func TestQueueLenOneSkipsLookaheadABA(t *testing.T) {
 	}
 }
 
-func TestExplicitRemovalOnlyKeepsLookaheadABA(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	pp, keys, err := crypto.Setup("test-explicit-lookahead", 2, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := NewNode(Config{
-		ID:                  "n0",
-		Members:             ids,
-		F:                   1,
-		QueueLen:            8,
-		LookaheadExpiration: time.Hour,
-		ExplicitRemovalOnly: true,
-		PVSS:                s,
-		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	source, seq, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if skip || certified {
-		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
-	}
-	node.mu.Lock()
-	_, pending := node.State.PendingABAs[instance]
-	node.mu.Unlock()
-	if !pending {
-		t.Fatalf("explicit removal mode did not create lookahead ABA %s", instance)
-	}
-
-	node.mu.Lock()
-	version := node.State.ConfigVersion
-	node.State.ComQ[source][seq+1] = Object{Producer: source, Seq: seq + 1, ConfigVersion: version}
-	node.mu.Unlock()
-
-	start := time.Now()
-	if certifiedBeacon, err := node.proposeEpochABAInputFromLookahead(ctx, 1, source, seq, instance, make(chan Beacon, 1)); err != nil {
-		t.Fatal(err)
-	} else if certifiedBeacon != nil {
-		t.Fatalf("unexpected certified beacon: %+v", *certifiedBeacon)
-	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("explicit removal mode waited for lookahead: %s", elapsed)
-	}
-	node.mu.Lock()
-	sent := node.abaInputSent[instance]
-	input, inputStored := node.abaInputs[instance]
-	node.mu.Unlock()
-	if !sent || !inputStored || !input {
-		t.Fatalf("explicit removal mode did not propose lookahead true input: sent=%v stored=%v input=%v", sent, inputStored, input)
-	}
-}
-
-func TestExplicitRemovalOnlyDropsMissingLookaheadABA(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	pp, keys, err := crypto.Setup("test-explicit-missing-lookahead", 2, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := NewNode(Config{
-		ID:                  "n0",
-		Members:             ids,
-		F:                   1,
-		QueueLen:            8,
-		LookaheadExpiration: time.Millisecond,
-		ExplicitRemovalOnly: true,
-		PVSS:                s,
-		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	source, seq, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if skip || certified {
-		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
-	}
-
-	start := time.Now()
-	if certifiedBeacon, err := node.proposeEpochABAInputFromLookahead(ctx, 1, source, seq, instance, make(chan Beacon, 1)); err != nil {
-		t.Fatal(err)
-	} else if certifiedBeacon != nil {
-		t.Fatalf("unexpected certified beacon: %+v", *certifiedBeacon)
-	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("explicit removal mode waited too long for missing lookahead: %s", elapsed)
-	}
-	node.mu.Lock()
-	_, pending := node.State.PendingABAs[instance]
-	sent := node.abaInputSent[instance]
-	_, inputStored := node.abaInputs[instance]
-	mark := node.State.RmMark[source]
-	node.mu.Unlock()
-	if pending || sent || inputStored {
-		t.Fatalf("missing lookahead left ABA state: pending=%v sent=%v input=%v", pending, sent, inputStored)
-	}
-	if mark != -1 {
-		t.Fatalf("missing lookahead marked source for removal: source=%s mark=%d", source, mark)
-	}
-}
-
-func TestExplicitRemovalOnlyDropsUnreadyLookaheadABA(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	pp, keys, err := crypto.Setup("test-explicit-unready-lookahead", 2, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := NewNode(Config{
-		ID:                  "n0",
-		Members:             ids,
-		F:                   1,
-		QueueLen:            8,
-		LookaheadExpiration: time.Millisecond,
-		ExplicitRemovalOnly: true,
-		PVSS:                s,
-		Transport:           p2p.NewMemoryNetwork().NewTransport("n0", 1024),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, _, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if skip || certified {
-		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
-	}
-	if err := node.proposeEpochABAInput(ctx, instance, true); err != nil {
-		t.Fatal(err)
-	}
-
-	start := time.Now()
-	if err := node.waitCurrentABAReady(ctx, instance); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("explicit removal mode waited too long for unready lookahead ABA: %s", elapsed)
-	}
-	node.mu.Lock()
-	_, pending := node.State.PendingABAs[instance]
-	_, inputStored := node.abaInputs[instance]
-	node.mu.Unlock()
-	if pending || inputStored {
-		t.Fatalf("unready lookahead left pending ABA state: pending=%v input=%v", pending, inputStored)
-	}
-}
-
-func TestExplicitRemovalOnlyDoesNotAutoRemoveMissingCurrentObject(t *testing.T) {
+func TestMissingCurrentObjectDoesNotTriggerUncertifiedRemoval(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -1105,15 +750,13 @@ func TestExplicitRemovalOnlyDoesNotAutoRemoveMissingCurrentObject(t *testing.T) 
 		t.Fatal(err)
 	}
 	node, err := NewNode(Config{
-		ID:                    "n0",
-		Members:               ids,
-		F:                     1,
-		QueueLen:              8,
-		RemovalExpiration:     time.Millisecond,
-		CurrentMissingRemoval: true,
-		ExplicitRemovalOnly:   true,
-		PVSS:                  s,
-		Transport:             p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+		ID:                            "n0",
+		Members:                       ids,
+		F:                             1,
+		QueueLen:                      8,
+		PVSS:                          s,
+		Transport:                     p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+		InsecureDeterministicIdentity: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1123,7 +766,7 @@ func TestExplicitRemovalOnlyDoesNotAutoRemoveMissingCurrentObject(t *testing.T) 
 	defer cancelMissing()
 	source := p2p.NodeID("n1")
 	seq := uint64(1)
-	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, aba.EpochInstance(1, source), make(chan Beacon, 1))
+	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, aba.EpochInstanceFor(0, 1, source, seq), make(chan Beacon, 1))
 	if err == nil {
 		t.Fatal("expected missing current object to wait for context")
 	}
@@ -1131,65 +774,7 @@ func TestExplicitRemovalOnlyDoesNotAutoRemoveMissingCurrentObject(t *testing.T) 
 	mark := node.State.RmMark[source]
 	node.mu.Unlock()
 	if mark != -1 {
-		t.Fatalf("explicit removal mode auto-marked missing source %s: mark=%d", source, mark)
-	}
-}
-
-func TestForceReconfigurationRemovalMarksCurrentSequence(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	node := nodes[0]
-	source := nextSource(node)
-
-	seq, applied, err := node.ForceReconfigurationRemoval(1, source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !applied {
-		t.Fatalf("expected forced ABA false for selected source %s", source)
-	}
-	node.mu.Lock()
-	mark := node.State.RmMark[source]
-	_, pending := node.State.PendingABAs[aba.EpochInstance(1, source)]
-	_, inputStored := node.abaInputs[aba.EpochInstance(1, source)]
-	node.mu.Unlock()
-	if mark != int64(seq) {
-		t.Fatalf("removal mark mismatch: got %d want %d", mark, seq)
-	}
-	if pending || inputStored {
-		t.Fatalf("forced removal left pending state: pending=%v input=%v", pending, inputStored)
-	}
-}
-
-func TestForceReconfigurationRemovalIgnoresOtherSources(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	node := nodes[0]
-	selected := nextSource(node)
-	other := p2p.NodeID("")
-	for _, id := range []p2p.NodeID{"n0", "n1", "n2", "n3"} {
-		if id != selected {
-			other = id
-			break
-		}
-	}
-	if other == "" {
-		t.Fatal("missing alternate source")
-	}
-	if _, applied, err := node.ForceReconfigurationRemoval(1, other); err != nil {
-		t.Fatal(err)
-	} else if applied {
-		t.Fatalf("forced removal for non-selected source %s", other)
-	}
-	node.mu.Lock()
-	mark := node.State.RmMark[other]
-	node.mu.Unlock()
-	if mark != -1 {
-		t.Fatalf("non-selected source was marked for removal: %s mark=%d", other, mark)
+		t.Fatalf("missing object auto-marked source without ABA evidence %s: mark=%d", source, mark)
 	}
 }
 
@@ -1207,12 +792,13 @@ func TestPrepareEpochDoesNotCreateLookaheadABAAtQueueLenOne(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, err := NewNode(Config{
-		ID:        "n0",
-		Members:   ids,
-		F:         1,
-		QueueLen:  1,
-		PVSS:      s,
-		Transport: p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+		ID:                            "n0",
+		Members:                       ids,
+		F:                             1,
+		QueueLen:                      1,
+		PVSS:                          s,
+		Transport:                     p2p.NewMemoryNetwork().NewTransport("n0", 1024),
+		InsecureDeterministicIdentity: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1264,7 +850,7 @@ func newTestNodes(t *testing.T, ctx context.Context) []*Node {
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, RemovalExpiration: 50 * time.Millisecond, PVSS: s, Transport: net.NewTransport(id, 1024)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: 1, QueueLen: 8, PVSS: s, Transport: net.NewTransport(id, 1024), InsecureDeterministicIdentity: true})
 		if err != nil {
 			t.Fatal(err)
 		}

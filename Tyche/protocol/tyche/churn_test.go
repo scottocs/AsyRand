@@ -3,6 +3,7 @@ package tyche
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"os"
@@ -13,7 +14,6 @@ import (
 	"time"
 
 	"Tyche/Tyche/crypto"
-	"Tyche/Tyche/protocol/aba"
 	"Tyche/utils/p2p"
 )
 
@@ -45,10 +45,16 @@ func TestBeaconChurnCrashAndJoin10000Epochs(t *testing.T) {
 		}
 		if joiner := joins[epoch]; joiner != "" {
 			t.Logf("epoch=%d event=joining_proposal node=%s active_before=%v members_before=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
-			cluster.join(t, ctx, joiner)
-			t.Logf("epoch=%d event=joined node=%s active_after=%v members_after=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
+			if cluster.join(t, ctx, joiner) {
+				t.Logf("epoch=%d event=join_admitted node=%s active_after=%v members_after=%v", epoch, joiner, cluster.activeIDs(), cluster.members())
+			} else {
+				joins[epoch+1] = joiner
+				t.Logf("epoch=%d event=join_deferred node=%s reason=pending_removal", epoch, joiner)
+			}
 		}
+		cluster.reconcilePendingJoins(t, ctx, uint64(epoch))
 		cluster.runEpoch(t, ctx, uint64(epoch), 10*time.Second)
+		cluster.reconcileProtocolRemovals(t, uint64(epoch))
 		if reportEvery > 0 && epoch%reportEvery == 0 {
 			t.Logf("completed %d/%d churn epochs in %s active=%v members=%v", epoch, epochs, time.Since(start), cluster.activeIDs(), cluster.members())
 		}
@@ -133,9 +139,6 @@ type churnResult struct {
 
 type pendingChurnJoin struct {
 	activation uint64
-	members    []p2p.NodeID
-	params     crypto.PVSSParams
-	keys       map[p2p.NodeID]crypto.KeyPair
 }
 
 type churnBenchmarkResult struct {
@@ -626,7 +629,7 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 		if err != nil {
 			t.Fatal(err)
 		}
-		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: initialQueueLen, PVSS: scheme, PVSSBackend: pvss, CryptoWorkers: cryptoWorkers, Transport: c.net.NewTransport(id, 32768)})
+		node, err := NewNode(Config{ID: id, Members: ids, F: f, QueueLen: initialQueueLen, PVSS: scheme, PVSSBackend: pvss, CryptoWorkers: cryptoWorkers, Transport: c.net.NewTransport(id, 32768), InsecureDeterministicIdentity: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -645,14 +648,10 @@ func (c *churnCluster) crashAndRemove(t *testing.T, id p2p.NodeID) {
 		return
 	}
 	c.active[id] = false
+	c.stopped[id] = true
 	c.cancels[id]()
 	if err := c.nodes[id].Transport.Close(); err != nil {
 		t.Fatal(err)
-	}
-	for _, node := range c.activeNodes() {
-		node.mu.Lock()
-		node.removeMemberLocked(id)
-		node.mu.Unlock()
 	}
 }
 
@@ -694,21 +693,8 @@ func (c *churnCluster) protocolRemovedByAnyActiveNode(id p2p.NodeID) bool {
 
 func (c *churnCluster) closeProtocolRemovedNode(t *testing.T, id p2p.NodeID) {
 	t.Helper()
-	ref := c.protocolRemovedReference(id)
-	if ref == nil {
+	if c.protocolRemovedReference(id) == nil {
 		t.Fatalf("no certified removal state for %s", id)
-	}
-	for _, node := range c.activeNodes() {
-		if node.ID == id {
-			continue
-		}
-		if node != ref {
-			copyRuntimeState(t, ref, node)
-		}
-		node.mu.Lock()
-		node.installRemovalPVSSLocked()
-		node.resetConfigurationCachesLocked()
-		node.mu.Unlock()
 	}
 }
 
@@ -910,14 +896,17 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	t.Helper()
 	ref := c.reference(t)
 	currentMembers := c.members()
+	for _, member := range currentMembers {
+		if c.stopped[member] {
+			return false
+		}
+	}
 	targetMembers := append(append([]p2p.NodeID(nil), currentMembers...), joiner)
 	sort.Slice(targetMembers, func(i, j int) bool { return targetMembers[i] < targetMembers[j] })
+	checkpoint := ref.Checkpoint()
 	ref.mu.Lock()
 	version := ref.State.ConfigVersion
 	contextEpoch := ref.State.Epoch
-	firstCoin := contextEpoch + 5
-	activation := contextEpoch + 10
-	f := ref.State.F
 	ref.mu.Unlock()
 	targetF := (len(targetMembers) - 1) / 3
 
@@ -934,40 +923,66 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	if err != nil {
 		t.Fatal(err)
 	}
+	identitySeed := crypto.DomainHash("Tyche/InsecureTestIdentity/v1", []byte(joiner))
+	identity, err := crypto.IdentityKeyPairFromSeed(identitySeed[:32])
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := JoinRequest{
 		ConfigVersion:   version,
-		ContextEpoch:    contextEpoch,
+		ParentHash:      HashCertifiedState(checkpoint.State),
 		Joiner:          joiner,
-		PublicKey:       string(joiner) + "-pk",
+		PublicKey:       hex.EncodeToString(identity.Public),
 		CandidateParams: pp,
 		Object:          Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
-		FirstCoinEpoch:  firstCoin,
-		ActivationEpoch: activation,
+		Checkpoint:      checkpoint,
 	}
-	rho := JoinDigest(req)
-	tau := TransitionIndex{ConfigVersion: version, Seq: 1}
-	signers := c.activeIDs()
-	need := 2*f + 1
-	if len(signers) < need {
-		t.Fatalf("not enough active signers for join: active=%v need=%d", signers, need)
+	req, err = SignLearnerReady(req, identity.Private)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cert := JoinCertificate{Request: req}
-	for _, signer := range signers[:need] {
-		cert.Cert1 = append(cert.Cert1, signedJoinAck(t, c.nodes[signer], tau, rho))
-		cert.Cert2 = append(cert.Cert2, signedJoinCommit(t, c.nodes[signer], tau, rho, activation))
+	ref.mu.Lock()
+	currentSetup := ref.ConfigurationSetups[version]
+	currentConfiguration := ref.Configurations[version]
+	historical := make([]Configuration, 0, len(ref.Configurations))
+	for _, configuration := range ref.Configurations {
+		historical = append(historical, configuration)
+	}
+	ref.mu.Unlock()
+	observerPrivate := crypto.KeyPairFromSeed(crypto.DomainHash("Tyche/ChurnLearnerPVSS/v1", []byte(joiner))).Private
+	observerScheme, err := crypto.NewPVSSScheme(joiner, observerPrivate, currentSetup.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityKeys := identityKeysForMembers(currentConfiguration, currentMembers)
+	identityKeys[joiner] = identity.Public
+	learner, err := NewNode(Config{
+		ID: joiner, Members: currentMembers, Learner: true, F: currentConfiguration.F,
+		ConfigVersion: version, QueueLen: c.queueLen, PVSS: observerScheme,
+		PVSSBackend: c.pvss, CryptoWorkers: c.cryptoWorkers,
+		Transport:       c.net.NewTransport(joiner, 32768),
+		IdentityPrivate: identity.Private, IdentityPublicKeys: identityKeys,
+		BootstrapCheckpoint: &checkpoint, HistoricalConfigurations: historical,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	learner.RegisterPVSSKey(pp.Epoch(), keys[joiner].Private)
+	learnerCtx, learnerCancel := context.WithCancel(parent)
+	learner.Start(learnerCtx)
+	c.nodes[joiner] = learner
+	c.active[joiner] = false
+	c.cancels[joiner] = learnerCancel
+	if err := learner.HandleJoinRequest(parent, req); err != nil {
+		t.Fatal(err)
 	}
 	for _, node := range c.activeNodes() {
 		node.RegisterPVSSKey(pp.Epoch(), keys[node.ID].Private)
-		if err := node.InstallJoinCertificate(cert); err != nil {
-			t.Fatal(err)
-		}
 	}
-	if !contains(c.members(), joiner) {
-		c.pendingJoins[joiner] = pendingChurnJoin{activation: activation, members: targetMembers, params: pp, keys: keys}
-		return true
+	if err := ref.ProposeJoin(parent, req); err != nil {
+		t.Fatal(err)
 	}
-	c.installPVSS(t, pp, keys, targetMembers)
-	c.addJoinerNode(t, parent, joiner, targetMembers, pp, keys)
+	c.pendingJoins[joiner] = pendingChurnJoin{activation: contextEpoch + 1}
 	return true
 }
 
@@ -977,64 +992,42 @@ func (c *churnCluster) reconcilePendingJoins(t *testing.T, parent context.Contex
 		if epoch < pending.activation {
 			continue
 		}
-		for _, node := range c.activeNodes() {
-			node.mu.Lock()
-			due := node.State.Epoch+1 == pending.activation
-			node.mu.Unlock()
-			if due {
-				if err := node.activatePendingJoins(parent, pending.activation); err != nil {
-					t.Fatal(err)
-				}
+		learner := c.nodes[id]
+		if learner == nil {
+			t.Fatalf("missing running learner %s", id)
+		}
+		checkpoint := c.reference(t).Checkpoint()
+		if checkpoint.State.JReady == nil || checkpoint.State.JReady.Joiner != id {
+			continue
+		}
+		if err := learner.InstallCheckpoint(checkpoint); err != nil {
+			t.Fatal(err)
+		}
+		active := c.activeNodes()
+		results := make(chan error, len(active))
+		for _, node := range active {
+			go func(node *Node) {
+				results <- node.activatePendingJoins(parent, epoch)
+			}(node)
+		}
+		for range active {
+			if err := <-results; err != nil {
+				t.Fatal(err)
 			}
 		}
 		if !contains(c.members(), id) {
-			delete(c.pendingJoins, id)
 			continue
 		}
-		c.installPVSS(t, pending.params, pending.keys, pending.members)
-		c.addJoinerNode(t, parent, id, pending.members, pending.params, pending.keys)
+		waitUntil(t, parent, func() bool {
+			learner.mu.Lock()
+			defer learner.mu.Unlock()
+			return contains(learner.Certified.Members, id) && learner.RBC != nil && learner.ABA != nil
+		})
+		learner.SetProducing(true)
+		c.active[id] = true
 		delete(c.pendingJoins, id)
 		t.Logf("epoch=%d event=joined node=%s active_after=%v members_after=%v", epoch, id, c.activeIDs(), c.members())
 	}
-}
-
-func (c *churnCluster) installPVSS(t *testing.T, pp crypto.PVSSParams, keys map[p2p.NodeID]crypto.KeyPair, members []p2p.NodeID) {
-	t.Helper()
-	for _, node := range c.activeNodes() {
-		scheme, err := crypto.NewPVSSScheme(node.ID, keys[node.ID].Private, pp)
-		if err != nil {
-			t.Fatal(err)
-		}
-		node.mu.Lock()
-		node.PVSS = scheme
-		node.mu.Unlock()
-	}
-}
-
-func (c *churnCluster) addJoinerNode(t *testing.T, parent context.Context, id p2p.NodeID, members []p2p.NodeID, pp crypto.PVSSParams, keys map[p2p.NodeID]crypto.KeyPair) {
-	t.Helper()
-	scheme, err := crypto.NewPVSSScheme(id, keys[id].Private, pp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ref := c.reference(t)
-	ref.mu.Lock()
-	f := ref.State.F
-	ref.mu.Unlock()
-	queueLen := c.queueLen
-	if queueLen <= 0 {
-		queueLen = len(members) + 64
-	}
-	node, err := NewNode(Config{ID: id, Members: members, F: f, QueueLen: queueLen, PVSS: scheme, PVSSBackend: c.pvss, CryptoWorkers: c.cryptoWorkers, Transport: c.net.NewTransport(id, 32768)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	copyRuntimeState(t, ref, node)
-	nodeCtx, cancel := context.WithCancel(parent)
-	node.Start(nodeCtx)
-	c.nodes[id] = node
-	c.active[id] = true
-	c.cancels[id] = cancel
 }
 
 func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint64, timeout time.Duration) {
@@ -1043,11 +1036,8 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	source, seq := nextSourceSeq(c.reference(t))
 	removingStoppedSource := c.stopped[source] && c.isMarkedForRemovalAt(source, seq)
 	sourceNode := c.nodes[source]
-	if sourceNode == nil || !c.active[source] {
+	if sourceNode == nil || (!c.active[source] && !c.stopped[source]) {
 		t.Fatalf("selected inactive source %s at epoch %d active=%v members=%v", source, epoch, c.activeIDs(), c.members())
-	}
-	if c.stopped[source] && !c.isMarkedForRemoval(source) {
-		c.applyABAFalse(t, parent, epoch, source, seq)
 	}
 	c.ensureStored(t, parent, sourceNode, source, seq, epoch, timeout)
 	c.waitStoredCurrent(t, parent, source, seq)
@@ -1123,21 +1113,6 @@ func (c *churnCluster) refillCandidateLists() {
 			node.refillSCLLocked()
 		}
 		node.mu.Unlock()
-	}
-}
-
-func (c *churnCluster) applyABAFalse(t *testing.T, ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64) {
-	t.Helper()
-	instance := aba.EpochInstance(epoch, source)
-	t.Logf("epoch=%d event=aba_false node=%s seq=%d stopped=%v active=%v members=%v", epoch, source, seq, c.stoppedActiveIDs(), c.activeIDs(), c.members())
-	for _, node := range c.activeNodes() {
-		node.mu.Lock()
-		if node.State.PendingABAs[instance] == nil {
-			node.State.PendingABAs[instance] = &PendingABA{Instance: instance, Epoch: epoch, Source: source, Seq: seq}
-		}
-		node.mu.Unlock()
-		_ = node.ABA.Propose(ctx, instance, false)
-		node.handleABADecision(ctx, aba.Decision{Instance: instance, Value: false})
 	}
 }
 
@@ -1331,74 +1306,4 @@ func (c *churnCluster) reference(t *testing.T) *Node {
 		t.Fatal("no active nodes")
 	}
 	panic("no active nodes")
-}
-
-func copyRuntimeState(t *testing.T, src *Node, dst *Node) {
-	t.Helper()
-	src.mu.Lock()
-	defer src.mu.Unlock()
-	dst.mu.Lock()
-	defer dst.mu.Unlock()
-	dst.State.ConfigVersion = src.State.ConfigVersion
-	dst.State.Members = append([]p2p.NodeID(nil), src.State.Members...)
-	dst.State.F = src.State.F
-	dst.State.Epoch = src.State.Epoch
-	dst.State.RPrev = append([]byte(nil), src.State.RPrev...)
-	dst.State.SCL = append([]p2p.NodeID(nil), src.State.SCL...)
-	dst.State.RSQ = append([]p2p.NodeID(nil), src.State.RSQ...)
-	dst.State.Seqs = copySeqs(src.State.Seqs)
-	dst.State.RmMark = copyRmMark(src.State.RmMark)
-	dst.State.ComQ = copyComQ(src.State.ComQ)
-	dst.State.QueueLen = src.State.QueueLen
-	dst.State.ProducerSeq = dst.State.Seqs[dst.ID]
-	dst.RBC.N, dst.RBC.F = len(dst.State.Members), dst.State.F
-	dst.ABA.N, dst.ABA.F = len(dst.State.Members), dst.State.F
-	for epoch, seed := range src.beaconSeeds {
-		dst.beaconSeeds[epoch] = append([]byte(nil), seed...)
-	}
-}
-
-func copySeqs(in map[p2p.NodeID]uint64) map[p2p.NodeID]uint64 {
-	out := make(map[p2p.NodeID]uint64, len(in))
-	for id, seq := range in {
-		out[id] = seq
-	}
-	return out
-}
-
-func copyRmMark(in map[p2p.NodeID]int64) map[p2p.NodeID]int64 {
-	out := make(map[p2p.NodeID]int64, len(in))
-	for id, mark := range in {
-		out[id] = mark
-	}
-	return out
-}
-
-func copyComQ(in map[p2p.NodeID]map[uint64]Object) map[p2p.NodeID]map[uint64]Object {
-	out := make(map[p2p.NodeID]map[uint64]Object, len(in))
-	for id, q := range in {
-		out[id] = make(map[uint64]Object, len(q))
-		for seq, obj := range q {
-			out[id][seq] = obj
-		}
-	}
-	return out
-}
-
-func signedJoinAck(t *testing.T, node *Node, tau TransitionIndex, rho string) JoinAck {
-	t.Helper()
-	sig, err := crypto.NewVoteShare(string(node.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return JoinAck{Transition: tau, RequestDigest: rho, Signer: node.ID, Signature: sig}
-}
-
-func signedJoinCommit(t *testing.T, node *Node, tau TransitionIndex, rho string, activation uint64) JoinCommit {
-	t.Helper()
-	sig, err := crypto.NewVoteShare(string(node.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return JoinCommit{Transition: tau, RequestDigest: rho, ActivationEpoch: activation, Signer: node.ID, Signature: sig}
 }

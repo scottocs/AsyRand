@@ -2,6 +2,7 @@ package tyche
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,55 +46,51 @@ type Beacon struct {
 	// Signature is the compact READY quorum certificate. ReadySenders records
 	// who voted; Signature proves those nodes signed the canonical READY
 	// statement for this epoch/source/sequence/random hash.
-	Signature     crypto.QuorumCertificate `json:"signature"`
-	ConfigVersion uint64                   `json:"config_version"`
-	State         CertifiedStateDigest     `json:"state"`
-	StateHash     string                   `json:"state_hash"`
+	ConfigVersion  uint64         `json:"config_version"`
+	StateHash      string         `json:"state_hash"`
+	CertifiedState CertifiedState `json:"certified_state"`
+	StateQC        StateQC        `json:"state_qc"`
 }
 
 type BeaconCertificate struct {
-	Epoch         uint64                   `json:"epoch"`
-	Source        p2p.NodeID               `json:"source"`
-	Seq           uint64                   `json:"seq"`
-	Random        []byte                   `json:"random"`
-	ObjectID      string                   `json:"object_id"`
-	Signature     crypto.QuorumCertificate `json:"signature"`
-	ConfigVersion uint64                   `json:"config_version"`
-	StateHash     string                   `json:"state_hash"`
-}
-
-type CertifiedStateDigest struct {
-	Members []p2p.NodeID          `json:"members"`
-	SCL     []p2p.NodeID          `json:"scl"`
-	RSQ     []p2p.NodeID          `json:"rsq"`
-	Seqs    map[p2p.NodeID]uint64 `json:"seqs"`
-	RmMark  map[p2p.NodeID]int64  `json:"rm_mark"`
+	Epoch          uint64         `json:"epoch"`
+	Source         p2p.NodeID     `json:"source"`
+	Seq            uint64         `json:"seq"`
+	Random         []byte         `json:"random"`
+	ObjectID       string         `json:"object_id"`
+	ConfigVersion  uint64         `json:"config_version"`
+	StateHash      string         `json:"state_hash"`
+	CertifiedState CertifiedState `json:"certified_state"`
+	StateQC        StateQC        `json:"state_qc"`
 }
 
 type Config struct {
-	ID           p2p.NodeID
-	Members      []p2p.NodeID
-	F            int
-	QueueLen     int
-	ProducerLow  int
-	ProducerHigh int
-	// RemovalExpiration bounds how long a reconfiguration run waits for the
-	// selected source's current object before certifying a missing-source
-	// removal epoch.
-	RemovalExpiration     time.Duration
-	LookaheadExpiration   time.Duration
-	CurrentMissingRemoval bool
-	// ExplicitRemovalOnly disables timeout-driven missing-current removal.
-	// Scheduled reconfiguration callers still mark removals explicitly; normal
-	// lookahead ABA continues to follow QueueLen.
-	ExplicitRemovalOnly bool
+	ID                  p2p.NodeID
+	Members             []p2p.NodeID
+	Learner             bool
+	F                   int
+	QueueLen            int
+	ProducerLow         int
+	ProducerHigh        int
+	LookaheadExpiration time.Duration
 	ConfigVersion       uint64
 	InitialRandom       []byte
 	PVSS                crypto.PVSSScheme
+	PVSSParams          crypto.PVSSParams
 	PVSSBackend         string
 	PVSSKeys            map[string]kyber.Scalar
-	CryptoWorkers       int
-	Transport           p2p.Transport
+	IdentityPrivate     ed25519.PrivateKey
+	IdentityPublicKeys  map[p2p.NodeID]ed25519.PublicKey
+	// InsecureDeterministicIdentity is only for tests and reproducible
+	// benchmarks. Production configurations must provide identity keys.
+	InsecureDeterministicIdentity bool
+	CryptoWorkers                 int
+	Transport                     p2p.Transport
+	// Store must be durable in production. Tests and explicitly insecure
+	// experiments may omit it and receive an in-memory store.
+	Store                    StateStore
+	BootstrapCheckpoint      *CertifiedCheckpoint
+	HistoricalConfigurations []Configuration
 }
 
 type State struct {
@@ -151,22 +148,43 @@ type ReconReadyMessage ReconEchoMessage
 // signedReconReadyMessage carries the signer identity counted for READY quorum
 // certification. The READY amplification rule is unchanged.
 type signedReconReadyMessage struct {
-	Epoch     uint64           `json:"epoch"`
-	Source    p2p.NodeID       `json:"source"`
-	Seq       uint64           `json:"seq"`
-	Random    []byte           `json:"random"`
-	StateHash string           `json:"state_hash"`
-	Signature crypto.VoteShare `json:"signature"`
+	Epoch     uint64            `json:"epoch"`
+	Source    p2p.NodeID        `json:"source"`
+	Seq       uint64            `json:"seq"`
+	Random    []byte            `json:"random"`
+	StateHash string            `json:"state_hash"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type Node struct {
-	ID        p2p.NodeID
-	Transport p2p.Transport
-	PVSS      crypto.PVSSScheme
-	Perf      *PerfMetrics
-	RBC       *rbc.Broadcaster
-	ABA       *aba.Agreement
-	Crypto    *cryptoexec.Executor
+	ID                  p2p.NodeID
+	Transport           p2p.Transport
+	PVSS                crypto.PVSSScheme
+	Perf                *PerfMetrics
+	RBC                 *rbc.Broadcaster
+	ABA                 *aba.Agreement
+	RBCs                map[uint64]*rbc.Broadcaster
+	ABAs                map[uint64]*aba.Agreement
+	engineStarted       map[uint64]bool
+	protocolContext     context.Context
+	Crypto              *cryptoexec.Executor
+	Configurations      map[uint64]Configuration
+	ConfigurationSetups map[uint64]ConfigurationSetup
+	Certified           CertifiedState
+	StateCertificate    *StateQC
+	HistoryAnchor       CertifiedState
+	StateHistory        []StateCertificateMessage
+	IdentityPrivate     ed25519.PrivateKey
+	signedParents       map[string]string
+	stateProposals      map[string]CertifiedState
+	stateVotes          map[string]map[p2p.NodeID]crypto.SignedVote
+	stateCertSent       map[string]bool
+	stateNotify         chan struct{}
+	allowInsecureSetup  bool
+	PVSSContexts        map[uint64]*PVSSContext
+	RBCCertificates     map[string]rbc.DeliveryCertificate
+	Retirement          map[string]*RetirementObligation
+	Store               StateStore
 
 	mu           sync.Mutex
 	State        *State
@@ -178,38 +196,31 @@ type Node struct {
 	// readies stores verified READY votes rather than bare sender ids.
 	// This lets certification aggregate the exact votes that justified the
 	// Bracha-style READY threshold.
-	readies               map[string]map[string]map[p2p.NodeID]crypto.VoteShare
-	readySent             map[string]bool
-	readySentEpoch        map[string]bool
-	reconSent             map[string]bool
-	certified             map[string]bool
-	joinAcks              map[string]map[p2p.NodeID]JoinAck
-	joinCommits           map[string]map[p2p.NodeID]JoinCommit
-	joinRequests          map[string]JoinRequest
-	pendingJoins          map[string]JoinCertificate
-	joinCoinWait          map[string]uint64
-	armSent               map[string]bool
-	commitSent            map[string]bool
-	joinCertSent          map[string]bool
-	abaInputSent          map[string]bool
-	abaInputs             map[string]bool
-	lockedFrom            uint64
-	pvssKeys              map[string]kyber.Scalar
-	pvssBackend           string
-	beaconSeeds           map[uint64][]byte
-	verified              map[string]verifiedObject
-	producerBusy          map[uint64]bool
-	producerLow           int
-	producerHigh          int
-	removalWait           time.Duration
-	lookaheadWait         time.Duration
-	currentMissingRemoval bool
-	explicitRemovalOnly   bool
-	producing             bool
-	waiters               map[string][]chan Beacon
-	certBeacons           map[string]Beacon
-	pendingCerts          map[string]BeaconCertificate
-	certifying            map[string]bool
+	readies             map[string]map[string]map[p2p.NodeID]crypto.SignedVote
+	readySent           map[string]bool
+	readySentEpoch      map[string]bool
+	reconSent           map[string]bool
+	certified           map[string]bool
+	joinAdmissionChoice map[string]string
+	joinRequestsV2      map[string]JoinRequest
+	joinAdmissions      map[string]map[p2p.NodeID]crypto.SignedVote
+	joinReadySent       map[string]bool
+	pendingJReady       *JoinReady
+	abaInputSent        map[string]bool
+	abaInputs           map[string]bool
+	pvssKeys            map[string]kyber.Scalar
+	pvssBackend         string
+	beaconSeeds         map[uint64][]byte
+	verified            map[string]verifiedObject
+	producerBusy        map[uint64]bool
+	producerLow         int
+	producerHigh        int
+	lookaheadWait       time.Duration
+	producing           bool
+	waiters             map[string][]chan Beacon
+	certBeacons         map[string]Beacon
+	pendingCerts        map[string]BeaconCertificate
+	certifying          map[string]bool
 
 	Beacons chan Beacon
 	Joins   chan JoinCertificate
@@ -295,13 +306,9 @@ func NewNode(cfg Config) (*Node, error) {
 	if low <= 0 {
 		low = 1
 	}
-	removalWait := cfg.RemovalExpiration
-	if removalWait <= 0 {
-		removalWait = 5 * time.Second
-	}
 	lookaheadWait := cfg.LookaheadExpiration
 	if lookaheadWait <= 0 {
-		lookaheadWait = removalWait
+		lookaheadWait = 5 * time.Second
 	}
 	pvssBackend := cfg.PVSSBackend
 	if pvssBackend == "" {
@@ -329,38 +336,101 @@ func NewNode(cfg Config) (*Node, error) {
 		st.ComQ[id] = make(map[uint64]Object)
 		st.RmMark[id] = -1
 	}
+	params := cfg.PVSSParams
+	if params.Epoch() == "" {
+		var err error
+		params, err = crypto.ParamsOf(cfg.PVSS)
+		if err != nil {
+			return nil, err
+		}
+	}
+	identityPrivate, identityPublic, err := resolveIdentityConfiguration(cfg, members)
+	if err != nil {
+		return nil, err
+	}
+	configuration, err := NewConfiguration(cfg.ConfigVersion, members, f, params, identityPublic)
+	if err != nil {
+		return nil, err
+	}
+	var rbcEngine *rbc.Broadcaster
+	var abaEngine *aba.Agreement
+	if configuration.Contains(cfg.ID) {
+		rbcEngine, err = rbc.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "pvss", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
+		if err != nil {
+			return nil, err
+		}
+		abaEngine, err = aba.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "control", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
+		if err != nil {
+			return nil, err
+		}
+	} else if !cfg.Learner {
+		return nil, fmt.Errorf("node %s is not a member; configure it explicitly as a learner", cfg.ID)
+	}
+	certified := certifiedStateFromRuntime(st, configuration)
 	n := &Node{
 		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{},
-		RBC:    rbc.New(cfg.ID, len(members), f, cfg.Transport),
-		ABA:    aba.New(cfg.ID, len(members), f, cfg.Transport),
-		Crypto: cryptoexec.New(cfg.CryptoWorkers),
-		State:  st,
-		recon:  make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool), reconClosing: make(map[string]bool),
-		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare),
+		RBC:            rbcEngine,
+		ABA:            abaEngine,
+		RBCs:           make(map[uint64]*rbc.Broadcaster),
+		ABAs:           make(map[uint64]*aba.Agreement),
+		engineStarted:  make(map[uint64]bool),
+		Crypto:         cryptoexec.New(cfg.CryptoWorkers),
+		State:          st,
+		Configurations: map[uint64]Configuration{configuration.Version: configuration},
+		ConfigurationSetups: map[uint64]ConfigurationSetup{
+			configuration.Version: {
+				Configuration: configuration,
+				Params:        params,
+				Scheme:        cfg.PVSS,
+			},
+		},
+		Certified:          certified,
+		HistoryAnchor:      CloneCertifiedState(certified),
+		IdentityPrivate:    append(ed25519.PrivateKey(nil), identityPrivate...),
+		signedParents:      make(map[string]string),
+		stateProposals:     make(map[string]CertifiedState),
+		stateVotes:         make(map[string]map[p2p.NodeID]crypto.SignedVote),
+		stateCertSent:      make(map[string]bool),
+		stateNotify:        make(chan struct{}),
+		allowInsecureSetup: cfg.InsecureDeterministicIdentity,
+		PVSSContexts: map[uint64]*PVSSContext{
+			cfg.ConfigVersion: {
+				Configuration: configuration,
+				Params:        params,
+				Scheme:        cfg.PVSS,
+				Status:        PVSSActive,
+			},
+		},
+		RBCCertificates: make(map[string]rbc.DeliveryCertificate),
+		Retirement:      make(map[string]*RetirementObligation),
+		Store:           cfg.Store,
+		recon:           make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool), reconClosing: make(map[string]bool),
+		echoes: make(map[string]map[string]map[p2p.NodeID]bool), readies: make(map[string]map[string]map[p2p.NodeID]crypto.SignedVote),
 		readySent: make(map[string]bool), readySentEpoch: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
-		joinAcks: make(map[string]map[p2p.NodeID]JoinAck), joinCommits: make(map[string]map[p2p.NodeID]JoinCommit),
-		joinRequests: make(map[string]JoinRequest), pendingJoins: make(map[string]JoinCertificate),
-		joinCoinWait: make(map[string]uint64),
-		armSent:      make(map[string]bool), commitSent: make(map[string]bool), joinCertSent: make(map[string]bool),
-		abaInputSent:          make(map[string]bool),
-		abaInputs:             make(map[string]bool),
-		beaconSeeds:           make(map[uint64][]byte),
-		verified:              make(map[string]verifiedObject),
-		producerBusy:          make(map[uint64]bool),
-		pvssKeys:              make(map[string]kyber.Scalar),
-		pvssBackend:           pvssBackend,
-		producerLow:           low,
-		producerHigh:          high,
-		removalWait:           removalWait,
-		lookaheadWait:         lookaheadWait,
-		currentMissingRemoval: cfg.CurrentMissingRemoval,
-		explicitRemovalOnly:   cfg.ExplicitRemovalOnly,
-		producing:             true,
-		waiters:               make(map[string][]chan Beacon),
-		certBeacons:           make(map[string]Beacon),
-		pendingCerts:          make(map[string]BeaconCertificate),
-		certifying:            make(map[string]bool),
-		Beacons:               make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
+		joinAdmissionChoice: make(map[string]string),
+		joinRequestsV2:      make(map[string]JoinRequest),
+		joinAdmissions:      make(map[string]map[p2p.NodeID]crypto.SignedVote),
+		joinReadySent:       make(map[string]bool),
+		abaInputSent:        make(map[string]bool),
+		abaInputs:           make(map[string]bool),
+		beaconSeeds:         make(map[uint64][]byte),
+		verified:            make(map[string]verifiedObject),
+		producerBusy:        make(map[uint64]bool),
+		pvssKeys:            make(map[string]kyber.Scalar),
+		pvssBackend:         pvssBackend,
+		producerLow:         low,
+		producerHigh:        high,
+		lookaheadWait:       lookaheadWait,
+		producing:           configuration.Contains(cfg.ID),
+		waiters:             make(map[string][]chan Beacon),
+		certBeacons:         make(map[string]Beacon),
+		pendingCerts:        make(map[string]BeaconCertificate),
+		certifying:          make(map[string]bool),
+		Beacons:             make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
+	}
+	if rbcEngine != nil {
+		n.RBCs[cfg.ConfigVersion] = rbcEngine
+		n.ABAs[cfg.ConfigVersion] = abaEngine
 	}
 	for epoch, key := range cfg.PVSSKeys {
 		if key != nil {
@@ -370,10 +440,40 @@ func NewNode(cfg Config) (*Node, error) {
 	if epoch := cfg.PVSS.Epoch(); epoch != "" && cfg.PVSS.PrivateKey() != nil {
 		n.pvssKeys[epoch] = cfg.PVSS.PrivateKey()
 	}
+	if n.Store == nil {
+		n.Store = NewMemoryStateStore()
+	}
+	for _, historical := range cfg.HistoricalConfigurations {
+		if err := historical.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid historical configuration %d: %w", historical.Version, err)
+		}
+		if existing, ok := n.Configurations[historical.Version]; ok && existing.Digest() != historical.Digest() {
+			return nil, fmt.Errorf("conflicting historical configuration %d", historical.Version)
+		}
+		n.Configurations[historical.Version] = historical
+	}
+	if cfg.BootstrapCheckpoint != nil {
+		if err := n.bootstrapCheckpoint(*cfg.BootstrapCheckpoint); err != nil {
+			return nil, err
+		}
+	}
+	if err := n.restorePersistentState(); err != nil {
+		return nil, err
+	}
+	n.mu.Lock()
+	if err := n.persistLocked(); err != nil {
+		n.mu.Unlock()
+		return nil, err
+	}
+	n.mu.Unlock()
 	return n, nil
 }
 
 func (n *Node) Start(ctx context.Context) {
+	n.mu.Lock()
+	n.protocolContext = ctx
+	n.startProtocolEngineCollectorsLocked(ctx, n.State.ConfigVersion)
+	n.mu.Unlock()
 	abaInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 4))
 	controlInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 2))
 	rbcInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 8))
@@ -408,11 +508,25 @@ func (n *Node) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (n *Node) startProtocolEngineCollectorsLocked(ctx context.Context, version uint64) {
+	if n.engineStarted[version] {
+		return
+	}
+	rbcEngine := n.RBCs[version]
+	abaEngine := n.ABAs[version]
+	if rbcEngine == nil || abaEngine == nil {
+		return
+	}
+	n.engineStarted[version] = true
 	go func() {
 		for {
 			select {
-			case d := <-n.RBC.Deliveries:
-				_ = n.handleRBCDelivery(ctx, d)
+			case delivery := <-rbcEngine.Deliveries:
+				if err := n.handleRBCDelivery(ctx, delivery); err != nil {
+					debugf("node=%s reject RBC delivery config=%d dealer=%s seq=%d err=%v", n.ID, delivery.ConfigVersion, delivery.Dealer, delivery.Seq, err)
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -421,10 +535,10 @@ func (n *Node) Start(ctx context.Context) {
 	go func() {
 		for {
 			select {
-			case dec := <-n.ABA.Decisions:
-				n.handleABADecision(ctx, dec)
-			case req := <-n.ABA.CoinRequests:
-				n.handleCoinRequest(req)
+			case decision := <-abaEngine.Decisions:
+				n.handleABADecision(ctx, decision)
+			case request := <-abaEngine.CoinRequests:
+				n.handleCoinRequest(request)
 			case <-ctx.Done():
 				return
 			}
@@ -482,8 +596,18 @@ func (n *Node) Handle(ctx context.Context, msg p2p.Message) error {
 }
 
 func (n *Node) handleRBCMessage(ctx context.Context, msg p2p.Message) error {
+	version, ok := rbc.ConfigVersionFromInstance(msg.Instance)
+	if !ok {
+		return nil
+	}
+	n.mu.Lock()
+	engine := n.RBCs[version]
+	n.mu.Unlock()
+	if engine == nil {
+		return nil
+	}
 	start := time.Now()
-	err := n.RBC.Handle(ctx, msg)
+	err := engine.Handle(ctx, msg)
 	if n.Perf != nil {
 		n.Perf.addRBCHandle(time.Since(start))
 	}
@@ -491,8 +615,18 @@ func (n *Node) handleRBCMessage(ctx context.Context, msg p2p.Message) error {
 }
 
 func (n *Node) handleABAMessage(ctx context.Context, msg p2p.Message) error {
+	version, ok := aba.ConfigVersionFromInstance(msg.Instance)
+	if !ok {
+		return nil
+	}
+	n.mu.Lock()
+	engine := n.ABAs[version]
+	n.mu.Unlock()
+	if engine == nil {
+		return nil
+	}
 	start := time.Now()
-	err := n.ABA.Handle(ctx, msg)
+	err := engine.Handle(ctx, msg)
 	if n.Perf != nil {
 		n.Perf.addABAHandle(time.Since(start))
 	}
@@ -501,9 +635,9 @@ func (n *Node) handleABAMessage(ctx context.Context, msg p2p.Message) error {
 
 func (n *Node) Produce(ctx context.Context) (Object, error) {
 	n.mu.Lock()
-	if !n.producing {
+	if !n.producing || n.RBC == nil || !contains(n.State.Members, n.ID) {
 		n.mu.Unlock()
-		return Object{}, errors.New("local producer is stopped")
+		return Object{}, errors.New("local node is not an active producer in the certified configuration")
 	}
 	if n.producerWindowDepthLocked() >= n.producerHigh {
 		n.mu.Unlock()
@@ -513,6 +647,12 @@ func (n *Node) Produce(ctx context.Context) (Object, error) {
 	seq := n.State.ProducerSeq
 	version := n.State.ConfigVersion
 	n.producerBusy[seq] = true
+	if err := n.persistLocked(); err != nil {
+		delete(n.producerBusy, seq)
+		n.State.ProducerSeq--
+		n.mu.Unlock()
+		return Object{}, err
+	}
 	n.mu.Unlock()
 	obj, err := n.produceSeq(ctx, seq, version)
 	n.finishProducerSeq(seq)
@@ -537,6 +677,10 @@ func (n *Node) IsProducing() bool {
 
 func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
 	n.mu.Lock()
+	if !n.producing || n.RBC == nil || !contains(n.State.Members, n.ID) {
+		n.mu.Unlock()
+		return 0, errors.New("local node is not an active producer in the certified configuration")
+	}
 	seq := n.State.Seqs[n.ID] + 1
 	version := n.State.ConfigVersion
 	if obj, ok := n.State.ComQ[n.ID][seq]; ok && obj.ConfigVersion == version {
@@ -548,6 +692,11 @@ func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
 			n.State.ProducerSeq = seq
 		}
 		n.producerBusy[seq] = true
+		if err := n.persistLocked(); err != nil {
+			delete(n.producerBusy, seq)
+			n.mu.Unlock()
+			return seq, err
+		}
 		n.mu.Unlock()
 		obj, err := n.produceSeq(ctx, seq, version)
 		if err != nil {
@@ -682,7 +831,9 @@ func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
 				producing = true
 			}
 			if producing && level < high && storedDepth < queueLen {
-				_, _ = n.Produce(ctx)
+				if _, err := n.Produce(ctx); err != nil {
+					debugf("node=%s producer attempt failed: %v", n.ID, err)
+				}
 			}
 			select {
 			case <-ticker.C:
@@ -733,6 +884,12 @@ func (n *Node) RunEpoch(ctx context.Context) (Beacon, error) {
 }
 
 func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
+	n.mu.Lock()
+	active := contains(n.Certified.Members, n.ID) && n.RBC != nil && n.ABA != nil
+	n.mu.Unlock()
+	if !active {
+		return Beacon{}, errors.New("learner or removed node cannot drive an epoch before activation")
+	}
 	for {
 		if b, ok := n.applyPendingBeaconCert(epoch); ok {
 			return b, nil
@@ -747,17 +904,16 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 		if err != nil {
 			return Beacon{}, err
 		}
-		wait := n.registerBeaconWaiter(epoch, source, seq)
-		if alreadyCertified {
-			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			return b, err
-		}
 		if skipCurrentABA {
-			if err := n.startRemovalEpochEcho(ctx, epoch, source, seq); err != nil {
-				n.unregisterBeaconWaiter(epoch, source, seq, wait)
+			if err := n.runCertifiedRemoval(ctx, source); err != nil {
 				return Beacon{}, err
 			}
+			// REMOVE preserves the epoch and randomness. Re-evaluate the source
+			// against the newly certified configuration for this same epoch.
+			continue
+		}
+		wait := n.registerBeaconWaiter(epoch, source, seq)
+		if alreadyCertified {
 			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return b, err
@@ -833,13 +989,8 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
 				return Beacon{}, err
 			}
-			n.mu.Lock()
-			includeObject := n.currentMissingRemoval
-			n.mu.Unlock()
 			recon := ReconMessage{Epoch: epoch, Source: source, Seq: seq, Share: sh}
-			if includeObject {
-				recon.Object = &obj
-			}
+			recon.Object = &obj
 			msg, err := p2p.NewMessage(Protocol, "RECON", instance, n.ID, "", recon)
 			if err != nil {
 				n.mu.Lock()
@@ -909,54 +1060,6 @@ func (n *Node) waitForEpochBeacon(ctx context.Context, epoch uint64, source p2p.
 	}
 }
 
-func (n *Node) startRemovalEpochEcho(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64) error {
-	key := epochKey(epoch, source, seq)
-	n.mu.Lock()
-	if n.reconSent[key] || n.reconDone[key] {
-		n.mu.Unlock()
-		return nil
-	}
-	version := n.State.ConfigVersion
-	prev := append([]byte(nil), n.State.RPrev...)
-	n.reconSent[key] = true
-	n.reconDone[key] = true
-	n.mu.Unlock()
-	random := crypto.HashBytes(prev, []byte(fmt.Sprintf("removal/%d/%s/%d", version, source, seq)))
-	echo, err := p2p.NewMessage(Protocol, "RECON_ECHO", key, n.ID, "", ReconEchoMessage{Epoch: epoch, Source: source, Seq: seq, Random: random})
-	if err != nil {
-		return err
-	}
-	return n.Transport.Broadcast(ctx, echo)
-}
-
-func (n *Node) startMissingCurrentRemovalEpochEcho(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64) error {
-	key := epochKey(epoch, source, seq)
-	instance := aba.EpochInstance(epoch, source)
-	n.mu.Lock()
-	if n.reconSent[key] || n.reconDone[key] {
-		n.mu.Unlock()
-		return nil
-	}
-	if n.State.RmMark[source] == -1 || n.State.RmMark[source] > int64(seq) {
-		n.State.RmMark[source] = int64(seq)
-	}
-	delete(n.State.PendingABAs, instance)
-	delete(n.abaInputSent, instance)
-	delete(n.abaInputs, instance)
-	version := n.State.ConfigVersion
-	prev := append([]byte(nil), n.State.RPrev...)
-	n.reconSent[key] = true
-	n.reconDone[key] = true
-	n.mu.Unlock()
-	debugf("node=%s current-missing-removal epoch=%d source=%s seq=%d", n.ID, epoch, source, seq)
-	random := crypto.HashBytes(prev, []byte(fmt.Sprintf("removal/%d/%s/%d", version, source, seq)))
-	echo, err := p2p.NewMessage(Protocol, "RECON_ECHO", key, n.ID, "", ReconEchoMessage{Epoch: epoch, Source: source, Seq: seq, Random: random})
-	if err != nil {
-		return err
-	}
-	return n.Transport.Broadcast(ctx, echo)
-}
-
 func (n *Node) registerBeaconWaiter(epoch uint64, source p2p.NodeID, seq uint64) chan Beacon {
 	key := epochKey(epoch, source, seq)
 	ch := make(chan Beacon, 1)
@@ -994,7 +1097,7 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 		for _, b := range n.certBeacons {
 			if b.Epoch == epoch {
 				n.mu.Unlock()
-				return b.Source, b.Seq, aba.EpochInstance(epoch, b.Source), false, true, nil
+				return b.Source, b.Seq, aba.EpochInstanceFor(b.ConfigVersion, epoch, b.Source, b.Seq), false, true, nil
 			}
 		}
 		n.mu.Unlock()
@@ -1014,8 +1117,8 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 	idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
 	source := n.State.SCL[idx]
 	seq := n.State.Seqs[source] + 1
-	instance := aba.EpochInstance(epoch, source)
-	skipCurrentABA := n.State.RmMark[source] != -1 && seq == uint64(n.State.RmMark[source])
+	instance := aba.EpochInstanceFor(n.State.ConfigVersion, epoch, source, seq)
+	skipCurrentABA := n.Certified.RmMark[source] >= 0 && seq == uint64(n.Certified.RmMark[source])
 	useLookaheadABA := n.State.QueueLen > 1
 	if useLookaheadABA && !skipCurrentABA && n.State.PendingABAs[instance] == nil {
 		n.State.PendingABAs[instance] = &PendingABA{Instance: instance, Epoch: epoch, Source: source, Seq: seq}
@@ -1035,18 +1138,6 @@ func (n *Node) prepareEpoch(ctx context.Context, epoch uint64) (p2p.NodeID, uint
 func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64, instance string, wait <-chan Beacon) (Object, *Beacon, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	var expire <-chan time.Time
-	var expireTimer *time.Timer
-	n.mu.Lock()
-	currentMissingRemoval := n.currentMissingRemoval
-	explicitRemovalOnly := n.explicitRemovalOnly
-	producing := n.producing
-	n.mu.Unlock()
-	if currentMissingRemoval && !explicitRemovalOnly && (source != n.ID || !producing) {
-		expireTimer = time.NewTimer(n.removalWait)
-		defer expireTimer.Stop()
-		expire = expireTimer.C
-	}
 	loggedWait := false
 	for {
 		if b, ok := n.certifiedBeaconForEpoch(epoch); ok {
@@ -1068,15 +1159,6 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 		case b := <-wait:
 			return Object{}, &b, nil
 		case <-ticker.C:
-		case <-expire:
-			if err := n.startMissingCurrentRemovalEpochEcho(ctx, epoch, source, seq); err != nil {
-				return Object{}, nil, err
-			}
-			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, wait)
-			if err != nil {
-				return Object{}, nil, err
-			}
-			return Object{}, &b, nil
 		case <-ctx.Done():
 			return Object{}, nil, ctx.Err()
 		}
@@ -1087,7 +1169,6 @@ func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint
 	next := seq + 1
 	n.mu.Lock()
 	queueLen := n.State.QueueLen
-	explicitRemovalOnly := n.explicitRemovalOnly
 	n.mu.Unlock()
 	if queueLen <= 1 {
 		return nil, nil
@@ -1095,9 +1176,6 @@ func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	lookaheadWait := n.lookaheadWait
-	if explicitRemovalOnly {
-		lookaheadWait = minDuration(lookaheadWait, 250*time.Millisecond)
-	}
 	expire := time.NewTimer(lookaheadWait)
 	defer expire.Stop()
 	for {
@@ -1120,22 +1198,11 @@ func (n *Node) proposeEpochABAInputFromLookahead(ctx context.Context, epoch uint
 			return &b, nil
 		case <-ticker.C:
 		case <-expire.C:
-			if explicitRemovalOnly {
-				n.dropPendingEpochABA(instance)
-				return nil, nil
-			}
 			return nil, n.proposeEpochABAInput(context.Background(), instance, false)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a <= 0 || a > b {
-		return b
-	}
-	return a
 }
 
 func (n *Node) proposeEpochABAInput(ctx context.Context, instance string, value bool) error {
@@ -1150,30 +1217,11 @@ func (n *Node) proposeEpochABAInput(ctx context.Context, instance string, value 
 	return n.ABA.Propose(ctx, instance, value)
 }
 
-func (n *Node) dropPendingEpochABA(instance string) {
-	n.mu.Lock()
-	delete(n.State.PendingABAs, instance)
-	delete(n.abaInputSent, instance)
-	delete(n.abaInputs, instance)
-	n.mu.Unlock()
-}
-
 func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	rebroadcast := time.NewTicker(100 * time.Millisecond)
 	defer rebroadcast.Stop()
-	n.mu.Lock()
-	explicitRemovalOnly := n.explicitRemovalOnly
-	readyWait := minDuration(n.lookaheadWait, 250*time.Millisecond)
-	n.mu.Unlock()
-	var expire <-chan time.Time
-	var expireTimer *time.Timer
-	if explicitRemovalOnly {
-		expireTimer = time.NewTimer(readyWait)
-		defer expireTimer.Stop()
-		expire = expireTimer.C
-	}
 	for {
 		st := n.ABA.Status(instance)
 		if st.Decided || st.CoinWait {
@@ -1192,9 +1240,6 @@ func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
 			if hasInput {
 				_ = n.ABA.Propose(context.Background(), instance, input)
 			}
-		case <-expire:
-			n.dropPendingEpochABA(instance)
-			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -1252,7 +1297,7 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 		if st.Decided {
 			p.Decided = true
 			p.Decision = st.Value
-			if !st.Value && !n.explicitRemovalOnly && n.State.RmMark[p.Source] == -1 {
+			if !st.Value && n.State.RmMark[p.Source] == -1 {
 				n.markRemovalLocked(p.Source, p.Seq)
 			}
 			delete(n.State.PendingABAs, inst)
@@ -1282,6 +1327,15 @@ func (n *Node) refreshPendingABAs(current string) (bool, []seedFeed) {
 }
 
 func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
+	n.mu.Lock()
+	engine := n.RBCs[d.ConfigVersion]
+	n.mu.Unlock()
+	if engine == nil {
+		return nil
+	}
+	if err := engine.VerifyDeliveryCertificate(d.Certificate); err != nil {
+		return err
+	}
 	var env envelope
 	if err := json.Unmarshal(d.Value, &env); err != nil {
 		return err
@@ -1292,6 +1346,12 @@ func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
 			return nil
 		}
 		obj := *env.Object
+		if obj.ConfigVersion != d.ConfigVersion || obj.Producer != d.Dealer {
+			return nil
+		}
+		n.mu.Lock()
+		n.RBCCertificates[rbcCertificateKey(obj.ConfigVersion, obj.Commitment.SecretID)] = d.Certificate
+		n.mu.Unlock()
 		n.Crypto.Go(ctx, func() { _ = n.storeObject(obj) })
 		return nil
 	case "join":
@@ -1370,8 +1430,14 @@ func (n *Node) ensureVerified(obj Object) error {
 		}
 		return errors.New("invalid pvss object")
 	}
+	n.mu.Lock()
+	pvssContext := n.PVSSContexts[obj.ConfigVersion]
+	n.mu.Unlock()
+	if pvssContext == nil || pvssContext.Scheme == nil {
+		return fmt.Errorf("missing PVSS context for configuration %d", obj.ConfigVersion)
+	}
 	start := time.Now()
-	valid := n.PVSS.Verify(obj.Commitment)
+	valid := pvssContext.Scheme.Verify(obj.Commitment)
 	if n.Perf != nil {
 		n.Perf.addPVSSVerify(time.Since(start))
 	}
@@ -1400,7 +1466,7 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.GoPriority(ctx, func() {
-			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, "", CertifiedStateDigest{}, crypto.VoteShare{})
+			n.observeEchoReady(ctx, "echo", from, body.Epoch, body.Source, body.Seq, body.Random, "", crypto.SignedVote{})
 		})
 	case "RECON_READY":
 		body, err := p2p.DecodePayload[signedReconReadyMessage](msg)
@@ -1409,38 +1475,56 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		}
 		from := msg.From
 		n.Crypto.GoPriority(ctx, func() {
-			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.StateHash, CertifiedStateDigest{}, body.Signature)
+			n.observeEchoReady(ctx, "ready", from, body.Epoch, body.Source, body.Seq, body.Random, body.StateHash, body.Signature)
 		})
-	case "JOIN_ACK":
-		body, err := p2p.DecodePayload[JoinAck](msg)
+	case "JOIN_REQUEST":
+		body, err := p2p.DecodePayload[JoinRequest](msg)
 		if err != nil {
 			return err
 		}
-		return n.HandleJoinAck(ctx, body)
-	case "JOIN_ARM":
-		body, err := p2p.DecodePayload[JoinArm](msg)
+		return n.HandleJoinRequest(ctx, body)
+	case "JOIN_ADMISSION":
+		body, err := p2p.DecodePayload[JoinAdmissionVote](msg)
 		if err != nil {
 			return err
 		}
-		return n.HandleJoinArm(ctx, body)
-	case "JOIN_COMMIT":
-		body, err := p2p.DecodePayload[JoinCommit](msg)
+		return n.HandleJoinAdmission(ctx, body)
+	case "JOIN_READY_CERT":
+		body, err := p2p.DecodePayload[JoinReadyCertificate](msg)
 		if err != nil {
 			return err
 		}
-		return n.HandleJoinCommit(ctx, body)
-	case "JOIN_CERT":
-		body, err := p2p.DecodePayload[JoinCertificate](msg)
-		if err != nil {
-			return err
-		}
-		return n.InstallJoinCertificate(body)
+		return n.HandleJoinReadyCertificate(body)
 	case "BEACON_CERT":
 		body, err := p2p.DecodePayload[BeaconCertificate](msg)
 		if err != nil {
 			return err
 		}
 		return n.handleBeaconCert(body)
+	case "STATE_PROPOSAL":
+		body, err := p2p.DecodePayload[StateProposalMessage](msg)
+		if err != nil {
+			return err
+		}
+		return n.HandleStateProposal(ctx, body)
+	case "STATE_VOTE":
+		body, err := p2p.DecodePayload[StateVoteMessage](msg)
+		if err != nil {
+			return err
+		}
+		return n.HandleStateVote(ctx, body)
+	case "STATE_CERT":
+		body, err := p2p.DecodePayload[StateCertificateMessage](msg)
+		if err != nil {
+			return err
+		}
+		return n.InstallStateCertificate(body)
+	case "RETIRE_SHARE":
+		body, err := p2p.DecodePayload[RetirementShareMessage](msg)
+		if err != nil {
+			return err
+		}
+		return n.HandleRetirementShare(body, msg.From)
 	}
 	return nil
 }
@@ -1464,6 +1548,12 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	}
 	key := epochKey(body.Epoch, body.Source, body.Seq)
 	n.mu.Lock()
+	pvssContext := n.PVSSContexts[obj.ConfigVersion]
+	if pvssContext == nil || pvssContext.Scheme == nil {
+		n.mu.Unlock()
+		return nil
+	}
+	scheme := pvssContext.Scheme
 	if n.reconDone[key] || n.reconClosing[key] || body.Share.CommitmentID != obj.Commitment.SecretID {
 		n.mu.Unlock()
 		return nil
@@ -1476,7 +1566,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	}
 	n.mu.Unlock()
 	start := time.Now()
-	validShare := n.PVSS.VerifyShare(obj.Commitment, body.Share)
+	validShare := scheme.VerifyShare(obj.Commitment, body.Share)
 	if n.Perf != nil {
 		n.Perf.addPVSSVerify(time.Since(start))
 	}
@@ -1514,7 +1604,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	// their decryption proofs in handleRecon, so reconstruction can reuse that
 	// local validation instead of checking the same proofs again.
 	start = time.Now()
-	secret, err := n.PVSS.ReconFromVerifiedShares(obj.Commitment, shares)
+	secret, err := scheme.ReconFromVerifiedShares(obj.Commitment, shares)
 	if n.Perf != nil {
 		n.Perf.addPVSSRecon(time.Since(start))
 	}
@@ -1524,8 +1614,8 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 		n.mu.Unlock()
 		return err
 	}
-	random := crypto.HashBytes(prev, secret)
 	n.mu.Lock()
+	random := n.mixRetirementEntropyLocked(prev, secret, body.Epoch)
 	if n.reconDone[key] {
 		n.mu.Unlock()
 		return nil
@@ -1546,58 +1636,67 @@ func debugf(format string, args ...any) {
 	}
 }
 
-func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, stateHash string, state CertifiedStateDigest, sig crypto.VoteShare) {
+func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeID, epoch uint64, source p2p.NodeID, seq uint64, random []byte, stateHash string, sig crypto.SignedVote) {
 	key := epochKey(epoch, source, seq)
 	rh := hex.EncodeToString(random)
-	voteKey := rh + "/" + stateHash
-	readyKey := key + "/" + voteKey
 	n.mu.Lock()
-	if n.State.Epoch >= epoch {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.Certified.Epoch+1 != epoch {
 		n.mu.Unlock()
 		return
 	}
-	n.mu.Unlock()
-	if kind == "ready" {
-		n.mu.Lock()
-		duplicate := n.certified[readyKey]
-		if !duplicate && n.readies[key] != nil && n.readies[key][voteKey] != nil {
-			_, duplicate = n.readies[key][voteKey][from]
-		}
-		members := n.memberSetLocked()
+	parent := CloneCertifiedState(n.Certified)
+	parentConfig, configured := n.Configurations[parent.ConfigVersion]
+	child, childErr := n.entropySuccessorWithControlLocked(parent, random, source, seq)
+	if childErr != nil || !configured {
 		n.mu.Unlock()
-		if duplicate {
+		return
+	}
+	childHash := HashCertifiedState(child)
+	if stateHash != "" && stateHash != childHash {
+		n.mu.Unlock()
+		return
+	}
+	stateHash = childHash
+	voteKey := rh + "/" + stateHash
+	readyKey := key + "/" + voteKey
+	if n.certified[readyKey] {
+		n.mu.Unlock()
+		return
+	}
+	if kind == "ready" {
+		if sig.Signer != string(from) {
+			n.mu.Unlock()
 			return
 		}
-		// A READY is counted only if it carries a valid signature over the exact
-		// READY transcript. This preserves the original threshold rule while
-		// preventing a bare sender id from becoming part of the certificate.
+		if n.readies[key] != nil && n.readies[key][voteKey] != nil {
+			if _, duplicate := n.readies[key][voteKey][from]; duplicate {
+				n.mu.Unlock()
+				return
+			}
+		}
+		transcript := StateVoteTranscript(parent.ConfigVersion, TransitionEntropy, HashCertifiedState(parent), childHash)
+		n.mu.Unlock()
 		start := time.Now()
-		valid := sig.Signer == string(from) && crypto.VerifyVoteShare(sig, members)
+		err := crypto.VerifySignedVote(sig, parentConfig.PublicKeys(), transcript)
 		if n.Perf != nil {
 			n.Perf.addCertVerify(time.Since(start))
 		}
-		if !valid {
+		if err != nil {
 			return
 		}
-	}
-	n.mu.Lock()
-	if kind == "echo" {
-		state = n.certifiedStateDigestForBeaconLocked(source, seq)
-		stateHash = stateDigestHash(state)
-		voteKey = rh + "/" + stateHash
-		readyKey = key + "/" + voteKey
+		n.mu.Lock()
 	}
 	if n.echoes[key] == nil {
 		n.echoes[key] = make(map[string]map[p2p.NodeID]bool)
 	}
 	if n.readies[key] == nil {
-		n.readies[key] = make(map[string]map[p2p.NodeID]crypto.VoteShare)
+		n.readies[key] = make(map[string]map[p2p.NodeID]crypto.SignedVote)
 	}
 	if n.echoes[key][rh] == nil {
 		n.echoes[key][rh] = make(map[p2p.NodeID]bool)
 	}
 	if n.readies[key][voteKey] == nil {
-		n.readies[key][voteKey] = make(map[p2p.NodeID]crypto.VoteShare)
+		n.readies[key][voteKey] = make(map[p2p.NodeID]crypto.SignedVote)
 	}
 	if kind == "echo" {
 		n.echoes[key][rh][from] = true
@@ -1606,38 +1705,25 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 	}
 	echoCount := len(n.echoes[key][rh])
 	readyCount := len(n.readies[key][voteKey])
-	needReady := !n.readySentEpoch[key] && !n.readySent[readyKey] && (echoCount >= 2*n.State.F+1 || readyCount >= n.State.F+1)
+	needReady := !n.readySentEpoch[key] && !n.readySent[readyKey] && (echoCount >= parentConfig.Q || readyCount >= parentConfig.F+1)
 	if needReady {
 		n.readySentEpoch[key] = true
 		n.readySent[readyKey] = true
 	}
-	certify := !n.certified[readyKey] && readyCount >= 2*n.State.F+1
+	certify := !n.certified[readyKey] && readyCount >= parentConfig.Q
 	var senders []p2p.NodeID
-	var votes []crypto.VoteShare
-	var members map[string]struct{}
+	var votes []crypto.SignedVote
 	if certify {
-		if len(state.Members) == 0 {
-			state = n.certifiedStateDigestForBeaconLocked(source, seq)
-			if stateDigestHash(state) != stateHash {
-				certify = false
-			}
+		for id := range n.readies[key][voteKey] {
+			senders = append(senders, id)
+			votes = append(votes, n.readies[key][voteKey][id])
 		}
-		members = n.memberSetLocked()
-		if certify {
-			for id := range n.readies[key][voteKey] {
-				senders = append(senders, id)
-				votes = append(votes, n.readies[key][voteKey][id])
-			}
-			sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
-		}
+		sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
 	}
 	n.mu.Unlock()
 	if needReady {
-		// READY amplification is unchanged: once enough ECHO/READY evidence is
-		// observed, this node broadcasts READY. The added vote signs the
-		// same canonical statement that will later be aggregated.
 		start := time.Now()
-		sig, err := crypto.NewVoteShare(string(n.ID))
+		sig, err := SignStateVote(n.ID, n.IdentityPrivate, parentConfig, TransitionEntropy, HashCertifiedState(parent), childHash)
 		if n.Perf != nil {
 			n.Perf.addCertSign(time.Since(start))
 		}
@@ -1649,12 +1735,8 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		}
 	}
 	if certify {
-		// Certification now outputs a compact aggregate quorum certificate for the
-		// 2f+1 READY quorum. The quorum threshold and random reconstruction are
-		// unchanged; only the representation of the READY certificate is smaller
-		// and externally verifiable.
 		start := time.Now()
-		cert, err := crypto.BuildQuorumCertificate(votes, members, 2*n.State.F+1)
+		stateQC, err := BuildStateQC(parentConfig, TransitionEntropy, HashCertifiedState(parent), childHash, votes)
 		if n.Perf != nil {
 			n.Perf.addCertAggregate(time.Since(start))
 		}
@@ -1668,14 +1750,14 @@ func (n *Node) observeEchoReady(ctx context.Context, kind string, from p2p.NodeI
 		}
 		n.certified[readyKey] = true
 		n.mu.Unlock()
-		n.certifyBeacon(epoch, source, seq, random, state, senders, cert, true)
+		n.certifyBeacon(epoch, source, seq, random, child, stateQC, senders, true)
 	}
 }
 
-func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate, broadcastCert bool) {
+func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, child CertifiedState, stateQC StateQC, senders []p2p.NodeID, broadcastCert bool) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.joinLockBlocksEpochLocked(epoch, source, seq) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch {
 		n.mu.Unlock()
 		return
 	}
@@ -1685,50 +1767,66 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 	}
 	n.certifying[key] = true
 	n.mu.Unlock()
-	go n.finishCertifyBeacon(epoch, source, seq, random, state, senders, cert, broadcastCert)
+	go n.finishCertifyBeacon(epoch, source, seq, random, child, stateQC, senders, broadcastCert)
 }
 
-func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, state CertifiedStateDigest, senders []p2p.NodeID, cert crypto.QuorumCertificate, broadcastCert bool) {
+func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, child CertifiedState, stateQC StateQC, senders []p2p.NodeID, broadcastCert bool) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.joinLockBlocksEpochLocked(epoch, source, seq) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch {
 		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
 	}
 	obj := n.State.ComQ[source][seq]
+	parent := CloneCertifiedState(n.Certified)
+	parentConfig, configured := n.Configurations[parent.ConfigVersion]
 	prev := append([]byte(nil), n.State.RPrev...)
 	secret := append([]byte(nil), n.reconSecret[key]...)
 	n.beaconSeeds[epoch] = append([]byte(nil), random...)
 	feeds := n.processPendingABAsLocked(epoch)
-	joinFeeds := n.processJoinCoinWaitsLocked(epoch)
 	n.discardCertifiedEpochABAsLocked(epoch)
 	n.mu.Unlock()
-	for _, feed := range feeds {
-		n.ABA.FeedSeed(context.Background(), feed.instance, feed.round, random)
-		n.waitPendingABAAfterSeed(context.Background(), feed)
-	}
-	for _, feed := range joinFeeds {
-		n.ABA.FeedSeed(context.Background(), feed.instance, feed.round, random)
-	}
-
-	n.mu.Lock()
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch || n.joinLockBlocksEpochLocked(epoch, source, seq) {
+	if !configured || VerifyStateQC(parentConfig, parent, child, stateQC) != nil {
+		n.mu.Lock()
 		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
 	}
-	removalMarks := copyRemovalMarks(n.State.RmMark)
+	for _, feed := range feeds {
+		n.ABA.FeedSeed(context.Background(), feed.instance, feed.round, random)
+		n.waitPendingABAAfterSeed(context.Background(), feed)
+	}
+	n.mu.Lock()
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch {
+		delete(n.certifying, key)
+		n.mu.Unlock()
+		return
+	}
 	configVersion := n.State.ConfigVersion
-	n.installCertifiedStateLocked(state)
-	n.mergeRemovalMarksLocked(removalMarks)
-	n.State.Epoch = epoch
-	n.State.RPrev = append([]byte(nil), random...)
+	if HashCertifiedState(n.Certified) != stateQC.ParentHash {
+		delete(n.certifying, key)
+		n.mu.Unlock()
+		return
+	}
+	if err := n.persistCertifiedLocked(child, stateQC); err != nil {
+		delete(n.certifying, key)
+		n.mu.Unlock()
+		return
+	}
+	n.installCertifiedEntropyLocked(child, stateQC)
+	n.consumeRetirementEntropyLocked(epoch)
+	if err := n.persistLocked(); err != nil {
+		delete(n.certifying, key)
+		n.mu.Unlock()
+		return
+	}
 	n.cleanupCertifiedStateLocked(epoch)
 	b := Beacon{
 		Epoch: epoch, Source: source, Seq: seq, PrevRandom: prev, Random: append([]byte(nil), random...),
-		Secret: secret, ObjectID: obj.Commitment.SecretID, ReadySenders: senders, Signature: cert,
-		ConfigVersion: configVersion, State: state, StateHash: stateDigestHash(state),
+		Secret: secret, ObjectID: obj.Commitment.SecretID, ReadySenders: senders,
+		ConfigVersion: configVersion, StateHash: HashCertifiedState(child),
+		CertifiedState: child, StateQC: stateQC,
 	}
 	n.certBeacons[key] = b
 	delete(n.certifying, key)
@@ -1745,11 +1843,11 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		default:
 		}
 	}
-	if broadcastCert && n.shouldBroadcastBeaconCert(cert) {
+	if broadcastCert && n.shouldBroadcastBeaconCert(stateQC) {
 		c := BeaconCertificate{
 			Epoch: epoch, Source: source, Seq: seq, Random: append([]byte(nil), random...),
-			ObjectID: obj.Commitment.SecretID, Signature: cert, ConfigVersion: configVersion,
-			StateHash: stateDigestHash(state),
+			ObjectID: obj.Commitment.SecretID, ConfigVersion: configVersion,
+			StateHash: HashCertifiedState(child), CertifiedState: child, StateQC: stateQC,
 		}
 		msg, err := p2p.NewMessage(Protocol, "BEACON_CERT", key, n.ID, "", c)
 		if err == nil {
@@ -1758,14 +1856,16 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	}
 }
 
-func (n *Node) shouldBroadcastBeaconCert(cert crypto.QuorumCertificate) bool {
+func (n *Node) shouldBroadcastBeaconCert(cert StateQC) bool {
 	relays := certificateSigners(cert)
 	return len(relays) > 0 && relays[0] == n.ID
 }
 
-func certificateSigners(cert crypto.QuorumCertificate) []p2p.NodeID {
-	signers := make([]string, 0, len(cert.Signers))
-	signers = append(signers, cert.Signers...)
+func certificateSigners(cert StateQC) []p2p.NodeID {
+	signers := make([]string, 0, len(cert.Signature.Votes))
+	for _, vote := range cert.Signature.Votes {
+		signers = append(signers, vote.Signer)
+	}
 	sort.Strings(signers)
 	ids := make([]p2p.NodeID, 0, len(signers))
 	for _, signer := range signers {
@@ -1792,7 +1892,7 @@ func (n *Node) handleBeaconCert(b BeaconCertificate) error {
 func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 	key := epochKey(b.Epoch, b.Source, b.Seq)
 	n.mu.Lock()
-	if n.State.Epoch >= b.Epoch || n.State.Epoch+1 != b.Epoch || b.ConfigVersion != n.State.ConfigVersion || n.joinLockBlocksEpochLocked(b.Epoch, b.Source, b.Seq) {
+	if n.State.Epoch >= b.Epoch || n.State.Epoch+1 != b.Epoch || b.ConfigVersion != n.State.ConfigVersion {
 		if n.State.Epoch < b.Epoch && b.ConfigVersion == n.State.ConfigVersion {
 			n.pendingCerts[key] = b
 		}
@@ -1800,21 +1900,11 @@ func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 		return false
 	}
 	obj, ok := n.State.ComQ[b.Source][b.Seq]
-	removalEpoch := n.State.RmMark[b.Source] != -1 && b.Seq == uint64(n.State.RmMark[b.Source])
-	threshold := 2*n.State.F + 1
-	members := n.memberSetLocked()
-	state := CertifiedStateDigest{}
-	stateHash := ""
-	if ok && obj.ConfigVersion == b.ConfigVersion {
-		state = n.certifiedStateDigestForBeaconLocked(b.Source, b.Seq)
-		stateHash = stateDigestHash(state)
-	} else if removalEpoch {
-		state = n.certifiedStateDigestForBeaconLocked(b.Source, b.Seq)
-		stateHash = stateDigestHash(state)
-	}
+	parent := CloneCertifiedState(n.Certified)
+	parentConfig, configured := n.Configurations[parent.ConfigVersion]
 	n.mu.Unlock()
 
-	if (!ok || obj.ConfigVersion != b.ConfigVersion) && !removalEpoch {
+	if !ok || obj.ConfigVersion != b.ConfigVersion || !configured {
 		n.mu.Lock()
 		if n.State.Epoch < b.Epoch && b.ConfigVersion == n.State.ConfigVersion {
 			n.pendingCerts[key] = b
@@ -1822,31 +1912,26 @@ func (n *Node) tryApplyBeaconCert(b BeaconCertificate) bool {
 		n.mu.Unlock()
 		return false
 	}
-	if removalEpoch {
-		if b.ObjectID != "" {
-			return false
-		}
-	} else if b.ObjectID != "" && b.ObjectID != obj.Commitment.SecretID {
+	if b.ObjectID != "" && b.ObjectID != obj.Commitment.SecretID {
 		return false
 	}
-	if b.StateHash == "" || b.StateHash != stateHash {
+	if b.CertifiedState.Epoch != b.Epoch || b.CertifiedState.ConfigVersion != b.ConfigVersion ||
+		string(b.CertifiedState.Random) != string(b.Random) ||
+		b.StateHash == "" || b.StateHash != HashCertifiedState(b.CertifiedState) {
 		return false
 	}
-	if err := crypto.VerifyQuorumCertificate(b.Signature, members, threshold); err != nil {
+	if err := VerifyStateQC(parentConfig, parent, b.CertifiedState, b.StateQC); err != nil {
 		return false
 	}
 	n.mu.Lock()
 	delete(n.pendingCerts, key)
 	n.mu.Unlock()
-	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, state, certificateSigners(b.Signature), b.Signature, false)
-	return true
-}
-
-func (n *Node) joinLockBlocksEpochLocked(epoch uint64, source p2p.NodeID, seq uint64) bool {
-	if n.lockedFrom == 0 || epoch < n.lockedFrom {
-		return false
+	senders := make([]p2p.NodeID, 0, len(b.StateQC.Signature.Votes))
+	for _, vote := range b.StateQC.Signature.Votes {
+		senders = append(senders, p2p.NodeID(vote.Signer))
 	}
-	return n.State.RmMark[source] == -1 || seq != uint64(n.State.RmMark[source])
+	n.certifyBeacon(b.Epoch, b.Source, b.Seq, b.Random, b.CertifiedState, b.StateQC, senders, false)
+	return true
 }
 
 type coinFeed struct {
@@ -1888,7 +1973,7 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 		if st.Decided {
 			p.Decided = true
 			p.Decision = st.Value
-			if !st.Value && !n.explicitRemovalOnly && n.State.RmMark[p.Source] == -1 {
+			if !st.Value && n.State.RmMark[p.Source] == -1 {
 				n.markRemovalLocked(p.Source, p.Seq)
 			}
 			delete(n.State.PendingABAs, feed.instance)
@@ -2003,149 +2088,40 @@ func (n *Node) cleanupCertifiedStateLocked(epoch uint64) {
 	for id, seq := range n.State.Seqs {
 		consumed[id] = seq
 	}
-	n.RBC.PruneThrough(consumed)
+	if engine := n.RBCs[n.State.ConfigVersion]; engine != nil {
+		engine.PruneThrough(consumed)
+	}
 }
 
-func (n *Node) removeMemberLocked(id p2p.NodeID) {
-	n.State.Members = removeID(n.State.Members, id)
-	n.State.SCL = removeID(n.State.SCL, id)
-	n.State.RSQ = removeID(n.State.RSQ, id)
-	delete(n.State.ComQ, id)
-	delete(n.State.Seqs, id)
-	delete(n.State.RmMark, id)
-	n.State.ConfigVersion++
-	n.State.F = (len(n.State.Members) - 1) / 3
-	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
-	n.ABA.N, n.ABA.F = len(n.State.Members), n.State.F
-	n.installRemovalPVSSLocked()
-	n.resetConfigurationCachesLocked()
-}
-
-func (n *Node) memberSetLocked() map[string]struct{} {
-	snapshot := make(map[string]struct{}, len(n.State.Members))
-	for _, id := range n.State.Members {
-		snapshot[string(id)] = struct{}{}
-	}
-	return snapshot
-}
-
-func (n *Node) installCertifiedStateLocked(d CertifiedStateDigest) {
-	oldMembers := append([]p2p.NodeID(nil), n.State.Members...)
-	for _, id := range oldMembers {
-		if !contains(d.Members, id) {
-			n.removeMemberLocked(id)
-		}
-	}
-	n.State.Members = append([]p2p.NodeID(nil), d.Members...)
-	n.State.SCL = append([]p2p.NodeID(nil), d.SCL...)
-	n.State.RSQ = append([]p2p.NodeID(nil), d.RSQ...)
-	n.State.Seqs = make(map[p2p.NodeID]uint64, len(d.Seqs))
-	for id, seq := range d.Seqs {
-		n.State.Seqs[id] = seq
-	}
-	n.State.RmMark = make(map[p2p.NodeID]int64, len(d.RmMark))
-	for id, marker := range d.RmMark {
-		n.State.RmMark[id] = marker
-	}
-	for _, id := range d.Members {
-		if n.State.ComQ[id] == nil {
-			n.State.ComQ[id] = make(map[uint64]Object)
-		}
-		if _, ok := n.State.RmMark[id]; !ok {
-			n.State.RmMark[id] = -1
-		}
+func (n *Node) installCertifiedEntropyLocked(child CertifiedState, qc StateQC) {
+	n.Certified = CloneCertifiedState(child)
+	qcCopy := qc
+	n.StateCertificate = &qcCopy
+	n.StateHistory = append(n.StateHistory, StateCertificateMessage{Child: CloneCertifiedState(child), QC: qc})
+	n.State.ConfigVersion = child.ConfigVersion
+	n.State.F = child.F
+	n.State.Epoch = child.Epoch
+	n.State.RPrev = append([]byte(nil), child.Random...)
+	n.State.Members = append([]p2p.NodeID(nil), child.Members...)
+	n.State.SCL = append([]p2p.NodeID(nil), child.SCL...)
+	n.State.RSQ = append([]p2p.NodeID(nil), child.RSQ...)
+	n.State.Seqs = cloneSeqMap(child.Seqs)
+	n.State.RmMark = cloneMarkMap(child.RmMark)
+	if child.JReady != nil && n.pendingJReady != nil &&
+		child.JReady.RequestDigest == n.pendingJReady.RequestDigest {
+		n.pendingJReady = nil
 	}
 	for id := range n.State.ComQ {
-		if !contains(d.Members, id) {
-			delete(n.State.ComQ, id)
+		if !contains(child.Members, id) {
 			continue
 		}
-		consumed := n.State.Seqs[id]
+		consumed := child.Seqs[id]
 		for seq := range n.State.ComQ[id] {
 			if seq <= consumed {
 				delete(n.State.ComQ[id], seq)
 			}
 		}
 	}
-	n.State.F = (len(n.State.Members) - 1) / 3
-	n.RBC.N, n.RBC.F = len(n.State.Members), n.State.F
-	n.ABA.N, n.ABA.F = len(n.State.Members), n.State.F
-}
-
-func (n *Node) mergeRemovalMarksLocked(marks map[p2p.NodeID]int64) {
-	for id, mark := range marks {
-		if mark == -1 || !contains(n.State.Members, id) {
-			continue
-		}
-		current, ok := n.State.RmMark[id]
-		if !ok || current == -1 || mark < current {
-			n.State.RmMark[id] = mark
-		}
-	}
-}
-
-func copyRemovalMarks(in map[p2p.NodeID]int64) map[p2p.NodeID]int64 {
-	out := make(map[p2p.NodeID]int64, len(in))
-	for id, mark := range in {
-		out[id] = mark
-	}
-	return out
-}
-
-func (n *Node) installRemovalPVSSLocked() {
-	if len(n.State.Members) == 0 {
-		n.producing = false
-		return
-	}
-	isMember := contains(n.State.Members, n.ID)
-	if !isMember {
-		n.producing = false
-	}
-	epoch := fmt.Sprintf("Tyche-v1/removal-config/%d/%v", n.State.ConfigVersion, n.State.Members)
-	pp, keys, err := crypto.SetupPVSS(n.pvssBackend, epoch, n.State.F+1, n.State.Members)
-	if err != nil {
-		return
-	}
-	key := keys[n.ID]
-	private := key.Private
-	if private == nil {
-		private = crypto.KeyPairFromSeed(crypto.HashBytes(
-			[]byte("Tyche-v1/observer-pvss"),
-			[]byte(n.ID),
-			[]byte(pp.Epoch()),
-		)).Private
-	}
-	scheme, err := crypto.NewPVSSScheme(n.ID, private, pp)
-	if err != nil {
-		return
-	}
-	n.PVSS = scheme
-	if key.Private != nil {
-		n.pvssKeys[pp.Epoch()] = key.Private.Clone()
-	}
-}
-
-func (n *Node) resetConfigurationCachesLocked() {
-	n.State.ProducerSeq = n.State.Seqs[n.ID]
-	n.producerBusy = make(map[uint64]bool)
-	for id, q := range n.State.ComQ {
-		consumed := n.State.Seqs[id]
-		for seq, obj := range q {
-			if seq <= consumed || obj.ConfigVersion != n.State.ConfigVersion {
-				delete(q, seq)
-			}
-		}
-	}
-	n.recon = make(map[string]map[p2p.NodeID]crypto.DecryptedShare)
-	n.reconSecret = make(map[string][]byte)
-	n.reconDone = make(map[string]bool)
-	n.reconClosing = make(map[string]bool)
-	n.echoes = make(map[string]map[string]map[p2p.NodeID]bool)
-	n.readies = make(map[string]map[string]map[p2p.NodeID]crypto.VoteShare)
-	n.readySent = make(map[string]bool)
-	n.reconSent = make(map[string]bool)
-	n.certified = make(map[string]bool)
-	n.verified = make(map[string]verifiedObject)
 }
 
 func (n *Node) lookupEpochObject(epoch uint64, source p2p.NodeID, seq uint64) (Object, error) {
@@ -2207,7 +2183,7 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 		idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
 		s.Source = n.State.SCL[idx]
 		s.Seq = n.State.Seqs[s.Source] + 1
-		s.Instance = aba.EpochInstance(s.NextEpoch, s.Source)
+		s.Instance = aba.EpochInstanceFor(n.State.ConfigVersion, s.NextEpoch, s.Source, s.Seq)
 		key := epochKey(s.NextEpoch, s.Source, s.Seq)
 		if obj, ok := n.State.ComQ[s.Source][s.Seq]; ok && obj.ConfigVersion == n.State.ConfigVersion {
 			s.Object = true
@@ -2233,7 +2209,7 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 		}
 	}
 	n.mu.Unlock()
-	if s.Instance != "" {
+	if s.Instance != "" && n.ABA != nil {
 		st := n.ABA.Status(s.Instance)
 		s.ABADecided = st.Decided
 		s.ABACoinWait = st.CoinWait
@@ -2258,40 +2234,6 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 	return s
 }
 
-// ForceReconfigurationRemoval is a benchmark-only hook used by distributed
-// reconfiguration experiments. Once a stopped producer is selected again, every
-// live node marks the current source sequence as the removal epoch. This keeps
-// the TCP benchmark from waiting on stale or exhausted objects after an earlier
-// configuration change.
-func (n *Node) ForceReconfigurationRemoval(epoch uint64, source p2p.NodeID) (uint64, bool, error) {
-	n.mu.Lock()
-	if n.State.Epoch+1 != epoch || !contains(n.State.Members, source) {
-		n.mu.Unlock()
-		return 0, false, nil
-	}
-	if len(n.State.SCL) == 0 {
-		n.refillSCLLocked()
-	}
-	if len(n.State.SCL) == 0 {
-		n.mu.Unlock()
-		return 0, false, errors.New("empty source candidate list")
-	}
-	selected := n.State.SCL[beaconIndex(n.State.RPrev, len(n.State.SCL))]
-	seq := n.State.Seqs[selected] + 1
-	if selected != source || n.State.RmMark[source] != -1 {
-		n.mu.Unlock()
-		return seq, false, nil
-	}
-	instance := aba.EpochInstance(epoch, source)
-	n.State.RmMark[source] = int64(seq)
-	delete(n.State.PendingABAs, instance)
-	delete(n.abaInputSent, instance)
-	delete(n.abaInputs, instance)
-	n.mu.Unlock()
-	n.ABA.Prune(instance)
-	return seq, true, nil
-}
-
 func maxEchoCount(votes map[string]map[p2p.NodeID]bool) int {
 	max := 0
 	for _, bySender := range votes {
@@ -2302,7 +2244,7 @@ func maxEchoCount(votes map[string]map[p2p.NodeID]bool) int {
 	return max
 }
 
-func maxReadyCount(votes map[string]map[p2p.NodeID]crypto.VoteShare) int {
+func maxReadyCount(votes map[string]map[p2p.NodeID]crypto.SignedVote) int {
 	max := 0
 	for _, bySender := range votes {
 		if len(bySender) > max {
@@ -2314,29 +2256,30 @@ func maxReadyCount(votes map[string]map[p2p.NodeID]crypto.VoteShare) int {
 
 func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 	n.mu.Lock()
+	engine := n.ABAs[dec.ConfigVersion]
+	if engine == nil {
+		engine = n.ABA
+	}
 	if p := n.State.PendingABAs[dec.Instance]; p != nil {
 		p.Decided = true
 		p.Decision = dec.Value
-		if !dec.Value && !n.explicitRemovalOnly && n.State.RmMark[p.Source] == -1 {
+		if !dec.Value && n.State.RmMark[p.Source] == -1 {
 			n.markRemovalLocked(p.Source, p.Seq)
 		}
 		delete(n.State.PendingABAs, dec.Instance)
 		delete(n.abaInputSent, dec.Instance)
 		delete(n.abaInputs, dec.Instance)
 	}
-	req, ok := n.joinRequestByInstanceLocked(dec.Instance)
-	if ok {
-		delete(n.joinCoinWait, dec.Instance)
-	}
 	n.mu.Unlock()
-	n.ABA.Prune(dec.Instance)
-	if ok && dec.Value {
-		_ = n.broadcastJoinCommit(ctx, req)
-	}
+	engine.Prune(dec.Instance)
 }
 
 func (n *Node) handleCoinRequest(req aba.CoinRequest) {
 	n.mu.Lock()
+	engine := n.ABAs[req.ConfigVersion]
+	if engine == nil {
+		engine = n.ABA
+	}
 	var seed []byte
 	if p := n.State.PendingABAs[req.Instance]; p != nil {
 		p.Round = req.Round
@@ -2346,83 +2289,11 @@ func (n *Node) handleCoinRequest(req aba.CoinRequest) {
 			seed = append([]byte(nil), known...)
 			p.CoinWait = false
 		}
-	} else if firstCoinEpoch, ok := aba.ParseJoinInstance(req.Instance); ok {
-		target := firstCoinEpoch + req.Round
-		if known := n.beaconSeeds[target]; len(known) > 0 {
-			seed = append([]byte(nil), known...)
-		} else {
-			n.joinCoinWait[req.Instance] = req.Round
-		}
 	}
 	n.mu.Unlock()
 	if len(seed) > 0 {
-		n.ABA.FeedSeed(context.Background(), req.Instance, req.Round, seed)
+		engine.FeedSeed(context.Background(), req.Instance, req.Round, seed)
 	}
-}
-
-func (n *Node) processJoinCoinWaitsLocked(certEpoch uint64) []coinFeed {
-	var feeds []coinFeed
-	for inst, round := range n.joinCoinWait {
-		firstCoinEpoch, ok := aba.ParseJoinInstance(inst)
-		if !ok {
-			delete(n.joinCoinWait, inst)
-			continue
-		}
-		if firstCoinEpoch+round == certEpoch {
-			feeds = append(feeds, coinFeed{instance: inst, round: round})
-			delete(n.joinCoinWait, inst)
-		}
-	}
-	return feeds
-}
-
-func (n *Node) stateDigestLocked() CertifiedStateDigest {
-	seqs := make(map[p2p.NodeID]uint64, len(n.State.Seqs))
-	for id, v := range n.State.Seqs {
-		seqs[id] = v
-	}
-	rm := make(map[p2p.NodeID]int64, len(n.State.Members))
-	for _, id := range n.State.Members {
-		rm[id] = -1
-	}
-	return CertifiedStateDigest{
-		Members: append([]p2p.NodeID(nil), n.State.Members...),
-		SCL:     append([]p2p.NodeID(nil), n.State.SCL...),
-		RSQ:     append([]p2p.NodeID(nil), n.State.RSQ...),
-		Seqs:    seqs, RmMark: rm,
-	}
-}
-
-func (n *Node) certifiedStateDigestForBeaconLocked(source p2p.NodeID, seq uint64) CertifiedStateDigest {
-	removalMark := n.State.RmMark[source]
-	d := n.stateDigestLocked()
-	window := n.exclusionWindowLocked()
-	if window > 0 && len(d.RSQ) >= window && len(d.RSQ) > 0 {
-		old := d.RSQ[0]
-		d.RSQ = append([]p2p.NodeID(nil), d.RSQ[1:]...)
-		if old != "" && contains(d.Members, old) && !contains(d.SCL, old) {
-			d.SCL = append(d.SCL, old)
-		}
-	}
-	if contains(d.Members, source) {
-		if window > 0 && !contains(d.RSQ, source) {
-			d.RSQ = append(d.RSQ, source)
-			d.SCL = removeID(d.SCL, source)
-		}
-		d.Seqs[source] = seq
-	}
-	if removalMark != -1 && seq == uint64(removalMark) {
-		d.Members = removeID(d.Members, source)
-		d.SCL = removeID(d.SCL, source)
-		d.RSQ = removeID(d.RSQ, source)
-		delete(d.Seqs, source)
-		delete(d.RmMark, source)
-	}
-	return d
-}
-
-func stateDigestHash(d CertifiedStateDigest) string {
-	return hex.EncodeToString(crypto.HashBytes([]byte("Tyche-v1/state"), canonicalJSON(d)))
 }
 
 func epochKey(epoch uint64, source p2p.NodeID, seq uint64) string {

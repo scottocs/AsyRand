@@ -38,7 +38,7 @@ func TestBeacon8Nodes100EpochsPerformance(t *testing.T) {
 			t.Fatal(err)
 		}
 		transport := net.NewTransport(id, 16384)
-		node, err := NewNode(Config{ID: id, Members: ids, F: 2, QueueLen: 2, PVSS: s, Transport: transport})
+		node, err := NewNode(Config{ID: id, Members: ids, F: 2, QueueLen: 2, PVSS: s, Transport: transport, InsecureDeterministicIdentity: true})
 		if err != nil {
 			t.Fatal(err)
 		}

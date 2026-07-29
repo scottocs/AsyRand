@@ -2,7 +2,10 @@ package aba
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,37 +20,45 @@ const Protocol = "aba"
 const bvalBroadcastDelay = 50 * time.Millisecond
 
 type InputMessage struct {
-	Value bool `json:"value"`
+	Value     bool              `json:"value"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type FinishMessage struct {
-	Value bool `json:"value"`
+	Value     bool              `json:"value"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type BValMessage struct {
-	Round uint64 `json:"round"`
-	Value bool   `json:"value"`
+	Round     uint64            `json:"round"`
+	Value     bool              `json:"value"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type AuxMessage struct {
-	Round uint64 `json:"round"`
-	Value bool   `json:"value"`
+	Round     uint64            `json:"round"`
+	Value     bool              `json:"value"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type ConfMessage struct {
-	Round  uint64 `json:"round"`
-	Values []bool `json:"values"`
+	Round     uint64            `json:"round"`
+	Values    []bool            `json:"values"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type CoinRequest struct {
-	Instance string
-	Round    uint64
+	ConfigVersion uint64
+	Instance      string
+	Round         uint64
 }
 
 type Decision struct {
-	Instance string
-	Value    bool
-	FastPath bool
+	ConfigVersion uint64
+	Instance      string
+	Value         bool
+	FastPath      bool
+	Evidence      []p2p.NodeID
 }
 
 type Status struct {
@@ -69,10 +80,16 @@ type Status struct {
 }
 
 type Agreement struct {
-	ID        p2p.NodeID
-	N         int
-	F         int
-	Transport p2p.Transport
+	ID            p2p.NodeID
+	N             int
+	F             int
+	Transport     p2p.Transport
+	Version       uint64
+	Purpose       string
+	Members       map[p2p.NodeID]struct{}
+	PrivateKey    ed25519.PrivateKey
+	PublicKeys    map[string]ed25519.PublicKey
+	Authenticated bool
 
 	mu           sync.Mutex
 	state        map[string]*instanceState
@@ -111,8 +128,60 @@ type instanceState struct {
 }
 
 func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Agreement {
+	return newAgreement(id, 0, "legacy", nil, n, f, transport)
+}
+
+func NewConfigured(id p2p.NodeID, version uint64, purpose string, members []p2p.NodeID, f int, transport p2p.Transport) (*Agreement, error) {
+	return newConfigured(id, version, purpose, members, f, transport, nil, nil)
+}
+
+func NewAuthenticated(id p2p.NodeID, version uint64, purpose string, members []p2p.NodeID, f int, transport p2p.Transport, private ed25519.PrivateKey, publicKeys map[string]ed25519.PublicKey) (*Agreement, error) {
+	if len(private) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid ABA identity private key")
+	}
+	for _, member := range members {
+		if len(publicKeys[string(member)]) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("missing ABA identity public key for %s", member)
+		}
+	}
+	return newConfigured(id, version, purpose, members, f, transport, private, publicKeys)
+}
+
+func newConfigured(id p2p.NodeID, version uint64, purpose string, members []p2p.NodeID, f int, transport p2p.Transport, private ed25519.PrivateKey, publicKeys map[string]ed25519.PublicKey) (*Agreement, error) {
+	if purpose == "" {
+		return nil, fmt.Errorf("ABA purpose is required")
+	}
+	memberSet := make(map[p2p.NodeID]struct{}, len(members))
+	for _, member := range members {
+		if member == "" {
+			return nil, fmt.Errorf("empty ABA member")
+		}
+		if _, duplicate := memberSet[member]; duplicate {
+			return nil, fmt.Errorf("duplicate ABA member %s", member)
+		}
+		memberSet[member] = struct{}{}
+	}
+	if _, ok := memberSet[id]; !ok {
+		return nil, fmt.Errorf("ABA node %s is not in configuration %d", id, version)
+	}
+	if f < 0 || len(members) < 3*f+1 {
+		return nil, fmt.Errorf("invalid ABA fault bound n=%d f=%d", len(members), f)
+	}
+	a := newAgreement(id, version, purpose, memberSet, len(members), f, transport)
+	if len(private) == ed25519.PrivateKeySize {
+		a.PrivateKey = append(ed25519.PrivateKey(nil), private...)
+		a.PublicKeys = make(map[string]ed25519.PublicKey, len(publicKeys))
+		for signer, public := range publicKeys {
+			a.PublicKeys[signer] = append(ed25519.PublicKey(nil), public...)
+		}
+		a.Authenticated = true
+	}
+	return a, nil
+}
+
+func newAgreement(id p2p.NodeID, version uint64, purpose string, members map[p2p.NodeID]struct{}, n, f int, transport p2p.Transport) *Agreement {
 	return &Agreement{
-		ID: id, N: n, F: f, Transport: transport,
+		ID: id, N: n, F: f, Transport: transport, Version: version, Purpose: purpose, Members: members,
 		state:        make(map[string]*instanceState),
 		pruned:       make(map[string]bool),
 		Decisions:    make(chan Decision, n*4),
@@ -121,6 +190,9 @@ func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Agreement {
 }
 
 func (a *Agreement) Propose(ctx context.Context, instance string, value bool) error {
+	if !a.validInstance(instance) {
+		return fmt.Errorf("ABA instance %q is outside configuration %d/%s", instance, a.Version, a.Purpose)
+	}
 	a.mu.Lock()
 	if _, ok := a.pruned[instance]; ok {
 		a.mu.Unlock()
@@ -149,11 +221,17 @@ func (a *Agreement) Propose(ctx context.Context, instance string, value bool) er
 }
 
 func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
+	if !a.acceptsSender(msg.From) || !a.validInstance(msg.Instance) {
+		return nil
+	}
 	switch msg.Type {
 	case "INPUT":
 		body, err := p2p.DecodePayload[InputMessage](msg)
 		if err != nil {
 			return err
+		}
+		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
+			return nil
 		}
 		a.handleInput(ctx, msg.Instance, msg.From, body.Value)
 	case "FINISH":
@@ -161,11 +239,17 @@ func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
 		if err != nil {
 			return err
 		}
+		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
+			return nil
+		}
 		a.handleFinish(ctx, msg.Instance, msg.From, body.Value)
 	case "BVAL":
 		body, err := p2p.DecodePayload[BValMessage](msg)
 		if err != nil {
 			return err
+		}
+		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
+			return nil
 		}
 		a.handleBVal(ctx, msg.Instance, msg.From, body.Round, body.Value)
 	case "AUX":
@@ -173,11 +257,17 @@ func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
 		if err != nil {
 			return err
 		}
+		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
+			return nil
+		}
 		a.handleAux(ctx, msg.Instance, msg.From, body.Round, body.Value)
 	case "CONF":
 		body, err := p2p.DecodePayload[ConfMessage](msg)
 		if err != nil {
 			return err
+		}
+		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
+			return nil
 		}
 		a.handleConf(ctx, msg.Instance, msg.From, body.Round, body.Values)
 	}
@@ -309,7 +399,7 @@ func (a *Agreement) handleInput(ctx context.Context, instance string, from p2p.N
 	}
 	st.inputs[from] = value
 	st.inputCount[value]++
-	shouldFinish := st.inputCount[true] >= 2*a.F+1 && !st.finishSent
+	shouldFinish := st.inputCount[true] >= a.quorum() && !st.finishSent
 	if shouldFinish {
 		st.finishSent = true
 	}
@@ -330,11 +420,12 @@ func (a *Agreement) handleFinish(ctx context.Context, instance string, from p2p.
 		return
 	}
 	st.finish[from] = true
-	if len(st.finish) >= 2*a.F+1 {
+	if len(st.finish) >= a.quorum() {
 		st.decided = true
 		st.decision = true
+		evidence := sortedSenders(st.finish, a.quorum())
 		a.mu.Unlock()
-		a.Decisions <- Decision{Instance: instance, Value: true, FastPath: true}
+		a.Decisions <- Decision{ConfigVersion: a.Version, Instance: instance, Value: true, FastPath: true, Evidence: evidence}
 		return
 	}
 	a.mu.Unlock()
@@ -383,7 +474,7 @@ func (a *Agreement) handleBVal(ctx context.Context, instance string, from p2p.No
 		a.broadcastAsync("CONF", instance, ConfMessage{Round: round, Values: confValues})
 	}
 	if needCoin {
-		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
+		a.CoinRequests <- CoinRequest{ConfigVersion: a.Version, Instance: instance, Round: round}
 	}
 	if hasCoin {
 		a.tryAdvanceWithCoin(ctx, instance, round)
@@ -410,7 +501,7 @@ func (a *Agreement) handleAux(ctx context.Context, instance string, from p2p.Nod
 		a.broadcastAsync("CONF", instance, ConfMessage{Round: round, Values: values})
 	}
 	if needCoin {
-		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
+		a.CoinRequests <- CoinRequest{ConfigVersion: a.Version, Instance: instance, Round: round}
 	}
 	if hasCoin {
 		a.tryAdvanceWithCoin(ctx, instance, round)
@@ -433,7 +524,7 @@ func (a *Agreement) handleConf(ctx context.Context, instance string, from p2p.No
 	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if needCoin {
-		a.CoinRequests <- CoinRequest{Instance: instance, Round: round}
+		a.CoinRequests <- CoinRequest{ConfigVersion: a.Version, Instance: instance, Round: round}
 	}
 	if hasCoin {
 		a.tryAdvanceWithCoin(ctx, instance, round)
@@ -522,8 +613,9 @@ func (a *Agreement) tryAdvanceWithCoin(ctx context.Context, instance string, rou
 		if b == coin {
 			st.decided = true
 			st.decision = b
+			evidence := sortedSenders(st.conf[round], a.quorum())
 			a.mu.Unlock()
-			a.Decisions <- Decision{Instance: instance, Value: b, FastPath: false}
+			a.Decisions <- Decision{ConfigVersion: a.Version, Instance: instance, Value: b, FastPath: false, Evidence: evidence}
 			return
 		}
 	} else {
@@ -598,6 +690,11 @@ func (a *Agreement) rebroadcastUntilReady(ctx context.Context, instance string) 
 }
 
 func (a *Agreement) broadcast(ctx context.Context, typ, instance string, payload any) error {
+	var err error
+	payload, err = a.signPayload(typ, instance, payload)
+	if err != nil {
+		return err
+	}
 	msg, err := p2p.NewMessage(Protocol, typ, instance, a.ID, "", payload)
 	if err != nil {
 		return err
@@ -610,6 +707,11 @@ func (a *Agreement) broadcastAsync(typ, instance string, payload any) {
 }
 
 func (a *Agreement) broadcastDelayed(typ, instance string, payload any, delay time.Duration) {
+	var err error
+	payload, err = a.signPayload(typ, instance, payload)
+	if err != nil {
+		return
+	}
 	msg, err := p2p.NewMessage(Protocol, typ, instance, a.ID, "", payload)
 	if err != nil {
 		return
@@ -640,7 +742,7 @@ func (a *Agreement) decidedOrPruned(instance string) bool {
 }
 
 func CoinFromSeed(instance string, round uint64, seed []byte) bool {
-	h := crypto.HashBytes([]byte("Tyche-v1/ABA/coin/"), seed, []byte(instance), []byte(fmt.Sprintf("/%d", round)))
+	h := crypto.DomainHash("Tyche/ABA/Coin/v1", seed, []byte(instance), []byte(fmt.Sprintf("%d", round)))
 	return h[len(h)-1]&1 == 1
 }
 
@@ -648,13 +750,42 @@ func EpochInstance(epoch uint64, source p2p.NodeID) string {
 	return fmt.Sprintf("epoch/%d/source/%s", epoch, source)
 }
 
+func EpochInstanceFor(configVersion, epoch uint64, source p2p.NodeID, seq uint64) string {
+	return fmt.Sprintf("aba/%d/control/epoch/%d/source/%s/seq/%d", configVersion, epoch, source, seq)
+}
+
 func JoinInstance(transition, requestDigest string, firstCoinEpoch uint64) string {
 	return fmt.Sprintf("join/%s/%s/%d", transition, requestDigest, firstCoinEpoch)
 }
 
+func JoinInstanceFor(configVersion uint64, transition, requestDigest string, firstCoinEpoch uint64) string {
+	return fmt.Sprintf("aba/%d/control/join/%s/%s/%d", configVersion, transition, requestDigest, firstCoinEpoch)
+}
+
+func ConfigVersionFromInstance(instance string) (uint64, bool) {
+	parts := strings.Split(instance, "/")
+	if len(parts) < 3 || parts[0] != "aba" {
+		return 0, false
+	}
+	version, err := strconv.ParseUint(parts[1], 10, 64)
+	return version, err == nil
+}
+
 func ParseJoinInstance(instance string) (uint64, bool) {
 	parts := strings.Split(instance, "/")
-	if len(parts) < 5 || parts[0] != "join" {
+	if len(parts) < 5 {
+		return 0, false
+	}
+	isJoin := parts[0] == "join"
+	if !isJoin {
+		for _, part := range parts {
+			if part == "join" {
+				isJoin = true
+				break
+			}
+		}
+	}
+	if !isJoin {
 		return 0, false
 	}
 	first, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
@@ -662,4 +793,115 @@ func ParseJoinInstance(instance string) (uint64, bool) {
 		return 0, false
 	}
 	return first, true
+}
+
+func (a *Agreement) acceptsSender(sender p2p.NodeID) bool {
+	if a.Members == nil {
+		return sender != ""
+	}
+	_, ok := a.Members[sender]
+	return ok
+}
+
+func (a *Agreement) validInstance(instance string) bool {
+	if instance == "" {
+		return false
+	}
+	if a.Purpose == "legacy" {
+		return true
+	}
+	return strings.HasPrefix(instance, fmt.Sprintf("aba/%d/%s/", a.Version, a.Purpose))
+}
+
+func sortedSenders(votes map[p2p.NodeID]bool, limit int) []p2p.NodeID {
+	out := make([]p2p.NodeID, 0, len(votes))
+	for sender := range votes {
+		out = append(out, sender)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (a *Agreement) payloadTranscript(kind, instance string, payload any) []byte {
+	raw, _ := json.Marshal(unsignedPayload(payload))
+	return crypto.DomainHash(
+		"Tyche/ABAMessage/v1",
+		[]byte(fmt.Sprintf("%d", a.Version)),
+		[]byte(a.Purpose),
+		[]byte(kind),
+		[]byte(instance),
+		raw,
+	)
+}
+
+func unsignedPayload(payload any) any {
+	switch body := payload.(type) {
+	case InputMessage:
+		return struct {
+			Value bool `json:"value"`
+		}{body.Value}
+	case FinishMessage:
+		return struct {
+			Value bool `json:"value"`
+		}{body.Value}
+	case BValMessage:
+		return struct {
+			Round uint64 `json:"round"`
+			Value bool   `json:"value"`
+		}{body.Round, body.Value}
+	case AuxMessage:
+		return struct {
+			Round uint64 `json:"round"`
+			Value bool   `json:"value"`
+		}{body.Round, body.Value}
+	case ConfMessage:
+		return struct {
+			Round  uint64 `json:"round"`
+			Values []bool `json:"values"`
+		}{body.Round, append([]bool(nil), body.Values...)}
+	default:
+		return payload
+	}
+}
+
+func (a *Agreement) signPayload(kind, instance string, payload any) (any, error) {
+	if !a.Authenticated {
+		return payload, nil
+	}
+	signature, err := crypto.SignTranscript(string(a.ID), a.PrivateKey, a.payloadTranscript(kind, instance, payload))
+	if err != nil {
+		return nil, err
+	}
+	switch body := payload.(type) {
+	case InputMessage:
+		body.Signature = signature
+		return body, nil
+	case FinishMessage:
+		body.Signature = signature
+		return body, nil
+	case BValMessage:
+		body.Signature = signature
+		return body, nil
+	case AuxMessage:
+		body.Signature = signature
+		return body, nil
+	case ConfMessage:
+		body.Signature = signature
+		return body, nil
+	default:
+		return nil, fmt.Errorf("unsupported authenticated ABA payload %T", payload)
+	}
+}
+
+func (a *Agreement) verifyPayload(kind, instance string, sender p2p.NodeID, payload any, signature crypto.SignedVote) bool {
+	if !a.Authenticated {
+		return true
+	}
+	if signature.Signer != string(sender) {
+		return false
+	}
+	return crypto.VerifySignedVote(signature, a.PublicKeys, a.payloadTranscript(kind, instance, payload)) == nil
 }
