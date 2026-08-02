@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"Tyche/Tyche/crypto"
 	"Tyche/utils/p2p"
 )
 
@@ -16,21 +15,19 @@ import (
 // process restart. Configuration material and private PVSS keys are deployment
 // inputs and are deliberately not copied into this record.
 type PersistentState struct {
-	Certified      CertifiedState                  `json:"certified"`
-	Certificate    *StateQC                        `json:"certificate,omitempty"`
-	HistoryAnchor  CertifiedState                  `json:"history_anchor"`
-	StateHistory   []StateCertificateMessage       `json:"state_history,omitempty"`
-	SignedParents  map[string]string               `json:"signed_parents"`
-	ProducerSeq    uint64                          `json:"producer_seq"`
-	Retirement     map[string]RetirementObligation `json:"retirement"`
-	ErasedVersions map[uint64]bool                 `json:"erased_versions"`
+	Schedule          SchedulingState            `json:"schedule"`
+	Certificate       *BeaconQC                  `json:"certificate,omitempty"`
+	HistoryAnchor     SchedulingState            `json:"history_anchor"`
+	BeaconHistory     []BeaconHistoryLink        `json:"beacon_history,omitempty"`
+	SignedBeaconSlots map[string]string          `json:"signed_beacon_slots"`
+	ProducerSeq       uint64                     `json:"producer_seq"`
+	RmMark            map[p2p.NodeID]RemovalMark `json:"rm_mark,omitempty"`
 }
 
-// StateStore provides atomic vote reservation and snapshot replacement.
-// ReserveStateVote must be durable before the corresponding signature is sent.
+// StateStore provides atomic BEACON-vote reservation and snapshot replacement.
 type StateStore interface {
 	Load() (PersistentState, bool, error)
-	ReserveStateVote(parentHash, childHash string) error
+	ReserveBeaconVote(slot, voteHash string) error
 	Save(PersistentState) error
 }
 
@@ -50,10 +47,10 @@ func (s *MemoryStateStore) Load() (PersistentState, bool, error) {
 	return clonePersistentState(s.state), s.present, nil
 }
 
-func (s *MemoryStateStore) ReserveStateVote(parentHash, childHash string) error {
+func (s *MemoryStateStore) ReserveBeaconVote(slot, voteHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := reserveVote(&s.state, parentHash, childHash); err != nil {
+	if err := reserveVote(&s.state, slot, voteHash); err != nil {
 		return err
 	}
 	s.present = true
@@ -63,7 +60,7 @@ func (s *MemoryStateStore) ReserveStateVote(parentHash, childHash string) error 
 func (s *MemoryStateStore) Save(state PersistentState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := mergeVoteReservations(&state, s.state.SignedParents); err != nil {
+	if err := mergeVoteReservations(&state, s.state.SignedBeaconSlots); err != nil {
 		return err
 	}
 	s.state = clonePersistentState(state)
@@ -95,14 +92,14 @@ func (s *FileStateStore) Load() (PersistentState, bool, error) {
 	return s.loadLocked()
 }
 
-func (s *FileStateStore) ReserveStateVote(parentHash, childHash string) error {
+func (s *FileStateStore) ReserveBeaconVote(slot, voteHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, _, err := s.loadLocked()
 	if err != nil {
 		return err
 	}
-	if err := reserveVote(&state, parentHash, childHash); err != nil {
+	if err := reserveVote(&state, slot, voteHash); err != nil {
 		return err
 	}
 	return s.writeLocked(state)
@@ -115,7 +112,7 @@ func (s *FileStateStore) Save(state PersistentState) error {
 	if err != nil {
 		return err
 	}
-	if err := mergeVoteReservations(&state, current.SignedParents); err != nil {
+	if err := mergeVoteReservations(&state, current.SignedBeaconSlots); err != nil {
 		return err
 	}
 	return s.writeLocked(state)
@@ -179,89 +176,62 @@ func (s *FileStateStore) writeLocked(state PersistentState) error {
 	return dirHandle.Sync()
 }
 
-func reserveVote(state *PersistentState, parentHash, childHash string) error {
-	if parentHash == "" || childHash == "" {
-		return errors.New("state vote reservation requires parent and child hashes")
+func reserveVote(state *PersistentState, slot, voteHash string) error {
+	if slot == "" || voteHash == "" {
+		return errors.New("BEACON vote reservation requires a slot and vote hash")
 	}
-	if state.SignedParents == nil {
-		state.SignedParents = make(map[string]string)
+	if state.SignedBeaconSlots == nil {
+		state.SignedBeaconSlots = make(map[string]string)
 	}
-	if existing := state.SignedParents[parentHash]; existing != "" && existing != childHash {
-		return fmt.Errorf("persistent double-sign prevention: parent %s is reserved for %s", parentHash, existing)
+	if existing := state.SignedBeaconSlots[slot]; existing != "" && existing != voteHash {
+		return fmt.Errorf("persistent double-sign prevention: %s is reserved for %s", slot, existing)
 	}
-	state.SignedParents[parentHash] = childHash
+	state.SignedBeaconSlots[slot] = voteHash
 	return nil
 }
 
 func mergeVoteReservations(state *PersistentState, reservations map[string]string) error {
-	if state.SignedParents == nil {
-		state.SignedParents = make(map[string]string)
+	if state.SignedBeaconSlots == nil {
+		state.SignedBeaconSlots = make(map[string]string)
 	}
-	for parent, child := range reservations {
-		if existing := state.SignedParents[parent]; existing != "" && existing != child {
-			return fmt.Errorf("conflicting persistent vote reservation for parent %s", parent)
+	for slot, voteHash := range reservations {
+		if existing := state.SignedBeaconSlots[slot]; existing != "" && existing != voteHash {
+			return fmt.Errorf("conflicting persistent vote reservation for slot %s", slot)
 		}
-		state.SignedParents[parent] = child
+		state.SignedBeaconSlots[slot] = voteHash
 	}
 	return nil
 }
 
 func clonePersistentState(in PersistentState) PersistentState {
 	out := in
-	out.Certified = CloneCertifiedState(in.Certified)
-	out.HistoryAnchor = CloneCertifiedState(in.HistoryAnchor)
-	out.StateHistory = append([]StateCertificateMessage(nil), in.StateHistory...)
+	out.Schedule = CloneSchedulingState(in.Schedule)
+	out.HistoryAnchor = CloneSchedulingState(in.HistoryAnchor)
+	out.BeaconHistory = append([]BeaconHistoryLink(nil), in.BeaconHistory...)
 	if in.Certificate != nil {
 		qc := *in.Certificate
 		out.Certificate = &qc
 	}
-	out.SignedParents = make(map[string]string, len(in.SignedParents))
-	for parent, child := range in.SignedParents {
-		out.SignedParents[parent] = child
+	out.SignedBeaconSlots = make(map[string]string, len(in.SignedBeaconSlots))
+	for slot, voteHash := range in.SignedBeaconSlots {
+		out.SignedBeaconSlots[slot] = voteHash
 	}
-	out.Retirement = make(map[string]RetirementObligation, len(in.Retirement))
-	for key, obligation := range in.Retirement {
-		copyObligation := obligation
-		copyObligation.Secret = append([]byte(nil), obligation.Secret...)
-		copyObligation.Shares = make(map[p2p.NodeID]crypto.DecryptedShare, len(obligation.Shares))
-		for holder, share := range obligation.Shares {
-			copyObligation.Shares[holder] = share
-		}
-		out.Retirement[key] = copyObligation
-	}
-	out.ErasedVersions = make(map[uint64]bool, len(in.ErasedVersions))
-	for version, erased := range in.ErasedVersions {
-		out.ErasedVersions[version] = erased
-	}
+	out.RmMark = cloneMarkMap(in.RmMark)
 	return out
 }
 
 func (n *Node) persistentStateLocked() PersistentState {
 	state := PersistentState{
-		Certified:      CloneCertifiedState(n.Certified),
-		HistoryAnchor:  CloneCertifiedState(n.HistoryAnchor),
-		StateHistory:   append([]StateCertificateMessage(nil), n.StateHistory...),
-		SignedParents:  make(map[string]string, len(n.signedParents)),
-		ProducerSeq:    n.State.ProducerSeq,
-		Retirement:     make(map[string]RetirementObligation, len(n.Retirement)),
-		ErasedVersions: make(map[uint64]bool),
+		Schedule:          CloneSchedulingState(n.Schedule),
+		HistoryAnchor:     CloneSchedulingState(n.HistoryAnchor),
+		BeaconHistory:     append([]BeaconHistoryLink(nil), n.BeaconHistory...),
+		SignedBeaconSlots: make(map[string]string),
+		ProducerSeq:       n.State.ProducerSeq,
+		RmMark:            cloneMarkMap(n.State.RmMark),
 	}
-	if n.StateCertificate != nil {
-		qc := *n.StateCertificate
+	if n.LatestBeaconQC != nil {
+		qc := *n.LatestBeaconQC
 		state.Certificate = &qc
-	}
-	for parent, child := range n.signedParents {
-		state.SignedParents[parent] = child
-	}
-	for key, obligation := range n.Retirement {
-		if obligation != nil {
-			state.Retirement[key] = *obligation
-		}
-	}
-	for version, pvssContext := range n.PVSSContexts {
-		if pvssContext != nil && pvssContext.Status == PVSSErased {
-			state.ErasedVersions[version] = true
-		}
 	}
 	return clonePersistentState(state)
 }
@@ -273,14 +243,6 @@ func (n *Node) persistLocked() error {
 	return n.Store.Save(n.persistentStateLocked())
 }
 
-func (n *Node) persistCertifiedLocked(child CertifiedState, qc StateQC) error {
-	state := n.persistentStateLocked()
-	state.Certified = CloneCertifiedState(child)
-	qcCopy := qc
-	state.Certificate = &qcCopy
-	return n.Store.Save(state)
-}
-
 func (n *Node) restorePersistentState() error {
 	state, present, err := n.Store.Load()
 	if err != nil || !present {
@@ -288,49 +250,38 @@ func (n *Node) restorePersistentState() error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for parent, child := range state.SignedParents {
-		n.signedParents[parent] = child
-	}
 	if state.ProducerSeq > n.State.ProducerSeq {
 		n.State.ProducerSeq = state.ProducerSeq
 	}
-	if state.Certified.ConfigDigest == "" {
+	if state.Schedule.ConfigDigest == "" {
 		return nil
 	}
-	setup, exists := n.ConfigurationSetups[state.Certified.ConfigVersion]
-	if !exists || setup.Configuration.Digest() != state.Certified.ConfigDigest {
-		return fmt.Errorf("persisted state needs exact configuration setup %d (%s)", state.Certified.ConfigVersion, state.Certified.ConfigDigest)
+	setup, exists := n.ConfigurationSetups[state.Schedule.ConfigVersion]
+	if !exists || setup.Configuration.Digest() != state.Schedule.ConfigDigest {
+		return fmt.Errorf("persisted state needs exact configuration setup %d (%s)", state.Schedule.ConfigVersion, state.Schedule.ConfigDigest)
 	}
-	if !sameMembers(state.Certified.Members, setup.Configuration.Members) {
-		return errors.New("persisted certified state membership does not match configured setup")
+	if !sameMembers(state.Schedule.Members, setup.Configuration.Members) {
+		return errors.New("persisted scheduling state membership does not match configured setup")
 	}
-	n.Certified = CloneCertifiedState(state.Certified)
+	n.Schedule = CloneSchedulingState(state.Schedule)
 	if state.HistoryAnchor.ConfigDigest != "" {
-		n.HistoryAnchor = CloneCertifiedState(state.HistoryAnchor)
+		n.HistoryAnchor = CloneSchedulingState(state.HistoryAnchor)
 	}
-	n.StateHistory = append([]StateCertificateMessage(nil), state.StateHistory...)
+	n.BeaconHistory = append([]BeaconHistoryLink(nil), state.BeaconHistory...)
 	if state.Certificate != nil {
 		qc := *state.Certificate
-		n.StateCertificate = &qc
+		n.LatestBeaconQC = &qc
 	}
-	n.State.ConfigVersion = state.Certified.ConfigVersion
-	n.State.F = state.Certified.F
-	n.State.Epoch = state.Certified.Epoch
-	n.State.RPrev = append([]byte(nil), state.Certified.Random...)
-	n.State.Members = append([]p2p.NodeID(nil), state.Certified.Members...)
-	n.State.SCL = append([]p2p.NodeID(nil), state.Certified.SCL...)
-	n.State.RSQ = append([]p2p.NodeID(nil), state.Certified.RSQ...)
-	n.State.Seqs = cloneSeqMap(state.Certified.Seqs)
-	n.State.RmMark = cloneMarkMap(state.Certified.RmMark)
+	n.State.ConfigVersion = state.Schedule.ConfigVersion
+	n.State.F = state.Schedule.F
+	n.State.Epoch = state.Schedule.Epoch
+	n.State.RPrev = append([]byte(nil), state.Schedule.Random...)
+	n.State.Members = append([]p2p.NodeID(nil), state.Schedule.Members...)
+	n.State.SCL = append([]p2p.NodeID(nil), state.Schedule.SCL...)
+	n.State.RSQ = append([]p2p.NodeID(nil), state.Schedule.RSQ...)
+	n.State.Seqs = cloneSeqMap(state.Schedule.Seqs)
+	n.State.RmMark = cloneMarkMap(state.RmMark)
 	n.State.ProducerSeq = maxUint64(n.State.ProducerSeq, state.ProducerSeq)
-	n.Retirement = make(map[string]*RetirementObligation, len(state.Retirement))
-	for key, obligation := range state.Retirement {
-		copyObligation := obligation
-		n.Retirement[key] = &copyObligation
-	}
-	if state.ErasedVersions[state.Certified.ConfigVersion] {
-		return errors.New("persisted tombstone erases the active PVSS configuration")
-	}
 	return nil
 }
 

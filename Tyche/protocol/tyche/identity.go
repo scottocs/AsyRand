@@ -47,20 +47,19 @@ func resolveIdentityConfiguration(cfg Config, members []p2p.NodeID) (ed25519.Pri
 	return private, public, nil
 }
 
-func certifiedStateFromRuntime(state *State, configuration Configuration) CertifiedState {
-	return canonicalCertifiedState(CertifiedState{
+func schedulingStateFromRuntime(state *State, configuration Configuration) SchedulingState {
+	return canonicalSchedulingState(SchedulingState{
 		ConfigVersion: state.ConfigVersion,
 		F:             configuration.F,
 		Q:             configuration.Q,
 		PVSSThreshold: configuration.PVSSThreshold,
 		Epoch:         state.Epoch,
 		Random:        append([]byte(nil), state.RPrev...),
+		BeaconHead:    GenesisBeaconHead(state.ConfigVersion, state.RPrev, state.Members),
 		Members:       append([]p2p.NodeID(nil), state.Members...),
 		SCL:           append([]p2p.NodeID(nil), state.SCL...),
 		RSQ:           append([]p2p.NodeID(nil), state.RSQ...),
 		Seqs:          cloneSeqMap(state.Seqs),
-		RmMark:        cloneMarkMap(state.RmMark),
 		ConfigDigest:  configuration.Digest(),
-		Transition:    TransitionGenesis,
 	})
 }

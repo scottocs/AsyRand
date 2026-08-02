@@ -56,6 +56,9 @@ func TestBeacon8Nodes100EpochsPerformance(t *testing.T) {
 	for e := 0; e < epochs; e++ {
 		source, seq := nextSourceSeq(nodes[0])
 		waitStored(t, ctx, nodes, source, seq)
+		// Benchmark the paper's optimistic Consumer path: every honest party
+		// sees the look-ahead object and therefore proposes 1 to ABA_e.
+		waitStored(t, ctx, nodes, source, seq+1)
 
 		results := make(chan Beacon, len(nodes))
 		errs := make(chan error, len(nodes))
@@ -170,25 +173,20 @@ func dumpNodes(nodes []*Node) string {
 		for key, shares := range n.recon {
 			reconCounts[key] = len(shares)
 		}
-		echoCounts := make(map[string]int, len(n.echoes))
-		for key, byRandom := range n.echoes {
-			for random, senders := range byRandom {
-				echoCounts[key+"/"+random] = len(senders)
-			}
-		}
-		readyCounts := make(map[string]int, len(n.readies))
-		for key, byRandom := range n.readies {
-			for random, senders := range byRandom {
-				readyCounts[key+"/"+random] = len(senders)
-			}
+		beaconVotes := make(map[string]int, len(n.beaconVotes))
+		for key, senders := range n.beaconVotes {
+			beaconVotes[key] = len(senders)
 		}
 		abaStatuses := make(map[string]aba.Status, len(n.State.PendingABAs))
-		for inst := range n.State.PendingABAs {
-			abaStatuses[inst] = n.ABA.Status(inst)
+		for epoch, pending := range n.State.PendingABAs {
+			inst := aba.EpochInstanceFor(pending.ConfigVersion, epoch)
+			if engine := n.ABAs[pending.ConfigVersion]; engine != nil {
+				abaStatuses[inst] = engine.Status(inst)
+			}
 		}
-		out += fmt.Sprintf("node=%s epoch=%d scl=%v rsq=%v seqs=%v queues=%v queue_seqs=%v pending=%v aba=%v recon=%v recon_done=%v echoes=%v readies=%v seeds=%d verified=%d\n",
+		out += fmt.Sprintf("node=%s epoch=%d scl=%v rsq=%v seqs=%v queues=%v queue_seqs=%v pending=%v aba=%v recon=%v recon_done=%v beacon_votes=%v seeds=%d verified=%d\n",
 			n.ID, n.State.Epoch, n.State.SCL, n.State.RSQ, n.State.Seqs, queueDepths, queueSeqs, n.State.PendingABAs, abaStatuses,
-			reconCounts, n.reconDone, echoCounts, readyCounts, len(n.beaconSeeds), len(n.verified))
+			reconCounts, n.reconDone, beaconVotes, len(n.beaconSeeds), len(n.verified))
 		n.mu.Unlock()
 	}
 	return out

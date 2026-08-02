@@ -15,7 +15,7 @@ func TestOptimisticPathDecidesTrue(t *testing.T) {
 	defer cancel()
 
 	nodes, _ := newTestAgreements(ctx, t)
-	instance := EpochInstance(1, "n0")
+	instance := EpochInstance(1)
 	for _, node := range nodes {
 		if err := node.Propose(ctx, instance, true); err != nil {
 			t.Fatal(err)
@@ -38,7 +38,7 @@ func TestPessimisticPathUsesExternalCoin(t *testing.T) {
 	defer cancel()
 
 	nodes, _ := newTestAgreements(ctx, t)
-	instance := EpochInstance(2, "n1")
+	instance := EpochInstance(2)
 	for _, node := range nodes {
 		if err := node.Propose(ctx, instance, false); err != nil {
 			t.Fatal(err)
@@ -82,7 +82,7 @@ func TestPruneDropsDecidedStateAndIgnoresLateMessages(t *testing.T) {
 	defer cancel()
 
 	a := New("n0", 4, 1, nil)
-	instance := EpochInstance(7, "n1")
+	instance := EpochInstance(7)
 	st := a.get(instance)
 	st.decided = true
 	st.decision = false
@@ -108,9 +108,25 @@ func TestPruneDropsDecidedStateAndIgnoresLateMessages(t *testing.T) {
 	}
 }
 
+func TestAdoptVerifiedDecisionUpdatesStatus(t *testing.T) {
+	a := New("n0", 4, 1, nil)
+	instance := EpochInstance(9)
+	cert := Certificate{Instance: instance, Purpose: "legacy", Value: false}
+	if !a.AdoptVerifiedDecision(cert) {
+		t.Fatal("verified decision was not adopted")
+	}
+	status := a.Status(instance)
+	if !status.Decided || status.Value || status.Certificate.Instance != instance {
+		t.Fatalf("bad adopted status: %+v", status)
+	}
+	if a.AdoptVerifiedDecision(Certificate{Instance: instance, Purpose: "legacy", Value: true}) {
+		t.Fatal("conflicting decision was accepted")
+	}
+}
+
 func TestProcessPendingAuxSendsConfOnce(t *testing.T) {
 	a := New("n0", 4, 1, nil)
-	st := a.get(EpochInstance(8, "n0"))
+	st := a.get(EpochInstance(8))
 	a.ensureRound(st, 0)
 	st.bin[0][true] = true
 	st.auxPending[0]["n0"] = true
@@ -134,7 +150,7 @@ func TestBValSendsAuxOncePerRound(t *testing.T) {
 	net := p2p.NewMemoryNetwork()
 	transport := net.NewTransport("n0", 64)
 	a := New("n0", 4, 1, transport)
-	instance := EpochInstance(9, "n0")
+	instance := EpochInstance(9)
 
 	a.handleBVal(ctx, instance, "n0", 0, true)
 	a.handleBVal(ctx, instance, "n1", 0, true)
@@ -171,7 +187,7 @@ func TestAuthenticatedABARejectsForgedAndCrossConfigInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance := EpochInstanceFor(4, 1, "n2", 1)
+	instance := EpochInstanceFor(4, 1)
 	body := InputMessage{Value: true}
 	body.Signature, err = tychecrypto.SignTranscript("n1", private["n1"], a.payloadTranscript("INPUT", instance, body))
 	if err != nil {
@@ -188,7 +204,7 @@ func TestAuthenticatedABARejectsForgedAndCrossConfigInput(t *testing.T) {
 		t.Fatalf("valid authenticated input count=%d", got)
 	}
 
-	replayedInstance := EpochInstanceFor(5, 1, "n2", 1)
+	replayedInstance := EpochInstanceFor(5, 1)
 	replay, err := p2p.NewMessage(Protocol, "INPUT", replayedInstance, "n1", "n0", body)
 	if err != nil {
 		t.Fatal(err)

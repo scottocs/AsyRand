@@ -40,7 +40,7 @@ func TestBeaconChurnCrashAndJoin10000Epochs(t *testing.T) {
 	for epoch := 1; epoch <= epochs; epoch++ {
 		if failed := failures[epoch]; failed != "" {
 			t.Logf("epoch=%d event=delete node=%s active_before=%v members_before=%v", epoch, failed, cluster.activeIDs(), cluster.members())
-			cluster.crashAndRemove(t, failed)
+			cluster.crashAndRemove(t, ctx, failed)
 			t.Logf("epoch=%d event=deleted node=%s active_after=%v members_after=%v", epoch, failed, cluster.activeIDs(), cluster.members())
 		}
 		if joiner := joins[epoch]; joiner != "" {
@@ -82,12 +82,12 @@ func TestBeaconRandomChurn1000Epochs(t *testing.T) {
 	t.Logf("random churn seed=%d epochs=%d initial_n=8 min_n=%d max_n=%d event_every=%d", seed, epochs, minN, maxN, eventEvery)
 	for epoch := 1; epoch <= epochs; epoch++ {
 		if eventEvery > 0 && epoch%eventEvery == 0 {
-			if cluster.randomChurn(t, ctx, rng, uint64(epoch), minN, maxN, &nextJoin) {
-				cluster.assertMembershipBounds(t, minN, maxN)
-			}
+			cluster.randomChurn(t, ctx, rng, uint64(epoch), minN, maxN, &nextJoin)
 		}
+		cluster.reconcilePendingJoins(t, ctx, uint64(epoch))
 		cluster.assertMembershipBounds(t, minN, maxN)
 		cluster.runEpoch(t, ctx, uint64(epoch), epochTimeout)
+		cluster.reconcilePendingJoins(t, ctx, uint64(epoch))
 		cluster.reconcileProtocolRemovals(t, uint64(epoch))
 		if reportEvery > 0 && epoch%reportEvery == 0 {
 			t.Logf("completed %d/%d random churn epochs in %s active=%v members=%v", epoch, epochs, time.Since(start), cluster.activeIDs(), cluster.members())
@@ -133,6 +133,7 @@ type churnCluster struct {
 }
 
 type churnResult struct {
+	node   *Node
 	beacon Beacon
 	err    error
 }
@@ -177,7 +178,6 @@ func runChurnBenchmarkCase(t *testing.T, label string, epochs int, reconfigTarge
 				if event.action == "stop" {
 					localStops++
 				}
-				cluster.assertMembershipBounds(t, minN, maxN)
 			}
 		}
 		cluster.reconcilePendingJoins(t, ctx, uint64(epoch))
@@ -338,12 +338,8 @@ func churnMessageCategory(key string) string {
 		return "rbc_control"
 	case key == "tyche/RECON":
 		return "consumer_recon"
-	case key == "tyche/RECON_ECHO":
-		return "consumer_echo"
-	case key == "tyche/RECON_READY":
-		return "recon_ready"
-	case key == "tyche/BEACON_CERT":
-		return "beacon_cert"
+	case key == "tyche/BEACON":
+		return "beacon_vote"
 	case strings.HasPrefix(key, "aba/"):
 		return "aba"
 	case strings.HasPrefix(key, "tyche/JOIN"):
@@ -635,6 +631,7 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 		}
 		nodeCtx, cancel := context.WithCancel(parent)
 		node.Start(nodeCtx)
+		node.StartProducer(nodeCtx, 5*time.Millisecond)
 		c.nodes[id] = node
 		c.active[id] = true
 		c.cancels[id] = cancel
@@ -642,11 +639,21 @@ func newChurnCluster(t *testing.T, parent context.Context, n int, f int) *churnC
 	return c
 }
 
-func (c *churnCluster) crashAndRemove(t *testing.T, id p2p.NodeID) {
+func (c *churnCluster) crashAndRemove(t *testing.T, ctx context.Context, id p2p.NodeID) {
 	t.Helper()
 	if !c.active[id] {
 		return
 	}
+	// Condition the liveness test on the paper's readiness window: the next
+	// FIFO object must already be RBC-delivered before the source crashes, so
+	// the Consumer can consume it, decide 0 from the absent look-ahead object,
+	// and remove the source at its next eligible selection.
+	node := c.nodes[id]
+	node.mu.Lock()
+	next := node.State.Seqs[id] + 1
+	epoch := node.State.Epoch + 1
+	node.mu.Unlock()
+	c.ensureStored(t, ctx, node, id, next, epoch, 10*time.Second)
 	c.active[id] = false
 	c.stopped[id] = true
 	c.cancels[id]()
@@ -657,7 +664,7 @@ func (c *churnCluster) crashAndRemove(t *testing.T, id p2p.NodeID) {
 
 func (c *churnCluster) reconcileProtocolRemovals(t *testing.T, epoch uint64) {
 	t.Helper()
-	for _, id := range c.stoppedActiveIDs() {
+	for _, id := range c.activeIDs() {
 		if !c.protocolRemovedByAnyActiveNode(id) {
 			continue
 		}
@@ -929,24 +936,24 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 		t.Fatal(err)
 	}
 	req := JoinRequest{
-		ConfigVersion:   version,
-		ParentHash:      HashCertifiedState(checkpoint.State),
-		Joiner:          joiner,
-		PublicKey:       hex.EncodeToString(identity.Public),
-		CandidateParams: pp,
-		Object:          Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
-		Checkpoint:      checkpoint,
-	}
-	req, err = SignLearnerReady(req, identity.Private)
-	if err != nil {
-		t.Fatal(err)
+		ConfigVersion: version,
+		Joiner:        joiner,
+		PublicKey:     hex.EncodeToString(identity.Public),
+		AnchorEpoch:   contextEpoch + 1,
+		Object:        Object{ConfigVersion: version + 1, Producer: joiner, Seq: 1, Commitment: commitment},
 	}
 	ref.mu.Lock()
 	currentSetup := ref.ConfigurationSetups[version]
 	currentConfiguration := ref.Configurations[version]
 	historical := make([]Configuration, 0, len(ref.Configurations))
+	historicalSetups := make([]ConfigurationSetup, 0, len(ref.ConfigurationSetups))
 	for _, configuration := range ref.Configurations {
 		historical = append(historical, configuration)
+	}
+	for setupVersion, setup := range ref.ConfigurationSetups {
+		if setupVersion <= currentConfiguration.Version {
+			historicalSetups = append(historicalSetups, setup)
+		}
 	}
 	ref.mu.Unlock()
 	observerPrivate := crypto.KeyPairFromSeed(crypto.DomainHash("Tyche/ChurnLearnerPVSS/v1", []byte(joiner))).Private
@@ -956,6 +963,15 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 	}
 	identityKeys := identityKeysForMembers(currentConfiguration, currentMembers)
 	identityKeys[joiner] = identity.Public
+	successorConfiguration, err := NewConfiguration(version+1, targetMembers, targetF, pp, identityKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range c.activeNodes() {
+		if err := node.RegisterConfigurationSetup(successorConfiguration, pp, keys[node.ID].Private); err != nil {
+			t.Fatal(err)
+		}
+	}
 	learner, err := NewNode(Config{
 		ID: joiner, Members: currentMembers, Learner: true, F: currentConfiguration.F,
 		ConfigVersion: version, QueueLen: c.queueLen, PVSS: observerScheme,
@@ -963,23 +979,29 @@ func (c *churnCluster) join(t *testing.T, parent context.Context, joiner p2p.Nod
 		Transport:       c.net.NewTransport(joiner, 32768),
 		IdentityPrivate: identity.Private, IdentityPublicKeys: identityKeys,
 		BootstrapCheckpoint: &checkpoint, HistoricalConfigurations: historical,
+		InsecureDeterministicIdentity: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	learner.RegisterPVSSKey(pp.Epoch(), keys[joiner].Private)
+	for _, historicalSetup := range historicalSetups {
+		if err := learner.RegisterConfigurationSetup(
+			historicalSetup.Configuration, historicalSetup.Params, nil,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := learner.RegisterConfigurationSetup(successorConfiguration, pp, keys[joiner].Private); err != nil {
+		t.Fatal(err)
+	}
 	learnerCtx, learnerCancel := context.WithCancel(parent)
 	learner.Start(learnerCtx)
+	learner.StartProducer(learnerCtx, 5*time.Millisecond)
 	c.nodes[joiner] = learner
 	c.active[joiner] = false
 	c.cancels[joiner] = learnerCancel
-	if err := learner.HandleJoinRequest(parent, req); err != nil {
-		t.Fatal(err)
-	}
-	for _, node := range c.activeNodes() {
-		node.RegisterPVSSKey(pp.Epoch(), keys[node.ID].Private)
-	}
-	if err := ref.ProposeJoin(parent, req); err != nil {
+	if err := learner.ProposeJoin(parent, req); err != nil {
 		t.Fatal(err)
 	}
 	c.pendingJoins[joiner] = pendingChurnJoin{activation: contextEpoch + 1}
@@ -996,32 +1018,33 @@ func (c *churnCluster) reconcilePendingJoins(t *testing.T, parent context.Contex
 		if learner == nil {
 			t.Fatalf("missing running learner %s", id)
 		}
-		checkpoint := c.reference(t).Checkpoint()
-		if checkpoint.State.JReady == nil || checkpoint.State.JReady.Joiner != id {
+		admitted := false
+		for _, member := range c.activeNodes() {
+			member.mu.Lock()
+			admitted = admitted || contains(member.Schedule.Members, id)
+			member.mu.Unlock()
+		}
+		if !admitted {
 			continue
 		}
-		if err := learner.InstallCheckpoint(checkpoint); err != nil {
-			t.Fatal(err)
-		}
-		active := c.activeNodes()
-		results := make(chan error, len(active))
-		for _, node := range active {
-			go func(node *Node) {
-				results <- node.activatePendingJoins(parent, epoch)
-			}(node)
-		}
-		for range active {
-			if err := <-results; err != nil {
-				t.Fatal(err)
+		// ABA certificates may be delivered at different physical times. Wait
+		// for reliable certificate dissemination before exposing the joiner as
+		// an active test driver; the protocol itself does not use this barrier.
+		waitUntil(t, parent, func() bool {
+			for _, member := range c.activeNodes() {
+				member.mu.Lock()
+				installed := contains(member.Schedule.Members, id)
+				member.mu.Unlock()
+				if !installed {
+					return false
+				}
 			}
-		}
-		if !contains(c.members(), id) {
-			continue
-		}
+			return true
+		})
 		waitUntil(t, parent, func() bool {
 			learner.mu.Lock()
 			defer learner.mu.Unlock()
-			return contains(learner.Certified.Members, id) && learner.RBC != nil && learner.ABA != nil
+			return contains(learner.Schedule.Members, id) && learner.RBC != nil && learner.ABA != nil
 		})
 		learner.SetProducing(true)
 		c.active[id] = true
@@ -1039,9 +1062,14 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	if sourceNode == nil || (!c.active[source] && !c.stopped[source]) {
 		t.Fatalf("selected inactive source %s at epoch %d active=%v members=%v", source, epoch, c.activeIDs(), c.members())
 	}
-	c.ensureStored(t, parent, sourceNode, source, seq, epoch, timeout)
-	c.waitStoredCurrent(t, parent, source, seq)
-	if !c.stopped[source] {
+	// Process 2' gives a due certified removal marker priority over queue
+	// access. A stopped marked source is removed without requiring the missing
+	// object that the marker was created to bypass.
+	if !removingStoppedSource {
+		c.ensureStored(t, parent, sourceNode, source, seq, epoch, timeout)
+		c.waitStoredCurrent(t, parent, source, seq)
+	}
+	if !c.stopped[source] && !removingStoppedSource {
 		c.ensureStored(t, parent, sourceNode, source, seq+1, epoch, timeout)
 		c.waitStoredCurrent(t, parent, source, seq+1)
 	}
@@ -1062,33 +1090,38 @@ func (c *churnCluster) runEpoch(t *testing.T, parent context.Context, epoch uint
 	for _, node := range required {
 		go func(node *Node) {
 			beacon, err := node.RunEpochAt(epochCtx, epoch)
-			results <- churnResult{beacon: beacon, err: err}
+			results <- churnResult{node: node, beacon: beacon, err: err}
 		}(node)
 	}
 	var first Beacon
-	received := 0
-	for received < len(required) {
+	processed := 0
+	beaconCount := 0
+	for processed < len(required) {
 		select {
 		case res := <-results:
+			processed++
 			if res.err != nil {
+				if res.node != nil && !res.node.IsMember(res.node.ID) {
+					continue
+				}
 				t.Fatalf("epoch %d failed: %v\n%s", epoch, res.err, dumpNodes(active))
 			}
-			if received == 0 {
+			if beaconCount == 0 {
 				first = res.beacon
-				received++
+				beaconCount++
 				continue
 			}
 			if !bytes.Equal(first.Random, res.beacon.Random) || first.Source != res.beacon.Source || first.Seq != res.beacon.Seq {
 				t.Fatalf("epoch %d beacon mismatch: first=%+v got=%+v", epoch, first, res.beacon)
 			}
-			received++
+			beaconCount++
 		case <-time.After(10 * time.Millisecond):
-			if removingStoppedSource && c.protocolRemovedByAnyActiveNode(source) {
-				return
-			}
 		case <-epochCtx.Done():
 			t.Fatalf("epoch %d timed out\n%s", epoch, dumpNodes(active))
 		}
+	}
+	if beaconCount == 0 {
+		t.Fatalf("epoch %d produced no certified beacon", epoch)
 	}
 }
 
@@ -1096,14 +1129,16 @@ func (c *churnCluster) isMarkedForRemoval(id p2p.NodeID) bool {
 	ref := c.reference(nil)
 	ref.mu.Lock()
 	defer ref.mu.Unlock()
-	return ref.State.RmMark[id] != -1
+	_, marked := ref.State.RmMark[id]
+	return marked
 }
 
 func (c *churnCluster) isMarkedForRemovalAt(id p2p.NodeID, seq uint64) bool {
 	ref := c.reference(nil)
 	ref.mu.Lock()
 	defer ref.mu.Unlock()
-	return ref.State.RmMark[id] != -1 && uint64(ref.State.RmMark[id]) == seq
+	mark, marked := ref.State.RmMark[id]
+	return marked && mark.Seq == seq
 }
 
 func (c *churnCluster) refillCandidateLists() {
@@ -1178,9 +1213,8 @@ func (c *churnCluster) copyStoredObjectToMissing(source p2p.NodeID, seq uint64) 
 	for _, node := range c.activeNodes() {
 		node.mu.Lock()
 		candidate, ok := node.State.ComQ[source][seq]
-		version := node.State.ConfigVersion
 		node.mu.Unlock()
-		if ok && candidate.ConfigVersion == version {
+		if ok {
 			obj = candidate
 			found = true
 			break
@@ -1195,7 +1229,7 @@ func (c *churnCluster) copyStoredObjectToMissing(source p2p.NodeID, seq uint64) 
 			node.State.ComQ[source] = make(map[uint64]Object)
 		}
 		existing, ok := node.State.ComQ[source][seq]
-		if (!ok || existing.ConfigVersion != obj.ConfigVersion) && obj.ConfigVersion == node.State.ConfigVersion {
+		if !ok || existing.ConfigVersion != obj.ConfigVersion {
 			node.State.ComQ[source][seq] = obj
 		}
 		node.mu.Unlock()
@@ -1207,9 +1241,9 @@ func (c *churnCluster) allActiveStored(source p2p.NodeID, seq uint64) bool {
 	for _, node := range c.activeNodes() {
 		node.mu.Lock()
 		obj, ok := node.State.ComQ[source][seq]
-		version := node.State.ConfigVersion
+		_, originKnown := node.PVSSContexts[obj.ConfigVersion]
 		node.mu.Unlock()
-		if !ok || obj.ConfigVersion != version {
+		if !ok || !originKnown {
 			return false
 		}
 	}

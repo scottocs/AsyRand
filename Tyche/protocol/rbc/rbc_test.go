@@ -186,13 +186,22 @@ func TestAuthenticatedDeliveryCertificateBindsExactVoterSet(t *testing.T) {
 	instance := InstanceFor(7, "pvss", "n1", 9)
 	hash := Digest([]byte("value"))
 	cert := DeliveryCertificate{ConfigVersion: 7, Purpose: "pvss", Instance: instance, Hash: hash}
+	var votes []tychecrypto.SignedVote
 	for _, id := range ids[:3] {
 		vote, err := tychecrypto.SignTranscript(string(id), private[id], b.transcript("READY", instance, hash))
 		if err != nil {
 			t.Fatal(err)
 		}
-		cert.ReadySenders = append(cert.ReadySenders, id)
-		cert.ReadyVotes = append(cert.ReadyVotes, vote)
+		votes = append(votes, vote)
+	}
+	cert.ReadyCertificate, err = tychecrypto.BuildSignedQuorumCertificate(
+		votes,
+		public,
+		b.quorum(),
+		b.transcript("READY", instance, hash),
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := b.VerifyDeliveryCertificate(cert); err != nil {
 		t.Fatal(err)
@@ -203,10 +212,11 @@ func TestAuthenticatedDeliveryCertificateBindsExactVoterSet(t *testing.T) {
 		t.Fatal("certificate replayed for a different value")
 	}
 	mismatch := cert
-	mismatch.ReadySenders = append([]p2p.NodeID(nil), cert.ReadySenders...)
-	mismatch.ReadySenders[2] = "n3"
+	mismatch.ReadyCertificate.SignerBitmap = append([]byte(nil), cert.ReadyCertificate.SignerBitmap...)
+	mismatch.ReadyCertificate.SignerBitmap[0] &^= 1 << 2
+	mismatch.ReadyCertificate.SignerBitmap[0] |= 1 << 3
 	if err := b.VerifyDeliveryCertificate(mismatch); err == nil {
-		t.Fatal("listed and signed READY sets were allowed to differ")
+		t.Fatal("signatures were accepted for a different READY bitmap")
 	}
 }
 

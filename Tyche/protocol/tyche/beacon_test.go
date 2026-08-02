@@ -3,14 +3,18 @@ package tyche
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"Tyche/Tyche/crypto"
 	"Tyche/Tyche/protocol/aba"
+	"Tyche/Tyche/protocol/rbc"
 	"Tyche/utils/p2p"
+	"go.dedis.ch/kyber/v3"
 )
 
 type beaconTestResult struct {
@@ -36,12 +40,42 @@ func waitUntil(t *testing.T, ctx context.Context, predicate func() bool) {
 
 type countingPVSSScheme struct {
 	crypto.PVSSScheme
-	verifyShareCount int
+	mu                sync.Mutex
+	verifyObjectCount int
+	verifyShareCount  int
+}
+
+func (s *countingPVSSScheme) Verify(c crypto.Commitment) bool {
+	s.mu.Lock()
+	s.verifyObjectCount++
+	s.mu.Unlock()
+	return s.PVSSScheme.Verify(c)
 }
 
 func (s *countingPVSSScheme) VerifyShare(c crypto.Commitment, sh crypto.DecryptedShare) bool {
+	s.mu.Lock()
 	s.verifyShareCount++
+	s.mu.Unlock()
 	return s.PVSSScheme.VerifyShare(c, sh)
+}
+
+func (s *countingPVSSScheme) counts() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.verifyObjectCount, s.verifyShareCount
+}
+
+type blockingPVSSScheme struct {
+	crypto.PVSSScheme
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingPVSSScheme) Share(dealer p2p.NodeID, seq uint64, secret kyber.Scalar) (crypto.Commitment, []byte, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return s.PVSSScheme.Share(dealer, seq, secret)
 }
 
 func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
@@ -92,14 +126,15 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 			} else if !bytes.Equal(first.Random, b.Random) || first.Source != b.Source || first.Seq != b.Seq {
 				t.Fatalf("beacon mismatch: first=%+v got=%+v", first, b)
 			}
-			if len(b.ReadySenders) < 3 {
-				t.Fatalf("weak ready certificate: %+v", b.ReadySenders)
+			if len(b.BeaconSigners) < 3 {
+				t.Fatalf("weak beacon certificate: %+v", b.BeaconSigners)
 			}
 			nodes[0].mu.Lock()
-			parentConfig := nodes[0].Configurations[b.StateQC.ParentConfigVersion]
+			parentConfig := nodes[0].Configurations[b.QC.ConfigVersion]
 			nodes[0].mu.Unlock()
-			if len(b.StateQC.Signature.Votes) < parentConfig.Q {
-				t.Fatalf("invalid StateQC quorum size: %d", len(b.StateQC.Signature.Votes))
+			signerCount := crypto.SignedQuorumCertificateSignerCount(b.QC.Signature)
+			if signerCount < parentConfig.Q {
+				t.Fatalf("invalid beacon certificate quorum size: %d", signerCount)
 			}
 		case <-ctx.Done():
 			t.Fatalf("timed out waiting for certified beacon\n%s", dumpNodes(nodes))
@@ -133,6 +168,9 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 	waitStored(t, ctx, nodes, source, obj.Seq)
 
 	target := nodes[0]
+	if _, _, _, _, _, err := target.prepareEpoch(1); err != nil {
+		t.Fatal(err)
+	}
 	counter := &countingPVSSScheme{PVSSScheme: target.PVSS}
 	target.PVSS = counter
 	target.mu.Lock()
@@ -144,16 +182,21 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := target.handleRecon(ctx, holder.ID, ReconMessage{Epoch: 1, Source: source, Seq: obj.Seq, Share: share}); err != nil {
+		if err := target.handleRecon(ctx, holder.ID, ReconMessage{
+			ConfigVersion: obj.ConfigVersion, ObjectConfigVersion: obj.ConfigVersion,
+			Epoch: 1, Source: source, Seq: obj.Seq,
+			ObjectID: obj.Commitment.SecretID, Share: share,
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if counter.verifyShareCount != obj.Commitment.Threshold {
-		t.Fatalf("VerifyShare count = %d, want threshold %d", counter.verifyShareCount, obj.Commitment.Threshold)
+	_, shareCount := counter.counts()
+	if shareCount != obj.Commitment.Threshold {
+		t.Fatalf("VerifyShare count = %d, want threshold %d", shareCount, obj.Commitment.Threshold)
 	}
 }
 
-func TestHandleReconStoresMissingObjectFromMessage(t *testing.T) {
+func TestHandleReconBuffersUntilRBCDelivery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -176,26 +219,156 @@ func TestHandleReconStoresMissingObjectFromMessage(t *testing.T) {
 	waitStored(t, ctx, nodes, source, obj.Seq)
 
 	target := nodes[0]
+	if _, _, _, _, _, err := target.prepareEpoch(1); err != nil {
+		t.Fatal(err)
+	}
 	holder := nodes[1]
 	if holder.ID == target.ID {
 		holder = nodes[2]
 	}
 	target.mu.Lock()
 	delete(target.State.ComQ[source], obj.Seq)
+	certificate := target.RBCCertificates[rbcCertificateKey(obj.ConfigVersion, obj.Commitment.SecretID)]
 	target.mu.Unlock()
 
 	share, err := holder.PVSS.PreReconVerified(obj.Commitment, holder.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := target.handleRecon(ctx, holder.ID, ReconMessage{Epoch: 1, Source: source, Seq: obj.Seq, Share: share, Object: &obj}); err != nil {
+	if err := target.handleRecon(ctx, holder.ID, ReconMessage{
+		ConfigVersion: obj.ConfigVersion, ObjectConfigVersion: obj.ConfigVersion,
+		Epoch: 1, Source: source, Seq: obj.Seq,
+		ObjectID: obj.Commitment.SecretID, Share: share,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	target.mu.Lock()
-	_, stored := target.State.ComQ[source][obj.Seq]
+	pendingBefore := target.pendingReconCount
+	_, reconstructedBefore := target.recon[epochKey(1, source, obj.Seq)][holder.ID]
 	target.mu.Unlock()
-	if !stored {
-		t.Fatalf("recon did not restore missing object %s/%d", source, obj.Seq)
+	if pendingBefore != 1 || reconstructedBefore {
+		t.Fatalf("missing-object recon was not buffered: pending=%d reconstructed=%v", pendingBefore, reconstructedBefore)
+	}
+
+	raw, err := json.Marshal(envelope{Kind: "object", Object: &obj})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := rbc.Delivery{
+		ConfigVersion: obj.ConfigVersion,
+		Purpose:       "pvss",
+		Dealer:        obj.Producer,
+		Seq:           obj.Seq,
+		Value:         raw,
+		Hash:          rbc.Digest(raw),
+		Certificate:   certificate,
+	}
+	if err := target.handleRBCDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, ctx, func() bool {
+		target.mu.Lock()
+		defer target.mu.Unlock()
+		_, stored := target.State.ComQ[source][obj.Seq]
+		_, replayed := target.recon[epochKey(1, source, obj.Seq)][holder.ID]
+		return stored && replayed && target.pendingReconCount == 0
+	})
+}
+
+func TestPendingReconIsBoundedAndDeduplicated(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	target := nodes[0]
+	target.mu.Lock()
+	version := target.State.ConfigVersion
+	epoch := target.State.Epoch + 1
+	target.mu.Unlock()
+	source, seq, _, _, _, err := target.prepareEpoch(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	members := append([]p2p.NodeID(nil), target.State.Members...)
+	target.mu.Unlock()
+
+	for _, from := range members {
+		objectID := "pending-" + string(source) + "-" + string(from)
+		body := ReconMessage{
+			ConfigVersion:       version,
+			ObjectConfigVersion: version,
+			Epoch:               epoch,
+			Source:              source,
+			Seq:                 seq,
+			ObjectID:            objectID,
+			Share: crypto.DecryptedShare{
+				CommitmentID: objectID,
+				Holder:       from,
+			},
+		}
+		if err := target.handleRecon(ctx, from, body); err != nil {
+			t.Fatal(err)
+		}
+		body.ObjectID += "-conflict"
+		body.Share.CommitmentID = body.ObjectID
+		if err := target.handleRecon(ctx, from, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	want := len(members)
+	if target.pendingReconCount != want {
+		t.Fatalf("pending recon count=%d, want hard bound %d", target.pendingReconCount, want)
+	}
+	if len(target.pendingRecon) != 1 {
+		t.Fatalf("pending recon buckets=%d, want 1", len(target.pendingRecon))
+	}
+}
+
+func TestPendingReconClearsAcrossConfigurationReset(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nodes := newTestNodes(t, ctx)
+	target := nodes[0]
+	target.mu.Lock()
+	version := target.State.ConfigVersion
+	epoch := target.State.Epoch + 1
+	// Open the immutable Step-0 context before accepting reconstruction events.
+	from := target.State.Members[1]
+	target.mu.Unlock()
+	source, seq, _, _, _, err := target.prepareEpoch(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := ReconMessage{
+		ConfigVersion:       version,
+		ObjectConfigVersion: version,
+		Epoch:               epoch,
+		Source:              source,
+		Seq:                 seq,
+		ObjectID:            "pending-reset",
+		Share: crypto.DecryptedShare{
+			CommitmentID: "pending-reset",
+			Holder:       from,
+		},
+	}
+	if err := target.handleRecon(ctx, from, body); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	if target.pendingReconCount != 1 {
+		target.mu.Unlock()
+		t.Fatalf("pending recon count=%d, want 1 before reset", target.pendingReconCount)
+	}
+	target.resetCurrentConfigurationCachesLocked()
+	count := target.pendingReconCount
+	buckets := len(target.pendingRecon)
+	target.mu.Unlock()
+	if count != 0 || buckets != 0 {
+		t.Fatalf("pending recon survived configuration reset: count=%d buckets=%d", count, buckets)
 	}
 }
 
@@ -266,7 +439,7 @@ func TestProducerHighWatermarkBoundsAllocatedObjects(t *testing.T) {
 	}
 
 	producer.mu.Lock()
-	window := producer.producerWindowDepthLocked()
+	window := producer.producerOccupancyLocked()
 	seq := producer.State.ProducerSeq
 	producer.mu.Unlock()
 	if window != 2 || seq != 2 {
@@ -283,6 +456,132 @@ func TestProducerHighWatermarkBoundsAllocatedObjects(t *testing.T) {
 	want := uint64(2 * len(nodes))
 	if sent != want {
 		t.Fatalf("rbc/VAL sent=%d, want %d", sent, want)
+	}
+}
+
+func TestProducerReservationOccupiesCapacityBeforeRBCCertificate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	node := newTestNodes(t, ctx)[0]
+	blocking := &blockingPVSSScheme{
+		PVSSScheme: node.PVSS,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	node.PVSS = blocking
+	node.producerHigh = 1
+	node.producerLow = 1
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := node.Produce(ctx)
+		done <- err
+	}()
+	select {
+	case <-blocking.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	node.mu.Lock()
+	occupancy := node.producerOccupancyLocked()
+	stored := node.outstandingQueueDepthLocked(node.ID)
+	node.mu.Unlock()
+	if occupancy != 1 || stored != 0 {
+		t.Fatalf("in-flight occupancy=%d stored=%d, want 1 and 0", occupancy, stored)
+	}
+	if _, err := node.Produce(ctx); err == nil {
+		t.Fatal("expected in-flight, uncertified object to occupy producer capacity")
+	}
+	close(blocking.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPVSSObjectAndShareVerificationAreSingleFlight(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	nodes := newTestNodes(t, ctx)
+	target := nodes[0]
+	commitment, _, err := target.PVSS.Share(target.ID, 500, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := Object{
+		ConfigVersion: target.State.ConfigVersion,
+		Producer:      target.ID,
+		Seq:           500,
+		Commitment:    commitment,
+	}
+	counter := &countingPVSSScheme{PVSSScheme: target.PVSS}
+
+	const copies = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, copies)
+	for i := 0; i < copies; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- target.verifyObjectOnce(obj, counter)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	share, err := nodes[1].PVSS.PreReconVerified(commitment, nodes[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shareErrs := make(chan error, copies)
+	for i := 0; i < copies; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !target.verifyShareOnce(obj, share, counter) {
+				shareErrs <- errors.New("valid share rejected")
+			}
+		}()
+	}
+	wg.Wait()
+	close(shareErrs)
+	for err := range shareErrs {
+		t.Fatal(err)
+	}
+	objectCount, shareCount := counter.counts()
+	if objectCount != 1 || shareCount != 1 {
+		t.Fatalf("verification counts object=%d share=%d, want 1 and 1", objectCount, shareCount)
+	}
+}
+
+func TestLookForwardExpirationRequiresDistinctProducers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	node := newTestNodes(t, ctx)[0]
+	members := append([]p2p.NodeID(nil), node.State.Members...)
+	target := members[0]
+	node.mu.Lock()
+	node.State.ComQ[target][1] = Object{Producer: target, Seq: 1}
+	for seq := uint64(1); seq <= 3; seq++ {
+		node.State.ComQ[members[1]][seq] = Object{Producer: members[1], Seq: seq}
+	}
+	if node.lookForwardExpiredLocked(target, 2) {
+		node.mu.Unlock()
+		t.Fatal("objects from one producer must not satisfy the distinct-producer rule")
+	}
+	node.State.ComQ[members[2]][1] = Object{Producer: members[2], Seq: 1}
+	if node.lookForwardExpiredLocked(target, 2) {
+		node.mu.Unlock()
+		t.Fatal("the current target plus two progressing producers must not satisfy 2f+1")
+	}
+	node.State.ComQ[members[3]][1] = Object{Producer: members[3], Seq: 1}
+	expired := node.lookForwardExpiredLocked(target, 2)
+	node.mu.Unlock()
+	if !expired {
+		t.Fatal("three distinct progressing producers should satisfy look-forward expiration")
 	}
 }
 
@@ -427,222 +726,16 @@ func TestRunnerIDNode1ObjectStores(t *testing.T) {
 	waitStored(t, ctx, nodes, "node1", 1)
 }
 
-func TestJoinUsesCertifiedJReadyAndStateQC(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	nodes := newTestNodes(t, ctx)
-	parent := nodes[0].Checkpoint()
-	targetMembers := []p2p.NodeID{"n0", "n1", "n2", "n3", "theta"}
-	params, targetKeys, err := crypto.SetupPVSS(crypto.PVSSO1, "join-v2", 2, targetMembers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, node := range nodes {
-		node.RegisterPVSSKey(params.Epoch(), targetKeys[node.ID].Private)
-	}
-	seed := crypto.DomainHash("Tyche/JoinTestIdentity/v1", []byte("theta"))
-	identity, err := crypto.IdentityKeyPairFromSeed(seed[:32])
-	if err != nil {
-		t.Fatal(err)
-	}
-	joinerScheme, err := crypto.NewPVSSScheme("theta", targetKeys["theta"].Private, params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	commitment, _, err := joinerScheme.Share("theta", 1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := JoinRequest{
-		ConfigVersion:   parent.State.ConfigVersion,
-		ParentHash:      HashCertifiedState(parent.State),
-		Joiner:          "theta",
-		PublicKey:       hex.EncodeToString(identity.Public),
-		CandidateParams: params,
-		Object:          Object{ConfigVersion: 1, Producer: "theta", Seq: 1, Commitment: commitment},
-		Checkpoint:      parent,
-	}
-	req, err = SignLearnerReady(req, identity.Private)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parentSetup := nodes[0].ConfigurationSetups[parent.State.ConfigVersion]
-	observerPrivate := crypto.KeyPairFromSeed(crypto.DomainHash("Tyche/JoinTestObserver/v1", []byte("theta"))).Private
-	observerScheme, err := crypto.NewPVSSScheme("theta", observerPrivate, parentSetup.Params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parentIdentityKeys := identityKeysForMembers(nodes[0].Configurations[parent.State.ConfigVersion], parent.State.Members)
-	parentIdentityKeys["theta"] = identity.Public
-	learner, err := NewNode(Config{
-		ID: "theta", Members: parent.State.Members, Learner: true, F: parent.State.F,
-		QueueLen: 8, PVSS: observerScheme, Transport: p2p.NewMemoryNetwork().NewTransport("theta", 1024),
-		IdentityPrivate: identity.Private, IdentityPublicKeys: parentIdentityKeys,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	learner.RegisterPVSSKey(params.Epoch(), targetKeys["theta"].Private)
-	if err := learner.HandleJoinRequest(ctx, req); err != nil {
-		t.Fatal(err)
-	}
-	if err := nodes[0].ProposeJoin(ctx, req); err != nil {
-		t.Fatal(err)
-	}
-	waitUntil(t, ctx, func() bool {
-		for _, node := range nodes {
-			node.mu.Lock()
-			ready := node.pendingJReady != nil
-			node.mu.Unlock()
-			if !ready {
-				return false
-			}
-		}
-		return true
-	})
-
-	parentState := CloneCertifiedState(nodes[0].Certified)
-	var child CertifiedState
-	for i, node := range nodes {
-		node.mu.Lock()
-		next, err := node.entropySuccessorWithControlLocked(node.Certified, []byte("join-ready-random"), "n0", 1)
-		node.mu.Unlock()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if i == 0 {
-			child = next
-		} else if HashCertifiedState(next) != HashCertifiedState(child) {
-			t.Fatal("nodes constructed different JReady states")
-		}
-	}
-	config := nodes[0].Configurations[parentState.ConfigVersion]
-	var votes []crypto.SignedVote
-	for _, node := range nodes[:config.Q] {
-		vote, err := SignStateVote(node.ID, node.IdentityPrivate, config, TransitionEntropy, HashCertifiedState(parentState), HashCertifiedState(child))
-		if err != nil {
-			t.Fatal(err)
-		}
-		votes = append(votes, vote)
-	}
-	qc, err := BuildStateQC(config, TransitionEntropy, HashCertifiedState(parentState), HashCertifiedState(child), votes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, node := range nodes {
-		node.mu.Lock()
-		node.installCertifiedEntropyLocked(child, qc)
-		node.mu.Unlock()
-	}
-	if err := learner.InstallCheckpoint(nodes[0].Checkpoint()); err != nil {
-		t.Fatal(err)
-	}
-	results := make(chan error, len(nodes))
-	for _, node := range nodes {
-		go func(node *Node) { results <- node.runCertifiedJoin(ctx) }(node)
-	}
-	for range nodes {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, node := range nodes {
-		if !contains(node.State.Members, "theta") || node.State.ConfigVersion != 1 || node.State.Epoch != child.Epoch {
-			t.Fatalf("JOIN StateQC not installed on %s: version=%d epoch=%d members=%v", node.ID, node.State.ConfigVersion, node.State.Epoch, node.State.Members)
-		}
-	}
-	nodes[0].mu.Lock()
-	installed := StateCertificateMessage{Child: CloneCertifiedState(nodes[0].Certified), QC: *nodes[0].StateCertificate}
-	nodes[0].mu.Unlock()
-	if err := learner.InstallStateCertificate(installed); err != nil {
-		t.Fatal(err)
-	}
-	learner.mu.Lock()
-	activated := learner.RBC != nil && learner.ABA != nil && contains(learner.Certified.Members, learner.ID)
-	learner.mu.Unlock()
-	if !activated {
-		t.Fatal("learner did not activate from JOIN StateQC")
-	}
-}
-
-func TestCertifiedRemovalMarkerSuppressesPendingJReady(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	node := newTestNodes(t, ctx)[0]
-	node.mu.Lock()
-	node.pendingJReady = &JoinReady{ParentHash: HashCertifiedState(node.Certified), RequestDigest: "join", Joiner: "theta"}
-	node.State.RmMark["n1"] = 1
-	child, err := node.entropySuccessorWithControlLocked(node.Certified, []byte("r"), "n0", 1)
-	node.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if child.JReady != nil || child.RmMark["n1"] != 1 {
-		t.Fatalf("removal did not take priority: ready=%+v marks=%v", child.JReady, child.RmMark)
-	}
-	node.mu.Lock()
-	node.Certified = CloneCertifiedState(child)
-	node.pendingJReady = &JoinReady{ParentHash: HashCertifiedState(node.Certified), RequestDigest: "later-join", Joiner: "theta"}
-	next, err := node.entropySuccessorWithControlLocked(node.Certified, []byte("r2"), "n0", 2)
-	node.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next.JReady != nil {
-		t.Fatal("an already-certified removal marker did not retain priority over JOIN")
-	}
-}
-
-func TestCertifiedRemovalUsesStateQCAcrossNodes(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	nodes := newTestNodes(t, ctx)
-	for _, node := range nodes {
-		node.mu.Lock()
-		node.Certified.RmMark["n3"] = 1
-		node.State.RmMark["n3"] = 1
-		node.mu.Unlock()
-	}
-	results := make(chan error, len(nodes))
-	for _, node := range nodes {
-		go func(node *Node) {
-			results <- node.runCertifiedRemoval(ctx, "n3")
-		}(node)
-	}
-	for range nodes {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, node := range nodes {
-		node.mu.Lock()
-		state := CloneCertifiedState(node.Certified)
-		qc := node.StateCertificate
-		activeRBC := node.RBC
-		node.mu.Unlock()
-		if state.ConfigVersion != 1 || state.Epoch != 0 || contains(state.Members, "n3") {
-			t.Fatalf("node %s installed invalid REMOVE state: %+v", node.ID, state)
-		}
-		if qc == nil || qc.Transition != TransitionRemove || qc.ParentConfigVersion != 0 {
-			t.Fatalf("node %s lacks exact REMOVE StateQC: %+v", node.ID, qc)
-		}
-		if node.ID == "n3" && activeRBC != nil {
-			t.Fatal("removed process retained an active child RBC engine")
-		}
-	}
-}
-
 func TestCoinBarrierIgnoresCurrentABA(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	nodes := newTestNodes(t, ctx)
-	current := aba.EpochInstanceFor(0, 1, "n0", 1)
 	nodes[0].mu.Lock()
-	nodes[0].State.PendingABAs[current] = &PendingABA{Instance: current, Epoch: 1, Source: "n0", Seq: 1}
+	nodes[0].State.PendingABAs[1] = &PendingABA{ConfigVersion: 0, Epoch: 1, Source: "n0", Seq: 1}
 	nodes[0].mu.Unlock()
 
-	if err := nodes[0].waitCoinBarrier(ctx, current); err != nil {
+	if err := nodes[0].waitCoinBarrier(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -652,9 +745,9 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 	defer cancel()
 
 	nodes := newTestNodes(t, ctx)
-	inst := aba.EpochInstanceFor(0, 1, "n0", 1)
+	inst := aba.EpochInstanceFor(0, 1)
 	nodes[0].mu.Lock()
-	nodes[0].State.PendingABAs[inst] = &PendingABA{Instance: inst, Epoch: 1, Source: "n0", Seq: 1}
+	nodes[0].State.PendingABAs[1] = &PendingABA{ConfigVersion: 0, Epoch: 1, Source: "n0", Seq: 1}
 	nodes[0].mu.Unlock()
 
 	for _, node := range nodes {
@@ -673,66 +766,84 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 	nodes[0].beaconSeeds[1+st.Round+1] = seed
 	nodes[0].mu.Unlock()
 
-	if err := nodes[0].waitCoinBarrier(ctx, "other"); err != nil {
+	if err := nodes[0].waitCoinBarrier(ctx, 2); err != nil {
 		t.Fatal(err)
 	}
 	nodes[0].mu.Lock()
-	_, pending := nodes[0].State.PendingABAs[inst]
+	_, pending := nodes[0].State.PendingABAs[1]
 	rm := nodes[0].State.RmMark["n0"]
 	nodes[0].mu.Unlock()
-	if pending || rm != 2 {
-		t.Fatalf("cached seed did not advance pending ABA to sequence marker: pending=%v rm=%d", pending, rm)
+	if pending || rm.Seq != 2 {
+		t.Fatalf("cached seed did not advance pending ABA to sequence marker: pending=%v rm=%+v", pending, rm)
+	}
+}
+
+func TestRemovalInstallsDirectlyFromABACertificate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	nodes := newTestNodes(t, ctx)
+	inst := aba.EpochInstanceFor(0, 1)
+	for _, node := range nodes {
+		node.mu.Lock()
+		node.State.PendingABAs[1] = &PendingABA{
+			ConfigVersion: 0, Epoch: 1, Source: "n0", Seq: 1,
+		}
+		node.mu.Unlock()
+		if err := node.ABA.Propose(ctx, inst, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitABAStatus(t, ctx, nodes[0], inst, func(st aba.Status) bool { return st.CoinWait })
+	round := nodes[0].ABA.Status(inst).Round
+	seed := []byte("remove-coin")
+	for aba.CoinFromSeed(inst, round, seed) {
+		seed = append(seed, byte(len(seed)))
+	}
+	for _, node := range nodes {
+		node.mu.Lock()
+		node.beaconSeeds[1+round+1] = append([]byte(nil), seed...)
+		node.mu.Unlock()
+		node.ABA.FeedSeed(ctx, inst, round, seed)
+	}
+	waitUntil(t, ctx, func() bool {
+		for _, node := range nodes {
+			node.mu.Lock()
+			mark, ok := node.State.RmMark["n0"]
+			node.mu.Unlock()
+			if !ok || mark.Seq != 2 || mark.Certificate.Value {
+				return false
+			}
+		}
+		return true
+	})
+	for _, node := range nodes {
+		node.mu.Lock()
+		node.Schedule.Seqs["n0"] = 1
+		node.State.Seqs["n0"] = 1
+		node.mu.Unlock()
+	}
+	results := make(chan error, len(nodes))
+	for _, node := range nodes {
+		go func(node *Node) { results <- node.runCertifiedRemoval(ctx, "n0") }(node)
+	}
+	for range nodes {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, node := range nodes {
+		node.mu.Lock()
+		removed := !contains(node.State.Members, "n0") && node.State.ConfigVersion == 1
+		node.mu.Unlock()
+		if !removed {
+			t.Fatalf("node %s did not install ABA-certified removal", node.ID)
+		}
 	}
 }
 
 func TestBeaconIndexUsesFullRandomValue(t *testing.T) {
 	if got := beaconIndex([]byte{1, 0}, 257); got != 256 {
 		t.Fatalf("beaconIndex used only a suffix byte: got=%d", got)
-	}
-}
-
-func TestQueueLenOneSkipsLookaheadABA(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	pp, keys, err := crypto.Setup("test-epoch", 2, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := NewNode(Config{
-		ID:                            "n0",
-		Members:                       ids,
-		F:                             1,
-		QueueLen:                      1,
-		LookaheadExpiration:           time.Hour,
-		PVSS:                          s,
-		Transport:                     p2p.NewMemoryNetwork().NewTransport("n0", 1024),
-		InsecureDeterministicIdentity: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	start := time.Now()
-	if certified, err := node.proposeEpochABAInputFromLookahead(ctx, 1, "n0", 1, "test-instance", make(chan Beacon, 1)); err != nil {
-		t.Fatal(err)
-	} else if certified != nil {
-		t.Fatalf("unexpected certified beacon: %+v", *certified)
-	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("queue_len=1 waited for lookahead: %s", elapsed)
-	}
-	node.mu.Lock()
-	sent := node.abaInputSent["test-instance"]
-	_, inputStored := node.abaInputs["test-instance"]
-	node.mu.Unlock()
-	if sent || inputStored {
-		t.Fatalf("queue_len=1 created lookahead ABA input: sent=%v stored=%v", sent, inputStored)
 	}
 }
 
@@ -766,55 +877,15 @@ func TestMissingCurrentObjectDoesNotTriggerUncertifiedRemoval(t *testing.T) {
 	defer cancelMissing()
 	source := p2p.NodeID("n1")
 	seq := uint64(1)
-	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, aba.EpochInstanceFor(0, 1, source, seq), make(chan Beacon, 1))
+	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, aba.EpochInstanceFor(0, 1), make(chan Beacon, 1))
 	if err == nil {
 		t.Fatal("expected missing current object to wait for context")
 	}
 	node.mu.Lock()
-	mark := node.State.RmMark[source]
+	_, marked := node.State.RmMark[source]
 	node.mu.Unlock()
-	if mark != -1 {
-		t.Fatalf("missing object auto-marked source without ABA evidence %s: mark=%d", source, mark)
-	}
-}
-
-func TestPrepareEpochDoesNotCreateLookaheadABAAtQueueLenOne(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
-	pp, keys, err := crypto.Setup("test-epoch", 2, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := crypto.NewScheme("n0", keys["n0"].Private, pp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := NewNode(Config{
-		ID:                            "n0",
-		Members:                       ids,
-		F:                             1,
-		QueueLen:                      1,
-		PVSS:                          s,
-		Transport:                     p2p.NewMemoryNetwork().NewTransport("n0", 1024),
-		InsecureDeterministicIdentity: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, instance, skip, certified, err := node.prepareEpoch(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if skip || certified {
-		t.Fatalf("unexpected skip/certified flags: skip=%v certified=%v", skip, certified)
-	}
-	node.mu.Lock()
-	_, pending := node.State.PendingABAs[instance]
-	node.mu.Unlock()
-	if pending {
-		t.Fatalf("queue_len=1 created pending lookahead ABA %s", instance)
+	if marked {
+		t.Fatalf("missing object auto-marked source without ABA evidence %s", source)
 	}
 }
 

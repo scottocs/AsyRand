@@ -48,35 +48,50 @@ type ConfMessage struct {
 }
 
 type CoinRequest struct {
-	ConfigVersion uint64
-	Instance      string
-	Round         uint64
+	ConfigVersion uint64 `json:"config_version"`
+	Instance      string `json:"instance"`
+	Round         uint64 `json:"round"`
 }
 
 type Decision struct {
-	ConfigVersion uint64
-	Instance      string
-	Value         bool
-	FastPath      bool
-	Evidence      []p2p.NodeID
+	ConfigVersion uint64      `json:"config_version"`
+	Instance      string      `json:"instance"`
+	Value         bool        `json:"value"`
+	FastPath      bool        `json:"fast_path"`
+	Certificate   Certificate `json:"certificate"`
+}
+
+// Certificate is transferable evidence for one ABA decision. Fast-path
+// certificates aggregate q matching FINISH(true) messages. Regular
+// certificates aggregate q matching singleton CONF messages from the deciding
+// round; the verifier additionally checks the externally supplied common coin.
+type Certificate struct {
+	ConfigVersion uint64                         `json:"config_version"`
+	Purpose       string                         `json:"purpose"`
+	Instance      string                         `json:"instance"`
+	Round         uint64                         `json:"round"`
+	Value         bool                           `json:"value"`
+	FastPath      bool                           `json:"fast_path"`
+	Quorum        crypto.SignedQuorumCertificate `json:"quorum"`
 }
 
 type Status struct {
-	Instance   string
-	Round      uint64
-	Decided    bool
-	Value      bool
-	CoinWait   bool
-	Inputs     int
-	InputTrue  int
-	InputFalse int
-	Finish     int
-	BValTrue   int
-	BValFalse  int
-	BinTrue    bool
-	BinFalse   bool
-	Aux        int
-	Conf       int
+	Instance    string
+	Round       uint64
+	Decided     bool
+	Value       bool
+	CoinWait    bool
+	Inputs      int
+	InputTrue   int
+	InputFalse  int
+	Finish      int
+	BValTrue    int
+	BValFalse   int
+	BinTrue     bool
+	BinFalse    bool
+	Aux         int
+	Conf        int
+	Certificate Certificate
 }
 
 type Agreement struct {
@@ -99,15 +114,16 @@ type Agreement struct {
 }
 
 type instanceState struct {
-	proposed bool
-	est      bool
-	round    uint64
-	decided  bool
-	decision bool
+	proposed    bool
+	est         bool
+	round       uint64
+	decided     bool
+	decision    bool
+	certificate Certificate
 
 	inputs     map[p2p.NodeID]bool
 	inputCount map[bool]int
-	finish     map[p2p.NodeID]bool
+	finish     map[p2p.NodeID]crypto.SignedVote
 	finishSent bool
 
 	bval        map[uint64]map[bool]map[p2p.NodeID]bool
@@ -119,6 +135,7 @@ type instanceState struct {
 	auxSent     map[uint64]bool
 	confPending map[uint64]map[p2p.NodeID][]bool
 	conf        map[uint64]map[p2p.NodeID]bool
+	confVotes   map[uint64]map[bool]map[p2p.NodeID]crypto.SignedVote
 	confVal     map[uint64]map[bool]bool
 	confSent    map[uint64]bool
 	coinReq     map[uint64]bool
@@ -242,7 +259,7 @@ func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
 		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
 			return nil
 		}
-		a.handleFinish(ctx, msg.Instance, msg.From, body.Value)
+		a.handleFinish(ctx, msg.Instance, msg.From, body)
 	case "BVAL":
 		body, err := p2p.DecodePayload[BValMessage](msg)
 		if err != nil {
@@ -269,7 +286,7 @@ func (a *Agreement) Handle(ctx context.Context, msg p2p.Message) error {
 		if !a.verifyPayload(msg.Type, msg.Instance, msg.From, body, body.Signature) {
 			return nil
 		}
-		a.handleConf(ctx, msg.Instance, msg.From, body.Round, body.Values)
+		a.handleConf(ctx, msg.Instance, msg.From, body)
 	}
 	return nil
 }
@@ -306,21 +323,22 @@ func (a *Agreement) Status(instance string) Status {
 	round := st.round
 	a.ensureRound(st, round)
 	return Status{
-		Instance:   instance,
-		Round:      round,
-		Decided:    st.decided,
-		Value:      st.decision,
-		CoinWait:   st.coinWait[round],
-		Inputs:     len(st.inputs),
-		InputTrue:  st.inputCount[true],
-		InputFalse: st.inputCount[false],
-		Finish:     len(st.finish),
-		BValTrue:   len(st.bval[round][true]),
-		BValFalse:  len(st.bval[round][false]),
-		BinTrue:    st.bin[round][true],
-		BinFalse:   st.bin[round][false],
-		Aux:        len(st.aux[round]),
-		Conf:       len(st.conf[round]),
+		Instance:    instance,
+		Round:       round,
+		Decided:     st.decided,
+		Value:       st.decision,
+		CoinWait:    st.coinWait[round],
+		Inputs:      len(st.inputs),
+		InputTrue:   st.inputCount[true],
+		InputFalse:  st.inputCount[false],
+		Finish:      len(st.finish),
+		BValTrue:    len(st.bval[round][true]),
+		BValFalse:   len(st.bval[round][false]),
+		BinTrue:     st.bin[round][true],
+		BinFalse:    st.bin[round][false],
+		Aux:         len(st.aux[round]),
+		Conf:        len(st.conf[round]),
+		Certificate: st.certificate,
 	}
 }
 
@@ -335,6 +353,32 @@ func (a *Agreement) Prune(instance string) {
 	a.pruned[instance] = st.decision
 }
 
+// AdoptVerifiedDecision installs a transferable certificate that the caller
+// has already verified against the configuration quorum and assigned beacon
+// seed.  It is the event-driven catch-up path: certificate dissemination
+// delivers the same ABA decision to a copy that did not locally assemble the
+// quorum.  No second agreement round is involved.
+func (a *Agreement) AdoptVerifiedDecision(cert Certificate) bool {
+	if cert.ConfigVersion != a.Version || cert.Purpose != a.Purpose ||
+		!a.validInstance(cert.Instance) {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if decision, ok := a.pruned[cert.Instance]; ok {
+		return decision == cert.Value
+	}
+	st := a.get(cert.Instance)
+	if st.decided {
+		return st.decision == cert.Value
+	}
+	st.decided = true
+	st.decision = cert.Value
+	st.certificate = cert
+	st.coinWait[st.round] = false
+	return true
+}
+
 func (a *Agreement) get(instance string) *instanceState {
 	st := a.state[instance]
 	if st != nil {
@@ -344,14 +388,15 @@ func (a *Agreement) get(instance string) *instanceState {
 		return &instanceState{decided: true, decision: decision}
 	}
 	st = &instanceState{
-		inputs: make(map[p2p.NodeID]bool), inputCount: make(map[bool]int), finish: make(map[p2p.NodeID]bool),
+		inputs: make(map[p2p.NodeID]bool), inputCount: make(map[bool]int), finish: make(map[p2p.NodeID]crypto.SignedVote),
 		bval: make(map[uint64]map[bool]map[p2p.NodeID]bool), bvalSent: make(map[uint64]map[bool]bool),
 		bin: make(map[uint64]map[bool]bool), auxPending: make(map[uint64]map[p2p.NodeID]bool),
 		aux:    make(map[uint64]map[p2p.NodeID]bool),
 		auxVal: make(map[uint64]map[bool]bool), auxSent: make(map[uint64]bool),
 		confPending: make(map[uint64]map[p2p.NodeID][]bool),
 		conf:        make(map[uint64]map[p2p.NodeID]bool), confVal: make(map[uint64]map[bool]bool),
-		confSent: make(map[uint64]bool), coinReq: make(map[uint64]bool), coinWait: make(map[uint64]bool),
+		confVotes: make(map[uint64]map[bool]map[p2p.NodeID]crypto.SignedVote),
+		confSent:  make(map[uint64]bool), coinReq: make(map[uint64]bool), coinWait: make(map[uint64]bool),
 		coins: make(map[uint64]bool), coinSeen: make(map[uint64]bool),
 	}
 	a.state[instance] = st
@@ -386,6 +431,12 @@ func (a *Agreement) ensureRound(st *instanceState, r uint64) {
 	if st.confVal[r] == nil {
 		st.confVal[r] = make(map[bool]bool)
 	}
+	if st.confVotes[r] == nil {
+		st.confVotes[r] = map[bool]map[p2p.NodeID]crypto.SignedVote{
+			false: {},
+			true:  {},
+		}
+	}
 }
 
 func (a *Agreement) quorum() int { return a.N - a.F }
@@ -409,8 +460,8 @@ func (a *Agreement) handleInput(ctx context.Context, instance string, from p2p.N
 	}
 }
 
-func (a *Agreement) handleFinish(ctx context.Context, instance string, from p2p.NodeID, value bool) {
-	if !value {
+func (a *Agreement) handleFinish(ctx context.Context, instance string, from p2p.NodeID, body FinishMessage) {
+	if !body.Value {
 		return
 	}
 	a.mu.Lock()
@@ -419,13 +470,27 @@ func (a *Agreement) handleFinish(ctx context.Context, instance string, from p2p.
 		a.mu.Unlock()
 		return
 	}
-	st.finish[from] = true
+	st.finish[from] = body.Signature
 	if len(st.finish) >= a.quorum() {
+		votes := signedVotes(st.finish, a.quorum())
+		cert, err := a.buildDecisionQuorum(votes)
+		if err != nil {
+			a.mu.Unlock()
+			return
+		}
+		certificate := Certificate{
+			ConfigVersion: a.Version,
+			Purpose:       a.Purpose,
+			Instance:      instance,
+			Value:         true,
+			FastPath:      true,
+			Quorum:        cert,
+		}
 		st.decided = true
 		st.decision = true
-		evidence := sortedSenders(st.finish, a.quorum())
+		st.certificate = certificate
 		a.mu.Unlock()
-		a.Decisions <- Decision{ConfigVersion: a.Version, Instance: instance, Value: true, FastPath: true, Evidence: evidence}
+		a.Decisions <- Decision{ConfigVersion: a.Version, Instance: instance, Value: true, FastPath: true, Certificate: certificate}
 		return
 	}
 	a.mu.Unlock()
@@ -508,7 +573,9 @@ func (a *Agreement) handleAux(ctx context.Context, instance string, from p2p.Nod
 	}
 }
 
-func (a *Agreement) handleConf(ctx context.Context, instance string, from p2p.NodeID, round uint64, values []bool) {
+func (a *Agreement) handleConf(ctx context.Context, instance string, from p2p.NodeID, body ConfMessage) {
+	round := body.Round
+	values := body.Values
 	a.mu.Lock()
 	st := a.get(instance)
 	if st.decided {
@@ -521,6 +588,9 @@ func (a *Agreement) handleConf(ctx context.Context, instance string, from p2p.No
 		return
 	}
 	st.confPending[round][from] = append([]bool(nil), values...)
+	if len(values) == 1 {
+		st.confVotes[round][values[0]][from] = body.Signature
+	}
 	needCoin, hasCoin := a.processPendingConfLocked(st, round)
 	a.mu.Unlock()
 	if needCoin {
@@ -611,11 +681,25 @@ func (a *Agreement) tryAdvanceWithCoin(ctx context.Context, instance string, rou
 		b := values[0]
 		st.est = b
 		if b == coin {
+			votes := signedVotes(st.confVotes[round][b], a.quorum())
+			cert, err := a.buildDecisionQuorum(votes)
+			if err != nil {
+				a.mu.Unlock()
+				return
+			}
+			certificate := Certificate{
+				ConfigVersion: a.Version,
+				Purpose:       a.Purpose,
+				Instance:      instance,
+				Round:         round,
+				Value:         b,
+				Quorum:        cert,
+			}
 			st.decided = true
 			st.decision = b
-			evidence := sortedSenders(st.conf[round], a.quorum())
+			st.certificate = certificate
 			a.mu.Unlock()
-			a.Decisions <- Decision{ConfigVersion: a.Version, Instance: instance, Value: b, FastPath: false, Evidence: evidence}
+			a.Decisions <- Decision{ConfigVersion: a.Version, Instance: instance, Value: b, FastPath: false, Certificate: certificate}
 			return
 		}
 	} else {
@@ -746,20 +830,53 @@ func CoinFromSeed(instance string, round uint64, seed []byte) bool {
 	return h[len(h)-1]&1 == 1
 }
 
-func EpochInstance(epoch uint64, source p2p.NodeID) string {
-	return fmt.Sprintf("epoch/%d/source/%s", epoch, source)
+// VerifyCertificate checks a transferable decision certificate. seed is
+// ignored for the all-1 fast path; a regular certificate must be accompanied
+// by the certified beacon value assigned to its deciding round.
+func VerifyCertificate(cert Certificate, publicKeys map[string]ed25519.PublicKey, quorum int, seed []byte) error {
+	if cert.Instance == "" || cert.Purpose == "" || quorum <= 0 {
+		return fmt.Errorf("invalid ABA certificate context")
+	}
+	var kind string
+	var payload any
+	if cert.FastPath {
+		if !cert.Value {
+			return fmt.Errorf("ABA fast-path certificate cannot decide 0")
+		}
+		kind = "FINISH"
+		payload = FinishMessage{Value: true}
+	} else {
+		if len(seed) == 0 {
+			return fmt.Errorf("regular ABA certificate requires its certified seed")
+		}
+		if CoinFromSeed(cert.Instance, cert.Round, seed) != cert.Value {
+			return fmt.Errorf("ABA certificate value does not match its deciding coin")
+		}
+		kind = "CONF"
+		payload = ConfMessage{Round: cert.Round, Values: []bool{cert.Value}}
+	}
+	raw, _ := json.Marshal(unsignedPayload(payload))
+	transcript := crypto.DomainHash(
+		"Tyche/ABAMessage/v1",
+		[]byte(fmt.Sprintf("%d", cert.ConfigVersion)),
+		[]byte(cert.Purpose),
+		[]byte(kind),
+		[]byte(cert.Instance),
+		raw,
+	)
+	return crypto.VerifySignedQuorumCertificate(cert.Quorum, publicKeys, quorum, transcript)
 }
 
-func EpochInstanceFor(configVersion, epoch uint64, source p2p.NodeID, seq uint64) string {
-	return fmt.Sprintf("aba/%d/control/epoch/%d/source/%s/seq/%d", configVersion, epoch, source, seq)
+func EpochInstance(epoch uint64) string {
+	return fmt.Sprintf("epoch/%d", epoch)
 }
 
-func JoinInstance(transition, requestDigest string, firstCoinEpoch uint64) string {
-	return fmt.Sprintf("join/%s/%s/%d", transition, requestDigest, firstCoinEpoch)
+func EpochInstanceFor(configVersion, epoch uint64) string {
+	return fmt.Sprintf("aba/%d/control/epoch/%d", configVersion, epoch)
 }
 
-func JoinInstanceFor(configVersion uint64, transition, requestDigest string, firstCoinEpoch uint64) string {
-	return fmt.Sprintf("aba/%d/control/join/%s/%s/%d", configVersion, transition, requestDigest, firstCoinEpoch)
+func JoinInstanceFor(configVersion uint64, joiner string) string {
+	return fmt.Sprintf("aba/%d/control/join/%s", configVersion, joiner)
 }
 
 func ConfigVersionFromInstance(instance string) (uint64, bool) {
@@ -771,28 +888,25 @@ func ConfigVersionFromInstance(instance string) (uint64, bool) {
 	return version, err == nil
 }
 
-func ParseJoinInstance(instance string) (uint64, bool) {
+func EpochFromInstance(instance string) (uint64, bool) {
 	parts := strings.Split(instance, "/")
-	if len(parts) < 5 {
+	if len(parts) != 5 || parts[0] != "aba" || parts[2] != "control" || parts[3] != "epoch" {
 		return 0, false
 	}
-	isJoin := parts[0] == "join"
-	if !isJoin {
-		for _, part := range parts {
-			if part == "join" {
-				isJoin = true
-				break
-			}
-		}
+	epoch, err := strconv.ParseUint(parts[4], 10, 64)
+	return epoch, err == nil
+}
+
+func JoinerFromInstance(instance string) (string, bool) {
+	parts := strings.Split(instance, "/")
+	if len(parts) == 2 && parts[0] == "join" && parts[1] != "" {
+		return parts[1], true
 	}
-	if !isJoin {
-		return 0, false
+	if len(parts) == 5 && parts[0] == "aba" && parts[2] == "control" &&
+		parts[3] == "join" && parts[4] != "" {
+		return parts[4], true
 	}
-	first, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return first, true
+	return "", false
 }
 
 func (a *Agreement) acceptsSender(sender p2p.NodeID) bool {
@@ -813,16 +927,27 @@ func (a *Agreement) validInstance(instance string) bool {
 	return strings.HasPrefix(instance, fmt.Sprintf("aba/%d/%s/", a.Version, a.Purpose))
 }
 
-func sortedSenders(votes map[p2p.NodeID]bool, limit int) []p2p.NodeID {
-	out := make([]p2p.NodeID, 0, len(votes))
+func signedVotes(votes map[p2p.NodeID]crypto.SignedVote, limit int) []crypto.SignedVote {
+	senders := make([]p2p.NodeID, 0, len(votes))
 	for sender := range votes {
-		out = append(out, sender)
+		senders = append(senders, sender)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	if len(out) > limit {
-		out = out[:limit]
+	sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
+	if len(senders) > limit {
+		senders = senders[:limit]
+	}
+	out := make([]crypto.SignedVote, 0, len(senders))
+	for _, sender := range senders {
+		out = append(out, votes[sender])
 	}
 	return out
+}
+
+func (a *Agreement) buildDecisionQuorum(votes []crypto.SignedVote) (crypto.SignedQuorumCertificate, error) {
+	if !a.Authenticated {
+		return crypto.SignedQuorumCertificate{}, nil
+	}
+	return crypto.EncodeVerifiedSignedQuorumCertificate(votes, a.PublicKeys, a.quorum())
 }
 
 func (a *Agreement) payloadTranscript(kind, instance string, payload any) []byte {
