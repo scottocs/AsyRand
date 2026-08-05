@@ -152,7 +152,7 @@ func waitQueuesAtLeast(t *testing.T, ctx context.Context, nodes []*Node, depth i
 func nextSourceSeq(n *Node) (p2p.NodeID, uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
+	idx := selectionIndex(n.State.Epoch+1, n.State.RPrev, 0, len(n.State.SCL))
 	source := n.State.SCL[idx]
 	return source, n.State.Seqs[source] + 1
 }
@@ -178,10 +178,9 @@ func dumpNodes(nodes []*Node) string {
 			beaconVotes[key] = len(senders)
 		}
 		abaStatuses := make(map[string]aba.Status, len(n.State.PendingABAs))
-		for epoch, pending := range n.State.PendingABAs {
-			inst := aba.EpochInstanceFor(pending.ConfigVersion, epoch)
-			if engine := n.ABAs[pending.ConfigVersion]; engine != nil {
-				abaStatuses[inst] = engine.Status(inst)
+		for instance := range n.State.PendingABAs {
+			if engine := n.ABA; engine != nil {
+				abaStatuses[instance] = engine.Status(instance)
 			}
 		}
 		out += fmt.Sprintf("node=%s epoch=%d scl=%v rsq=%v seqs=%v queues=%v queue_seqs=%v pending=%v aba=%v recon=%v recon_done=%v beacon_votes=%v seeds=%d verified=%d\n",

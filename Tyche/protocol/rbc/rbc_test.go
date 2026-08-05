@@ -80,7 +80,7 @@ func TestRBCInitialCarriesValue(t *testing.T) {
 	if val.Hash != Digest(value) {
 		t.Fatalf("bad hash: %s", val.Hash)
 	}
-	if val.Dealer != "n0" || val.Seq != 7 || !bytes.Equal(val.Value, value) {
+	if !bytes.Equal(val.Value, value) {
 		t.Fatalf("bad initial value: %+v", val)
 	}
 }
@@ -96,11 +96,7 @@ func TestRBCValAfterReadyQuorumDelivers(t *testing.T) {
 	value := []byte("late-val-rbc-value")
 	hash := Digest(value)
 	for _, from := range []p2p.NodeID{"n1", "n2", "n3"} {
-		msg, err := p2p.NewMessage(Protocol, "READY", Instance("dealer", 9, hash), from, "n0", VoteMessage{
-			Dealer: "dealer",
-			Seq:    9,
-			Hash:   hash,
-		})
+		msg, err := p2p.NewMessage(Protocol, "READY", Instance("dealer", 9, hash), from, "n0", VoteMessage{Hash: hash})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,12 +111,7 @@ func TestRBCValAfterReadyQuorumDelivers(t *testing.T) {
 	default:
 	}
 
-	val, err := p2p.NewMessage(Protocol, "VAL", Instance("dealer", 9, hash), "dealer", "n0", ValueMessage{
-		Dealer: "dealer",
-		Seq:    9,
-		Value:  value,
-		Hash:   hash,
-	})
+	val, err := p2p.NewMessage(Protocol, "VAL", Instance("dealer", 9, hash), "dealer", "n0", ValueMessage{Value: value, Hash: hash})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,14 +136,14 @@ func TestPruneThroughKeepsFutureInstances(t *testing.T) {
 	old := Instance("dealer", 3, oldHash)
 	future := Instance("dealer", 4, futureHash)
 
-	b.values[old] = ValueMessage{Dealer: "dealer", Seq: 3, Value: []byte("old"), Hash: oldHash}
+	b.values[old] = ValueMessage{Value: []byte("old"), Hash: oldHash}
 	b.echoes[old] = map[p2p.NodeID]bool{"n1": true}
 	b.readies[old] = map[p2p.NodeID]bool{"n2": true}
 	b.echoSent[old] = true
 	b.readySent[old] = true
 	b.delivered[old] = true
 
-	b.values[future] = ValueMessage{Dealer: "dealer", Seq: 4, Value: []byte("future"), Hash: futureHash}
+	b.values[future] = ValueMessage{Value: []byte("future"), Hash: futureHash}
 	b.echoes[future] = map[p2p.NodeID]bool{"n1": true}
 	b.readies[future] = map[p2p.NodeID]bool{"n2": true}
 	b.echoSent[future] = true
@@ -238,7 +229,7 @@ func TestAuthenticatedRBCRejectsEquivocatingSecondVAL(t *testing.T) {
 	}
 	instance := InstanceFor(3, "pvss", "n1", 1)
 	send := func(value []byte) {
-		body := ValueMessage{ConfigVersion: 3, Purpose: "pvss", Dealer: "n1", Seq: 1, Value: value, Hash: Digest(value)}
+		body := ValueMessage{Value: value, Hash: Digest(value)}
 		body.Signature, err = tychecrypto.SignTranscript("n1", private["n1"], b.transcript("VAL", instance, body.Hash))
 		if err != nil {
 			t.Fatal(err)

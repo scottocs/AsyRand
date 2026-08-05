@@ -10,6 +10,8 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,23 +34,19 @@ type Object struct {
 	Commitment    crypto.Commitment `json:"commitment"`
 }
 
+type CertifiedObject struct {
+	Object      Object                  `json:"object"`
+	Certificate rbc.DeliveryCertificate `json:"rbc_certificate"`
+}
+
 type Beacon struct {
-	Epoch         uint64       `json:"epoch"`
-	Source        p2p.NodeID   `json:"source"`
-	Seq           uint64       `json:"seq"`
-	PrevRandom    []byte       `json:"prev_random"`
-	Random        []byte       `json:"random"`
-	Secret        []byte       `json:"secret"`
-	ObjectID      string       `json:"object_id"`
-	BeaconSigners []p2p.NodeID `json:"beacon_signers"`
-	ConfigVersion uint64       `json:"config_version"`
-	QC            BeaconQC     `json:"beacon_qc"`
+	BeaconQC `json:"certificate"`
+	Skipped  []SkippedTuple `json:"skipped,omitempty"`
 }
 
 type Config struct {
 	ID                 p2p.NodeID
 	Members            []p2p.NodeID
-	Learner            bool
 	F                  int
 	QueueLen           int
 	ProducerLow        int
@@ -68,9 +66,7 @@ type Config struct {
 	Transport                     p2p.Transport
 	// Store must be durable in production. Tests and explicitly insecure
 	// experiments may omit it and receive an in-memory store.
-	Store                    StateStore
-	BootstrapCheckpoint      *CertifiedCheckpoint
-	HistoricalConfigurations []Configuration
+	Store StateStore
 }
 
 type State struct {
@@ -81,44 +77,39 @@ type State struct {
 	RPrev         []byte
 	SCL           []p2p.NodeID
 	RSQ           []p2p.NodeID
-	ComQ          map[p2p.NodeID]map[uint64]Object
+	ComQ          map[p2p.NodeID]map[uint64]CertifiedObject
 	Seqs          map[p2p.NodeID]uint64
-	RmMark        map[p2p.NodeID]RemovalMark
-	PendingABAs   map[uint64]*PendingABA
-	QueueLen      int
-	ProducerSeq   uint64
+	// PendingABAs is exactly the set of tuple ABA identifiers in coin-wait.
+	PendingABAs map[string]struct{}
+	// ABADecisions retains transferable decisions until their successor tuple
+	// has been consumed or certified as skipped.
+	ABADecisions map[string]aba.Decision
+	QueueLen     int
+	ProducerSeq  uint64
 }
 
-type PendingABA struct {
-	ConfigVersion uint64     `json:"config_version"`
-	Epoch         uint64     `json:"epoch"`
-	Source        p2p.NodeID `json:"source"`
-	Seq           uint64     `json:"seq"`
-	Round         uint64     `json:"round"`
-	CoinWait      bool       `json:"coin_wait"`
-}
-
-type RemovalMark struct {
-	Seq           uint64          `json:"seq"`
-	ConfigVersion uint64          `json:"config_version"`
-	Epoch         uint64          `json:"epoch"`
-	Certificate   aba.Certificate `json:"certificate"`
+type SkippedTuple struct {
+	Source      p2p.NodeID      `json:"source"`
+	Seq         uint64          `json:"seq"`
+	Certificate aba.Certificate `json:"certificate"`
 }
 
 type envelope struct {
-	Kind   string       `json:"kind"`
-	Object *Object      `json:"object,omitempty"`
-	Join   *JoinRequest `json:"join,omitempty"`
+	Kind   string  `json:"kind"`
+	Object *Object `json:"object,omitempty"`
 }
 
 type ReconMessage struct {
-	ConfigVersion       uint64                `json:"config_version"`
 	ObjectConfigVersion uint64                `json:"object_config_version"`
-	Epoch               uint64                `json:"epoch"`
-	Source              p2p.NodeID            `json:"source"`
-	Seq                 uint64                `json:"seq"`
-	ObjectID            string                `json:"object_id"`
 	Share               crypto.DecryptedShare `json:"share"`
+}
+
+type reconScope struct {
+	ConfigVersion uint64
+	Epoch         uint64
+	ParentHash    string
+	Source        p2p.NodeID
+	Seq           uint64
 }
 
 type pendingReconBucket struct {
@@ -127,13 +118,19 @@ type pendingReconBucket struct {
 	Epoch               uint64
 	Source              p2p.NodeID
 	Seq                 uint64
-	Messages            map[p2p.NodeID]ReconMessage
+	Messages            map[p2p.NodeID]pendingReconMessage
+}
+
+type pendingReconMessage struct {
+	Instance string
+	Body     ReconMessage
 }
 
 type signedBeaconMessage struct {
 	ConfigVersion uint64            `json:"config_version"`
 	Epoch         uint64            `json:"epoch"`
 	ParentHash    string            `json:"parent_hash"`
+	SkippedHash   string            `json:"skipped_hash"`
 	Source        p2p.NodeID        `json:"source"`
 	Seq           uint64            `json:"seq"`
 	Random        []byte            `json:"random"`
@@ -141,11 +138,12 @@ type signedBeaconMessage struct {
 }
 
 type certifiedABADecision struct {
-	Decision aba.Decision `json:"decision"`
+	Certificate aba.Certificate `json:"certificate"`
 }
 
 type certifiedBeaconRecord struct {
-	QC BeaconQC `json:"qc"`
+	QC      BeaconQC       `json:"qc"`
+	Skipped []SkippedTuple `json:"skipped,omitempty"`
 }
 
 // epochAttempt is the immutable Step-0 context for one opened Consumer
@@ -159,41 +157,35 @@ type epochAttempt struct {
 	Source        p2p.NodeID
 	Seq           uint64
 	PrevRandom    []byte
+	Skipped       []SkippedTuple
 }
 
 var errRestartEpoch = errors.New("epoch control state changed; restart Step 0")
+var errPriorDecisionPending = errors.New("prior tuple ABA decision is not yet available")
 
 type Node struct {
-	ID                  p2p.NodeID
-	Transport           p2p.Transport
-	PVSS                crypto.PVSSScheme
-	Perf                *PerfMetrics
-	RBC                 *rbc.Broadcaster
-	JoinRBC             *rbc.Broadcaster
-	ABA                 *aba.Agreement
-	RBCs                map[uint64]*rbc.Broadcaster
-	JoinRBCs            map[uint64]*rbc.Broadcaster
-	ABAs                map[uint64]*aba.Agreement
-	engineStarted       map[uint64]bool
-	protocolContext     context.Context
-	Crypto              *cryptoexec.Executor
-	Configurations      map[uint64]Configuration
-	ConfigurationSetups map[uint64]ConfigurationSetup
-	CandidateSetups     map[string]ConfigurationSetup
-	Schedule            SchedulingState
-	LatestBeaconQC      *BeaconQC
-	HistoryAnchor       SchedulingState
-	BeaconHistory       []BeaconHistoryLink
-	IdentityPrivate     ed25519.PrivateKey
-	allowInsecureSetup  bool
-	PVSSContexts        map[uint64]*PVSSContext
-	RBCCertificates     map[string]rbc.DeliveryCertificate
-	Store               StateStore
+	ID                 p2p.NodeID
+	Transport          p2p.Transport
+	PVSS               crypto.PVSSScheme
+	Perf               *PerfMetrics
+	RBC                *rbc.Broadcaster
+	ABA                *aba.Agreement
+	engineStarted      bool
+	protocolContext    context.Context
+	Crypto             *cryptoexec.Executor
+	Configuration      Configuration
+	Schedule           SchedulingState
+	LatestBeaconQC     *BeaconQC
+	HistoryAnchor      SchedulingState
+	BeaconHistory      []BeaconHistoryLink
+	IdentityPrivate    ed25519.PrivateKey
+	allowInsecureSetup bool
+	PVSSContext        *PVSSContext
+	Store              StateStore
 
 	mu                sync.Mutex
 	State             *State
 	recon             map[string]map[p2p.NodeID]crypto.DecryptedShare
-	reconSecret       map[string][]byte
 	reconDone         map[string]bool
 	reconClosing      map[string]bool
 	pendingRecon      map[string]*pendingReconBucket
@@ -202,10 +194,6 @@ type Node struct {
 	beaconVoteSent    map[string]bool
 	reconSent         map[string]bool
 	certified         map[string]bool
-	PendingJoin       *PendingJoin
-	pendingJoinCert   *JoinDecisionCertificate
-	joinProposals     map[string]JoinRequest
-	deferredJoinABA   map[string][]p2p.Message
 	pendingABACerts   map[string]aba.Decision
 	abaCertRelayed    map[string]bool
 	beaconCertRelayed map[string]bool
@@ -226,7 +214,6 @@ type Node struct {
 	certifying        map[string]bool
 
 	Beacons chan Beacon
-	Joins   chan JoinCertificate
 }
 
 type verifiedObject struct {
@@ -335,14 +322,14 @@ func NewNode(cfg Config) (*Node, error) {
 		RPrev:         seed,
 		SCL:           append([]p2p.NodeID(nil), members...),
 		RSQ:           make([]p2p.NodeID, 0, 2*f),
-		ComQ:          make(map[p2p.NodeID]map[uint64]Object),
+		ComQ:          make(map[p2p.NodeID]map[uint64]CertifiedObject),
 		Seqs:          make(map[p2p.NodeID]uint64),
-		RmMark:        make(map[p2p.NodeID]RemovalMark),
-		PendingABAs:   make(map[uint64]*PendingABA),
+		PendingABAs:   make(map[string]struct{}),
+		ABADecisions:  make(map[string]aba.Decision),
 		QueueLen:      queueLen,
 	}
 	for _, id := range members {
-		st.ComQ[id] = make(map[uint64]Object)
+		st.ComQ[id] = make(map[uint64]CertifiedObject)
 	}
 	params := cfg.PVSSParams
 	if params.Epoch() == "" {
@@ -361,65 +348,40 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	var rbcEngine *rbc.Broadcaster
-	var joinRBCEngine *rbc.Broadcaster
 	var abaEngine *aba.Agreement
-	if configuration.Contains(cfg.ID) {
-		rbcEngine, err = rbc.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "pvss", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
-		if err != nil {
-			return nil, err
-		}
-		joinRBCEngine, err = rbc.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "join", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
-		if err != nil {
-			return nil, err
-		}
-		abaEngine, err = aba.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "control", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
-		if err != nil {
-			return nil, err
-		}
-	} else if !cfg.Learner {
-		return nil, fmt.Errorf("node %s is not a member; configure it explicitly as a learner", cfg.ID)
+	if !configuration.Contains(cfg.ID) {
+		return nil, fmt.Errorf("node %s is not a member of the fixed party set", cfg.ID)
+	}
+	rbcEngine, err = rbc.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "pvss", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
+	if err != nil {
+		return nil, err
+	}
+	abaEngine, err = aba.NewAuthenticated(cfg.ID, cfg.ConfigVersion, "control", members, f, cfg.Transport, identityPrivate, configuration.PublicKeys())
+	if err != nil {
+		return nil, err
 	}
 	schedule := schedulingStateFromRuntime(st, configuration)
 	n := &Node{
 		ID: cfg.ID, Transport: cfg.Transport, PVSS: cfg.PVSS, Perf: &PerfMetrics{},
-		RBC:            rbcEngine,
-		JoinRBC:        joinRBCEngine,
-		ABA:            abaEngine,
-		RBCs:           make(map[uint64]*rbc.Broadcaster),
-		JoinRBCs:       make(map[uint64]*rbc.Broadcaster),
-		ABAs:           make(map[uint64]*aba.Agreement),
-		engineStarted:  make(map[uint64]bool),
-		Crypto:         cryptoexec.New(cfg.CryptoWorkers),
-		State:          st,
-		Configurations: map[uint64]Configuration{configuration.Version: configuration},
-		ConfigurationSetups: map[uint64]ConfigurationSetup{
-			configuration.Version: {
-				Configuration: configuration,
-				Params:        params,
-				Scheme:        cfg.PVSS,
-			},
-		},
-		CandidateSetups:    make(map[string]ConfigurationSetup),
+		RBC:                rbcEngine,
+		ABA:                abaEngine,
+		Crypto:             cryptoexec.New(cfg.CryptoWorkers),
+		State:              st,
+		Configuration:      configuration,
 		Schedule:           schedule,
 		HistoryAnchor:      CloneSchedulingState(schedule),
 		IdentityPrivate:    append(ed25519.PrivateKey(nil), identityPrivate...),
 		allowInsecureSetup: cfg.InsecureDeterministicIdentity,
-		PVSSContexts: map[uint64]*PVSSContext{
-			cfg.ConfigVersion: {
-				Configuration: configuration,
-				Params:        params,
-				Scheme:        cfg.PVSS,
-				Status:        PVSSActive,
-			},
+		PVSSContext: &PVSSContext{
+			Configuration: configuration,
+			Params:        params,
+			Scheme:        cfg.PVSS,
 		},
-		RBCCertificates: make(map[string]rbc.DeliveryCertificate),
-		Store:           cfg.Store,
-		recon:           make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconSecret: make(map[string][]byte), reconDone: make(map[string]bool), reconClosing: make(map[string]bool),
+		Store: cfg.Store,
+		recon: make(map[string]map[p2p.NodeID]crypto.DecryptedShare), reconDone: make(map[string]bool), reconClosing: make(map[string]bool),
 		pendingRecon:   make(map[string]*pendingReconBucket),
 		beaconVotes:    make(map[string]map[p2p.NodeID]crypto.SignedVote),
 		beaconVoteSent: make(map[string]bool), reconSent: make(map[string]bool), certified: make(map[string]bool),
-		joinProposals:     make(map[string]JoinRequest),
-		deferredJoinABA:   make(map[string][]p2p.Message),
 		pendingABACerts:   make(map[string]aba.Decision),
 		abaCertRelayed:    make(map[string]bool),
 		beaconCertRelayed: make(map[string]bool),
@@ -434,16 +396,11 @@ func NewNode(cfg Config) (*Node, error) {
 		pvssBackend:       pvssBackend,
 		producerLow:       low,
 		producerHigh:      high,
-		producing:         configuration.Contains(cfg.ID),
+		producing:         true,
 		waiters:           make(map[string][]chan Beacon),
 		certBeacons:       make(map[string]Beacon),
 		certifying:        make(map[string]bool),
-		Beacons:           make(chan Beacon, len(members)*4), Joins: make(chan JoinCertificate, len(members)*2),
-	}
-	if rbcEngine != nil {
-		n.RBCs[cfg.ConfigVersion] = rbcEngine
-		n.JoinRBCs[cfg.ConfigVersion] = joinRBCEngine
-		n.ABAs[cfg.ConfigVersion] = abaEngine
+		Beacons:           make(chan Beacon, len(members)*4),
 	}
 	for epoch, key := range cfg.PVSSKeys {
 		if key != nil {
@@ -455,20 +412,6 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	if n.Store == nil {
 		n.Store = NewMemoryStateStore()
-	}
-	for _, historical := range cfg.HistoricalConfigurations {
-		if err := historical.Validate(); err != nil {
-			return nil, fmt.Errorf("invalid historical configuration %d: %w", historical.Version, err)
-		}
-		if existing, ok := n.Configurations[historical.Version]; ok && existing.Digest() != historical.Digest() {
-			return nil, fmt.Errorf("conflicting historical configuration %d", historical.Version)
-		}
-		n.Configurations[historical.Version] = historical
-	}
-	if cfg.BootstrapCheckpoint != nil {
-		if err := n.bootstrapCheckpoint(*cfg.BootstrapCheckpoint); err != nil {
-			return nil, err
-		}
 	}
 	if err := n.restorePersistentState(); err != nil {
 		return nil, err
@@ -485,7 +428,7 @@ func NewNode(cfg Config) (*Node, error) {
 func (n *Node) Start(ctx context.Context) {
 	n.mu.Lock()
 	n.protocolContext = ctx
-	n.startProtocolEngineCollectorsLocked(ctx, n.State.ConfigVersion)
+	n.startProtocolEngineCollectorsLocked(ctx)
 	n.mu.Unlock()
 	abaInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 4))
 	controlInbox := make(chan p2p.Message, protocolQueueSize(len(n.State.Members), 2))
@@ -523,35 +466,22 @@ func (n *Node) Start(ctx context.Context) {
 	}()
 }
 
-func (n *Node) startProtocolEngineCollectorsLocked(ctx context.Context, version uint64) {
-	if n.engineStarted[version] {
+func (n *Node) startProtocolEngineCollectorsLocked(ctx context.Context) {
+	if n.engineStarted {
 		return
 	}
-	rbcEngine := n.RBCs[version]
-	joinRBCEngine := n.JoinRBCs[version]
-	abaEngine := n.ABAs[version]
-	if rbcEngine == nil || joinRBCEngine == nil || abaEngine == nil {
+	rbcEngine := n.RBC
+	abaEngine := n.ABA
+	if rbcEngine == nil || abaEngine == nil {
 		return
 	}
-	n.engineStarted[version] = true
+	n.engineStarted = true
 	go func() {
 		for {
 			select {
 			case delivery := <-rbcEngine.Deliveries:
 				if err := n.handleRBCDelivery(ctx, delivery); err != nil {
 					debugf("node=%s reject RBC delivery config=%d dealer=%s seq=%d err=%v", n.ID, delivery.ConfigVersion, delivery.Dealer, delivery.Seq, err)
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		for {
-			select {
-			case delivery := <-joinRBCEngine.Deliveries:
-				if err := n.handleRBCDelivery(ctx, delivery); err != nil {
-					debugf("node=%s reject joining RBC delivery config=%d dealer=%s err=%v", n.ID, delivery.ConfigVersion, delivery.Dealer, err)
 				}
 			case <-ctx.Done():
 				return
@@ -622,24 +552,13 @@ func (n *Node) Handle(ctx context.Context, msg p2p.Message) error {
 }
 
 func (n *Node) handleRBCMessage(ctx context.Context, msg p2p.Message) error {
-	version, ok := rbc.ConfigVersionFromInstance(msg.Instance)
-	if !ok {
+	purpose, ok := rbc.PurposeFromInstance(msg.Instance)
+	if !ok || purpose != "pvss" {
 		return nil
 	}
-	n.mu.Lock()
-	purpose, purposeOK := rbc.PurposeFromInstance(msg.Instance)
-	engine := n.RBCs[version]
-	if purposeOK && purpose == "join" {
-		engine = n.JoinRBCs[version]
-	}
-	n.mu.Unlock()
+	engine := n.RBC
 	if engine == nil {
 		return nil
-	}
-	if purposeOK && purpose == "join" && msg.Type == "VAL" {
-		if err := n.prepareExternalJoinRBC(msg, engine); err != nil {
-			return nil
-		}
 	}
 	start := time.Now()
 	err := engine.Handle(ctx, msg)
@@ -650,39 +569,7 @@ func (n *Node) handleRBCMessage(ctx context.Context, msg p2p.Message) error {
 }
 
 func (n *Node) handleABAMessage(ctx context.Context, msg p2p.Message) error {
-	version, ok := aba.ConfigVersionFromInstance(msg.Instance)
-	if !ok {
-		return nil
-	}
-	n.mu.Lock()
-	engine := n.ABAs[version]
-	if joiner, isJoin := aba.JoinerFromInstance(msg.Instance); isJoin {
-		if n.PendingJoin == nil {
-			limit := len(n.State.Members) * 8
-			_, known := n.deferredJoinABA[msg.Instance]
-			if (known || len(n.deferredJoinABA) < len(n.State.Members)) &&
-				len(n.deferredJoinABA[msg.Instance]) < limit {
-				n.deferredJoinABA[msg.Instance] = append(n.deferredJoinABA[msg.Instance], msg)
-			}
-			n.mu.Unlock()
-			return nil
-		}
-		req := n.PendingJoin.Proposal
-		expected := aba.JoinInstanceFor(req.ConfigVersion, string(req.Joiner))
-		if version != req.ConfigVersion || joiner != string(req.Joiner) || msg.Instance != expected {
-			n.mu.Unlock()
-			return nil
-		}
-		if n.PendingJoin.Phase == JoinReserved {
-			limit := len(n.State.Members) * 8
-			if len(n.deferredJoinABA[msg.Instance]) < limit {
-				n.deferredJoinABA[msg.Instance] = append(n.deferredJoinABA[msg.Instance], msg)
-			}
-			n.mu.Unlock()
-			return nil
-		}
-	}
-	n.mu.Unlock()
+	engine := n.ABA
 	if engine == nil {
 		return nil
 	}
@@ -744,7 +631,7 @@ func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
 	}
 	seq := n.State.Seqs[n.ID] + 1
 	version := n.State.ConfigVersion
-	if obj, ok := n.State.ComQ[n.ID][seq]; ok && obj.ConfigVersion == version {
+	if entry, ok := n.State.ComQ[n.ID][seq]; ok && entry.Object.ConfigVersion == version {
 		n.mu.Unlock()
 		return seq, nil
 	}
@@ -759,32 +646,29 @@ func (n *Node) EnsureCurrentObject(ctx context.Context) (uint64, error) {
 			return seq, err
 		}
 		n.mu.Unlock()
-		obj, err := n.produceSeq(ctx, seq, version)
+		_, err := n.produceSeq(ctx, seq, version)
 		if err != nil {
 			n.finishProducerSeq(seq)
 			n.rollbackProducerSeq(seq)
 			return seq, err
 		}
-		if err := n.storeObject(obj); err != nil {
-			n.finishProducerSeq(seq)
-			n.rollbackProducerSeq(seq)
-			return seq, err
-		}
-		n.finishProducerSeq(seq)
-		return seq, nil
+		// Queue insertion is performed only by the authenticated RBC delivery
+		// handler; do not bypass delivery by storing the dealer's local value.
+	} else {
+		n.mu.Unlock()
 	}
-	n.mu.Unlock()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		n.mu.Lock()
-		obj, ok := n.State.ComQ[n.ID][seq]
+		entry, ok := n.State.ComQ[n.ID][seq]
 		currentVersion := n.State.ConfigVersion
 		n.mu.Unlock()
 		if currentVersion != version {
 			return seq, fmt.Errorf("configuration changed while producing current object: start=%d current=%d", version, currentVersion)
 		}
-		if ok && obj.ConfigVersion == currentVersion {
+		if ok && entry.Object.ConfigVersion == currentVersion {
+			n.finishProducerSeq(seq)
 			return seq, nil
 		}
 		select {
@@ -928,79 +812,59 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 	active := contains(n.Schedule.Members, n.ID) && n.RBC != nil && n.ABA != nil
 	n.mu.Unlock()
 	if !active {
-		return Beacon{}, errors.New("learner or removed node cannot drive an epoch before activation")
+		return Beacon{}, errors.New("node is not an active member of the fixed party set")
 	}
 	for {
 		if b, ok := n.certifiedBeaconForEpoch(epoch); ok {
 			return b, nil
 		}
-		if err := n.maybeStartJoin(ctx); err != nil {
-			return Beacon{}, err
-		}
-		if err := n.maybeInstallJoin(ctx); err != nil {
-			return Beacon{}, err
-		}
-		source, seq, instance, skipCurrentABA, alreadyCertified, err := n.prepareEpoch(epoch)
+		source, seq, instance, skipTuple, alreadyCertified, err := n.prepareEpoch(epoch)
 		if err != nil {
+			if errors.Is(err, errPriorDecisionPending) {
+				select {
+				case <-time.After(10 * time.Millisecond):
+					continue
+				case <-ctx.Done():
+					return Beacon{}, ctx.Err()
+				}
+			}
 			return Beacon{}, err
 		}
 		// Establishing the local instance may make an earlier transferable
 		// certificate verifiable. Replay that certified event now.
 		n.retryPendingABACertificates(ctx)
-		if skipCurrentABA {
-			if err := n.runCertifiedRemoval(ctx, source); err != nil {
-				return Beacon{}, err
-			}
-			// REMOVE preserves the epoch and randomness. Re-evaluate the source
-			// against the newly certified configuration for this same epoch.
-			continue
-		}
 		wait := n.registerBeaconWaiter(epoch, source, seq)
 		if alreadyCertified {
 			b, err := n.waitForEpochBeacon(ctx, epoch, source, seq, instance, wait)
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return b, err
 		}
-		obj, certified, err := n.waitObjectOrBeacon(ctx, epoch, source, seq, instance, wait)
-		if err != nil {
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if errors.Is(err, errRestartEpoch) {
-				continue
-			}
-			return Beacon{}, err
-		}
-		if certified != nil {
-			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			return *certified, nil
-		}
-
-		if !skipCurrentABA {
-			if certified, err := n.proposeEpochABAInputFromLookahead(ctx, epoch, source, seq, instance, wait); err != nil {
+		var obj Object
+		if !skipTuple {
+			var certified *Beacon
+			obj, certified, err = n.waitObjectOrBeacon(ctx, epoch, source, seq, instance, wait)
+			if err != nil {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
-				if errors.Is(err, errRestartEpoch) {
-					continue
-				}
 				return Beacon{}, err
-			} else if certified != nil {
+			}
+			if certified != nil {
 				n.unregisterBeaconWaiter(epoch, source, seq, wait)
 				return *certified, nil
 			}
-			if err := n.waitCurrentABAReady(ctx, instance); err != nil {
-				n.unregisterBeaconWaiter(epoch, source, seq, wait)
-				if errors.Is(err, errRestartEpoch) {
-					continue
-				}
-				return Beacon{}, err
-			}
 		}
-		if err := n.waitCoinBarrier(ctx, epoch); err != nil {
+
+		if certified, err := n.proposeEpochABAInputFromLookahead(ctx, epoch, source, seq, instance, wait); err != nil {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
-			if errors.Is(err, errRestartEpoch) {
-				continue
-			}
+			return Beacon{}, err
+		} else if certified != nil {
+			n.unregisterBeaconWaiter(epoch, source, seq, wait)
+			return *certified, nil
+		}
+		if err := n.waitCurrentABAReady(ctx, instance); err != nil {
+			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			return Beacon{}, err
 		}
-		if n.epochAttemptMustRestart(instance, source, seq) {
+		if skipTuple {
 			n.unregisterBeaconWaiter(epoch, source, seq, wait)
 			continue
 		}
@@ -1016,7 +880,7 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 		}
 		key := epochKey(epoch, source, seq)
 		n.mu.Lock()
-		origin := n.PVSSContexts[obj.ConfigVersion]
+		origin := n.PVSSContext
 		canShare := origin != nil && origin.Scheme != nil &&
 			origin.Configuration.Contains(n.ID)
 		needRecon := canShare && !n.reconDone[key] && !n.reconSent[key]
@@ -1040,15 +904,14 @@ func (n *Node) RunEpochAt(ctx context.Context, epoch uint64) (Beacon, error) {
 				return Beacon{}, err
 			}
 			recon := ReconMessage{
-				ConfigVersion:       abaVersion(instance),
 				ObjectConfigVersion: obj.ConfigVersion,
-				Epoch:               epoch,
-				Source:              source,
-				Seq:                 seq,
-				ObjectID:            obj.Commitment.SecretID,
 				Share:               sh,
 			}
-			msg, err := p2p.NewMessage(Protocol, "RECON", instance, n.ID, "", recon)
+			n.mu.Lock()
+			attempt := n.epochAttempts[consumerEpochKey(abaVersion(instance), epoch)]
+			n.mu.Unlock()
+			reconInstance := reconInstance(abaVersion(instance), epoch, attempt.ParentHash, source, seq)
+			msg, err := p2p.NewMessage(Protocol, "RECON", reconInstance, n.ID, "", recon)
 			if err != nil {
 				n.mu.Lock()
 				delete(n.reconSent, key)
@@ -1105,10 +968,7 @@ func (n *Node) waitForEpochBeacon(ctx context.Context, epoch uint64, source p2p.
 }
 
 func (n *Node) epochAttemptMustRestart(instance string, source p2p.NodeID, seq uint64) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	mark, marked := n.State.RmMark[source]
-	return marked && mark.Seq == seq
+	return false
 }
 
 func (n *Node) registerBeaconWaiter(epoch uint64, source p2p.NodeID, seq uint64) chan Beacon {
@@ -1148,7 +1008,7 @@ func (n *Node) prepareEpoch(epoch uint64) (p2p.NodeID, uint64, string, bool, boo
 		for _, b := range n.certBeacons {
 			if b.Epoch == epoch {
 				n.mu.Unlock()
-				return b.Source, b.Seq, aba.EpochInstanceFor(b.ConfigVersion, epoch), false, true, nil
+				return b.Source, b.Seq, aba.TupleInstanceFor(b.ConfigVersion, epoch, b.Source, b.Seq), false, true, nil
 			}
 		}
 		n.mu.Unlock()
@@ -1161,36 +1021,66 @@ func (n *Node) prepareEpoch(epoch uint64) (p2p.NodeID, uint64, string, bool, boo
 	if len(n.State.SCL) == 0 {
 		n.refillSCLLocked()
 	}
-	if len(n.State.SCL) == 0 {
+	attemptKey := consumerEpochKey(n.State.ConfigVersion, epoch)
+	attempt := n.epochAttempts[attemptKey]
+	excluded := make(map[p2p.NodeID]bool)
+	for _, item := range attempt.Skipped {
+		excluded[item.Source] = true
+	}
+	minEpoch := uint64(1)
+	if epoch > uint64(2*n.State.F) {
+		minEpoch = epoch - uint64(2*n.State.F)
+	}
+	for _, link := range n.BeaconHistory {
+		if link.QC.Epoch < minEpoch || link.QC.Epoch >= epoch {
+			continue
+		}
+		for _, item := range link.Skipped {
+			excluded[item.Source] = true
+		}
+	}
+	candidates := make([]p2p.NodeID, 0, len(n.State.SCL))
+	for _, candidate := range n.State.SCL {
+		if !excluded[candidate] {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
 		n.mu.Unlock()
 		return "", 0, "", false, false, errors.New("empty source candidate list")
 	}
-	idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
-	source := n.State.SCL[idx]
+	idx := selectionIndex(epoch, n.State.RPrev, len(attempt.Skipped), len(candidates))
+	source := candidates[idx]
 	seq := n.State.Seqs[source] + 1
-	instance := aba.EpochInstanceFor(n.State.ConfigVersion, epoch)
-	mark, marked := n.State.RmMark[source]
-	skipCurrentABA := marked && seq == mark.Seq
-	if !skipCurrentABA {
-		if _, exists := n.epochAttempts[instance]; !exists {
-			n.epochAttempts[instance] = epochAttempt{
-				ConfigVersion: n.State.ConfigVersion,
-				Epoch:         epoch,
-				ParentHash:    n.Schedule.BeaconHead,
-				Source:        source,
-				Seq:           seq,
-				PrevRandom:    append([]byte(nil), n.State.RPrev...),
-			}
+	instance := aba.TupleInstanceFor(n.State.ConfigVersion, epoch, source, seq)
+	skipTuple := false
+	if seq > 1 {
+		priorInstance := n.Schedule.ControlInstances[source]
+		decision, decided := n.State.ABADecisions[priorInstance]
+		if priorInstance == "" || !decided {
+			n.mu.Unlock()
+			return "", 0, "", false, false, errPriorDecisionPending
+		}
+		if !decision.Value {
+			skipTuple = true
+			attempt.Skipped = append(attempt.Skipped, SkippedTuple{
+				Source: source, Seq: seq, Certificate: decision.Certificate,
+			})
 		}
 	}
-	if !skipCurrentABA && n.State.PendingABAs[epoch] == nil {
-		n.State.PendingABAs[epoch] = &PendingABA{
-			ConfigVersion: n.State.ConfigVersion,
-			Epoch:         epoch, Source: source, Seq: seq,
-		}
+	attempt.ConfigVersion = n.State.ConfigVersion
+	attempt.Epoch = epoch
+	attempt.ParentHash = n.Schedule.BeaconHead
+	attempt.Source = source
+	attempt.Seq = seq
+	attempt.PrevRandom = append([]byte(nil), n.State.RPrev...)
+	n.epochAttempts[attemptKey] = attempt
+	if !skipTuple {
+		// The final candidate fixes the exact skipped prefix signed in P_e.
+		n.epochAttempts[attemptKey] = attempt
 	}
 	n.mu.Unlock()
-	return source, seq, instance, skipCurrentABA, false, nil
+	return source, seq, instance, skipTuple, false, nil
 }
 
 func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.NodeID, seq uint64, instance string, wait <-chan Beacon) (Object, *Beacon, error) {
@@ -1209,11 +1099,11 @@ func (n *Node) waitObjectOrBeacon(ctx context.Context, epoch uint64, source p2p.
 			loggedWait = true
 		}
 		n.mu.Lock()
-		obj, ok := n.State.ComQ[source][seq]
+		entry, ok := n.State.ComQ[source][seq]
 		n.mu.Unlock()
 		if ok {
 			debugf("node=%s step0-current-object-ready epoch=%d source=%s seq=%d instance=%s", n.ID, epoch, source, seq, instance)
-			return obj, nil, nil
+			return entry.Object, nil, nil
 		}
 		select {
 		case b := <-wait:
@@ -1319,34 +1209,22 @@ func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
 	rebroadcast := time.NewTicker(100 * time.Millisecond)
 	defer rebroadcast.Stop()
 	for {
-		n.mu.Lock()
-		epoch, _ := aba.EpochFromInstance(instance)
-		pending := n.State.PendingABAs[epoch]
-		removalDue := false
-		if pending != nil {
-			mark, marked := n.State.RmMark[pending.Source]
-			removalDue = marked && mark.Seq == pending.Seq
-		}
-		n.mu.Unlock()
-		if removalDue {
-			return errRestartEpoch
-		}
 		engine := n.abaEngineFor(instance)
 		if engine == nil {
 			return errors.New("missing epoch ABA engine")
 		}
 		st := engine.Status(instance)
-		if st.Decided || st.CoinWait {
+		if st.Decided {
 			return nil
 		}
 		n.mu.Lock()
-		epoch, _ = aba.EpochFromInstance(instance)
-		_, pendingExists := n.State.PendingABAs[epoch]
 		input, hasInput := n.abaInputs[instance]
-		n.mu.Unlock()
-		if !pendingExists {
+		if st.CoinWait {
+			n.State.PendingABAs[instance] = struct{}{}
+			n.mu.Unlock()
 			return nil
 		}
+		n.mu.Unlock()
 		select {
 		case <-ticker.C:
 		case <-rebroadcast.C:
@@ -1359,35 +1237,11 @@ func (n *Node) waitCurrentABAReady(ctx context.Context, instance string) error {
 	}
 }
 
-func (n *Node) waitCoinBarrier(ctx context.Context, currentEpoch uint64) error {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		blocked, feeds := n.refreshPendingABAs(currentEpoch)
-		for _, feed := range feeds {
-			if engine := n.abaEngineFor(feed.instance); engine != nil {
-				engine.FeedSeed(ctx, feed.instance, feed.round, feed.seed)
-			}
-		}
-		if !blocked {
-			return nil
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
 func (n *Node) abaEngineFor(instance string) *aba.Agreement {
-	version, ok := aba.ConfigVersionFromInstance(instance)
-	if !ok {
+	if _, ok := aba.ConfigVersionFromInstance(instance); !ok {
 		return nil
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.ABAs[version]
+	return n.ABA
 }
 
 type seedFeed struct {
@@ -1396,87 +1250,11 @@ type seedFeed struct {
 	seed     []byte
 }
 
-func (n *Node) refreshPendingABAs(currentEpoch uint64) (bool, []seedFeed) {
-	n.mu.Lock()
-	epochs := make([]uint64, 0, len(n.State.PendingABAs))
-	for epoch := range n.State.PendingABAs {
-		epochs = append(epochs, epoch)
-	}
-	n.mu.Unlock()
-
-	statuses := make(map[uint64]aba.Status, len(epochs))
-	for _, epoch := range epochs {
-		n.mu.Lock()
-		p := n.State.PendingABAs[epoch]
-		n.mu.Unlock()
-		if p != nil {
-			instance := aba.EpochInstanceFor(p.ConfigVersion, epoch)
-			if engine := n.abaEngineFor(instance); engine != nil {
-				statuses[epoch] = engine.Status(instance)
-			}
-		}
-	}
-
-	n.mu.Lock()
-	var feeds []seedFeed
-	var pruned []string
-	blocked := false
-	stateChanged := false
-	for _, epoch := range epochs {
-		p := n.State.PendingABAs[epoch]
-		if p == nil {
-			continue
-		}
-		instance := aba.EpochInstanceFor(p.ConfigVersion, epoch)
-		st := statuses[epoch]
-		if st.Decided {
-			if !st.Value {
-				n.markRemovalLocked(p, st.Certificate)
-			}
-			delete(n.State.PendingABAs, epoch)
-			delete(n.abaInputSent, instance)
-			delete(n.abaInputs, instance)
-			pruned = append(pruned, instance)
-			stateChanged = true
-			continue
-		}
-		p.Round = st.Round
-		p.CoinWait = st.CoinWait
-		if st.CoinWait {
-			target := p.Epoch + st.Round + 1
-			if seed := n.beaconSeeds[target]; len(seed) > 0 {
-				p.CoinWait = false
-				feeds = append(feeds, seedFeed{instance: instance, round: st.Round, seed: append([]byte(nil), seed...)})
-			} else {
-				n.noteJoinControlLocked()
-			}
-		}
-		if epoch != currentEpoch && !p.CoinWait {
-			blocked = true
-		}
-	}
-	if stateChanged {
-		_ = n.persistLocked()
-	}
-	n.mu.Unlock()
-	for _, inst := range pruned {
-		n.mu.Lock()
-		engine := n.ABAs[abaVersion(inst)]
-		n.mu.Unlock()
-		if engine != nil {
-			engine.Prune(inst)
-		}
-	}
-	return blocked, feeds
-}
-
 func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
-	n.mu.Lock()
-	engine := n.RBCs[d.ConfigVersion]
-	if d.Purpose == "join" {
-		engine = n.JoinRBCs[d.ConfigVersion]
+	engine := n.RBC
+	if d.Purpose != "pvss" {
+		return nil
 	}
-	n.mu.Unlock()
 	if engine == nil {
 		return nil
 	}
@@ -1496,27 +1274,19 @@ func (n *Node) handleRBCDelivery(ctx context.Context, d rbc.Delivery) error {
 		if obj.ConfigVersion != d.ConfigVersion || obj.Producer != d.Dealer {
 			return nil
 		}
-		n.mu.Lock()
-		n.RBCCertificates[rbcCertificateKey(obj.ConfigVersion, obj.Commitment.SecretID)] = d.Certificate
-		n.mu.Unlock()
 		n.Crypto.Go(ctx, func() {
-			if err := n.storeObject(obj); err != nil {
+			if err := n.storeObject(obj, d.Certificate); err != nil {
 				return
 			}
 			n.replayPendingRecon(ctx, obj)
 		})
 		return nil
-	case "join":
-		if env.Join == nil {
-			return nil
-		}
-		return n.handleJoinDelivery(ctx, d, *env.Join)
 	default:
 		return nil
 	}
 }
 
-func (n *Node) storeObject(obj Object) error {
+func (n *Node) storeObject(obj Object, certificate rbc.DeliveryCertificate) error {
 	if obj.Producer == "" || obj.Seq == 0 || obj.Commitment.Dealer != obj.Producer || obj.Commitment.Seq != obj.Seq {
 		debugf("node=%s drop object producer=%s seq=%d reason=invalid", n.ID, obj.Producer, obj.Seq)
 		return errors.New("invalid pvss object")
@@ -1525,7 +1295,7 @@ func (n *Node) storeObject(obj Object) error {
 		defer n.finishProducerSeq(obj.Seq)
 	}
 	n.mu.Lock()
-	origin := n.PVSSContexts[obj.ConfigVersion]
+	origin := n.PVSSContext
 	if origin == nil || !origin.Configuration.Contains(obj.Producer) ||
 		!contains(n.State.Members, obj.Producer) {
 		n.mu.Unlock()
@@ -1536,10 +1306,9 @@ func (n *Node) storeObject(obj Object) error {
 		return nil
 	}
 	nextSeq := n.State.Seqs[obj.Producer] + 1
-	maxSeq := n.State.Seqs[obj.Producer] + uint64(n.State.QueueLen)
-	if obj.Seq < nextSeq || obj.Seq > maxSeq {
+	if obj.Seq < nextSeq {
 		n.mu.Unlock()
-		debugf("node=%s drop object producer=%s seq=%d reason=window next=%d max=%d", n.ID, obj.Producer, obj.Seq, nextSeq, maxSeq)
+		debugf("node=%s drop object producer=%s seq=%d reason=stale next=%d", n.ID, obj.Producer, obj.Seq, nextSeq)
 		return nil
 	}
 	if _, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists {
@@ -1553,7 +1322,7 @@ func (n *Node) storeObject(obj Object) error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.PVSSContexts[obj.ConfigVersion] == nil ||
+	if n.PVSSContext == nil ||
 		!contains(n.State.Members, obj.Producer) {
 		return nil
 	}
@@ -1561,22 +1330,21 @@ func (n *Node) storeObject(obj Object) error {
 		return nil
 	}
 	nextSeq = n.State.Seqs[obj.Producer] + 1
-	maxSeq = n.State.Seqs[obj.Producer] + uint64(n.State.QueueLen)
-	if obj.Seq < nextSeq || obj.Seq > maxSeq {
-		debugf("node=%s drop object producer=%s seq=%d reason=window next=%d max=%d", n.ID, obj.Producer, obj.Seq, nextSeq, maxSeq)
+	if obj.Seq < nextSeq {
+		debugf("node=%s drop object producer=%s seq=%d reason=stale next=%d", n.ID, obj.Producer, obj.Seq, nextSeq)
 		return nil
 	}
 	if _, exists := n.State.ComQ[obj.Producer][obj.Seq]; exists {
 		return nil
 	}
-	n.State.ComQ[obj.Producer][obj.Seq] = obj
+	n.State.ComQ[obj.Producer][obj.Seq] = CertifiedObject{Object: obj, Certificate: certificate}
 	debugf("node=%s store object producer=%s seq=%d", n.ID, obj.Producer, obj.Seq)
 	return nil
 }
 
 func (n *Node) ensureVerified(obj Object) error {
 	n.mu.Lock()
-	pvssContext := n.PVSSContexts[obj.ConfigVersion]
+	pvssContext := n.PVSSContext
 	n.mu.Unlock()
 	if pvssContext == nil || pvssContext.Scheme == nil {
 		return fmt.Errorf("missing PVSS context for configuration %d", obj.ConfigVersion)
@@ -1631,7 +1399,8 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 			return err
 		}
 		from := msg.From
-		n.Crypto.GoPriority(ctx, func() { _ = n.handleRecon(ctx, from, body) })
+		instance := msg.Instance
+		n.Crypto.GoPriority(ctx, func() { _ = n.handleRecon(ctx, from, instance, body) })
 	case "BEACON":
 		body, err := p2p.DecodePayload[signedBeaconMessage](msg)
 		if err != nil {
@@ -1641,50 +1410,45 @@ func (n *Node) handleTyche(ctx context.Context, msg p2p.Message) error {
 		n.Crypto.GoPriority(ctx, func() {
 			n.observeBeaconVote(ctx, from, body)
 		})
-	case "BEACON_CERT":
-		body, err := p2p.DecodePayload[certifiedBeaconRecord](msg)
-		if err != nil {
-			return err
-		}
-		return n.handleCertifiedBeacon(ctx, body.QC)
-	case "JOIN_CERT":
-		body, err := p2p.DecodePayload[JoinDecisionCertificate](msg)
-		if err != nil {
-			return err
-		}
-		return n.handleJoinCertificate(ctx, body)
 	case "ABA_CERT":
 		body, err := p2p.DecodePayload[certifiedABADecision](msg)
 		if err != nil {
 			return err
 		}
-		return n.handleCertifiedABADecision(ctx, body.Decision)
+		cert := body.Certificate
+		return n.handleCertifiedABADecision(ctx, aba.Decision{
+			ConfigVersion: cert.ConfigVersion, Instance: cert.Instance,
+			Value: cert.Value, FastPath: cert.FastPath, Certificate: cert,
+		})
 	}
 	return nil
 }
 
-func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessage) error {
+func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, instance string, body ReconMessage) error {
+	scope, ok := parseReconInstance(instance)
+	if !ok {
+		return nil
+	}
 	n.mu.Lock()
-	if !n.validReconMetadataLocked(from, body) {
+	if !n.validReconMetadataLocked(from, scope, body) {
 		n.mu.Unlock()
 		return nil
 	}
-	obj, available := n.State.ComQ[body.Source][body.Seq]
+	entry, available := n.State.ComQ[scope.Source][scope.Seq]
 	if !available {
-		n.bufferPendingReconLocked(from, body)
+		n.bufferPendingReconLocked(from, instance, scope, body)
 		n.mu.Unlock()
 		return nil
 	}
-	if obj.ConfigVersion != body.ObjectConfigVersion || obj.Commitment.SecretID != body.ObjectID {
+	obj := entry.Object
+	if obj.ConfigVersion != body.ObjectConfigVersion || obj.Commitment.SecretID != body.Share.CommitmentID {
 		n.mu.Unlock()
 		return nil
 	}
 	n.mu.Unlock()
-	n.broadcastOriginReconOnce(ctx, body, obj)
-
-	key := epochKey(body.Epoch, body.Source, body.Seq)
+	key := epochKey(scope.Epoch, scope.Source, scope.Seq)
 	n.mu.Lock()
-	pvssContext := n.PVSSContexts[obj.ConfigVersion]
+	pvssContext := n.PVSSContext
 	if pvssContext == nil || pvssContext.Scheme == nil {
 		n.mu.Unlock()
 		return nil
@@ -1704,7 +1468,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	n.mu.Unlock()
 	validShare := n.verifyShareOnce(obj, body.Share, scheme)
 	if !validShare {
-		debugf("node=%s drop recon from=%s epoch=%d source=%s seq=%d holder=%s valid=%v", n.ID, from, body.Epoch, body.Source, body.Seq, body.Share.Holder, validShare)
+		debugf("node=%s drop recon from=%s epoch=%d source=%s seq=%d holder=%s valid=%v", n.ID, from, scope.Epoch, scope.Source, scope.Seq, body.Share.Holder, validShare)
 		return nil
 	}
 	n.mu.Lock()
@@ -1725,7 +1489,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	for _, sh := range n.recon[key] {
 		shares = append(shares, sh)
 	}
-	attempt, attemptOK := n.epochAttempts[aba.EpochInstanceFor(body.ConfigVersion, body.Epoch)]
+	attempt, attemptOK := n.epochAttempts[consumerEpochKey(scope.ConfigVersion, scope.Epoch)]
 	if !attemptOK {
 		delete(n.reconClosing, key)
 		n.mu.Unlock()
@@ -1758,7 +1522,7 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 	random := crypto.DomainHash(
 		"Tyche/Beacon/v1",
 		[]byte(fmt.Sprintf("%d", configVersion)),
-		[]byte(fmt.Sprintf("%d", body.Epoch)),
+		[]byte(fmt.Sprintf("%d", scope.Epoch)),
 		prev,
 		secret,
 	)
@@ -1767,9 +1531,8 @@ func (n *Node) handleRecon(ctx context.Context, from p2p.NodeID, body ReconMessa
 		return nil
 	}
 	n.reconDone[key] = true
-	n.reconSecret[key] = append([]byte(nil), secret...)
 	n.mu.Unlock()
-	return n.broadcastBeaconVote(ctx, configVersion, body.Epoch, body.Source, body.Seq, random)
+	return n.broadcastBeaconVote(ctx, configVersion, scope.Epoch, scope.Source, scope.Seq, random)
 }
 
 // verifyShareOnce applies the same one-verification rule to a holder's
@@ -1805,73 +1568,29 @@ func (n *Node) verifyShareOnce(obj Object, share crypto.DecryptedShare, scheme c
 	return valid
 }
 
-// broadcastOriginReconOnce lets an honest historical shareholder contribute
-// without introducing a RECON_REQUEST message. Active shareholders have
-// already set reconSent on the consumer path, so this emits at most one share.
-func (n *Node) broadcastOriginReconOnce(ctx context.Context, body ReconMessage, obj Object) {
-	key := epochKey(body.Epoch, body.Source, body.Seq)
-	n.mu.Lock()
-	origin := n.PVSSContexts[obj.ConfigVersion]
-	if origin == nil || origin.Scheme == nil ||
-		!origin.Configuration.Contains(n.ID) ||
-		contains(n.State.Members, n.ID) || n.reconSent[key] {
-		n.mu.Unlock()
-		return
-	}
-	n.reconSent[key] = true
-	scheme := origin.Scheme
-	n.mu.Unlock()
-	share, err := scheme.PreReconVerified(obj.Commitment, n.ID)
-	if err != nil {
-		n.mu.Lock()
-		delete(n.reconSent, key)
-		n.mu.Unlock()
-		return
-	}
-	message := ReconMessage{
-		ConfigVersion:       body.ConfigVersion,
-		ObjectConfigVersion: obj.ConfigVersion,
-		Epoch:               body.Epoch,
-		Source:              body.Source,
-		Seq:                 body.Seq,
-		ObjectID:            obj.Commitment.SecretID,
-		Share:               share,
-	}
-	instance := aba.EpochInstanceFor(body.ConfigVersion, body.Epoch)
-	wire, err := p2p.NewMessage(Protocol, "RECON", instance, n.ID, "", message)
-	if err == nil {
-		n.safeBroadcast(ctx, wire)
-	}
-}
-
 func pendingReconKey(version, epoch uint64, source p2p.NodeID, seq uint64) string {
 	return fmt.Sprintf("%d/%d/%s/%d", version, epoch, source, seq)
 }
 
-func (n *Node) validReconMetadataLocked(from p2p.NodeID, body ReconMessage) bool {
-	instance := aba.EpochInstanceFor(body.ConfigVersion, body.Epoch)
-	attempt, opened := n.epochAttempts[instance]
-	mark, removalDue := n.State.RmMark[body.Source]
-	if !opened || body.ObjectConfigVersion > body.ConfigVersion ||
-		body.Epoch != n.State.Epoch+1 ||
-		attempt.ParentHash != n.Schedule.BeaconHead ||
-		body.Source != attempt.Source || body.Seq != attempt.Seq ||
-		body.Seq != n.State.Seqs[body.Source]+1 ||
-		(removalDue && mark.Seq == body.Seq) ||
-		body.ObjectID == "" ||
-		body.Share.CommitmentID != body.ObjectID ||
+func (n *Node) validReconMetadataLocked(from p2p.NodeID, scope reconScope, body ReconMessage) bool {
+	attempt, opened := n.epochAttempts[consumerEpochKey(scope.ConfigVersion, scope.Epoch)]
+	if !opened || body.ObjectConfigVersion > scope.ConfigVersion ||
+		scope.Epoch != n.State.Epoch+1 ||
+		scope.ParentHash != n.Schedule.BeaconHead || attempt.ParentHash != scope.ParentHash ||
+		scope.Source != attempt.Source || scope.Seq != attempt.Seq ||
+		scope.Seq != n.State.Seqs[scope.Source]+1 ||
+		body.Share.CommitmentID == "" ||
 		body.Share.Holder != from {
 		return false
 	}
-	signing, signingOK := n.Configurations[body.ConfigVersion]
-	origin, originOK := n.Configurations[body.ObjectConfigVersion]
-	return signingOK && signing.Contains(from) && signing.Contains(body.Source) &&
-		originOK && origin.Contains(from) && origin.Contains(body.Source) &&
-		contains(n.State.Members, body.Source)
+	config := n.Configuration
+	return scope.ConfigVersion == config.Version && body.ObjectConfigVersion == config.Version &&
+		config.Contains(from) && config.Contains(scope.Source) &&
+		contains(n.State.Members, scope.Source)
 }
 
-func (n *Node) bufferPendingReconLocked(from p2p.NodeID, body ReconMessage) {
-	key := pendingReconKey(body.ObjectConfigVersion, body.Epoch, body.Source, body.Seq)
+func (n *Node) bufferPendingReconLocked(from p2p.NodeID, instance string, scope reconScope, body ReconMessage) {
+	key := pendingReconKey(body.ObjectConfigVersion, scope.Epoch, scope.Source, scope.Seq)
 	bucket := n.pendingRecon[key]
 	if bucket != nil {
 		if _, duplicate := bucket.Messages[from]; duplicate {
@@ -1886,27 +1605,28 @@ func (n *Node) bufferPendingReconLocked(from p2p.NodeID, body ReconMessage) {
 			return
 		}
 		bucket = &pendingReconBucket{
-			ConfigVersion:       body.ConfigVersion,
+			ConfigVersion:       scope.ConfigVersion,
 			ObjectConfigVersion: body.ObjectConfigVersion,
-			Epoch:               body.Epoch,
-			Source:              body.Source,
-			Seq:                 body.Seq,
-			Messages:            make(map[p2p.NodeID]ReconMessage),
+			Epoch:               scope.Epoch,
+			Source:              scope.Source,
+			Seq:                 scope.Seq,
+			Messages:            make(map[p2p.NodeID]pendingReconMessage),
 		}
 		n.pendingRecon[key] = bucket
 	}
 	if len(bucket.Messages) >= len(n.State.Members) {
 		return
 	}
-	bucket.Messages[from] = body
+	bucket.Messages[from] = pendingReconMessage{Instance: instance, Body: body}
 	n.pendingReconCount++
 }
 
 func (n *Node) replayPendingRecon(ctx context.Context, obj Object) {
 	n.mu.Lock()
 	var pending []struct {
-		from p2p.NodeID
-		body ReconMessage
+		from     p2p.NodeID
+		instance string
+		body     ReconMessage
 	}
 	for key, bucket := range n.pendingRecon {
 		if bucket.ObjectConfigVersion != obj.ConfigVersion ||
@@ -1914,12 +1634,13 @@ func (n *Node) replayPendingRecon(ctx context.Context, obj Object) {
 			bucket.Seq != obj.Seq {
 			continue
 		}
-		for from, body := range bucket.Messages {
-			if body.ObjectID == obj.Commitment.SecretID {
+		for from, message := range bucket.Messages {
+			if message.Body.Share.CommitmentID == obj.Commitment.SecretID {
 				pending = append(pending, struct {
-					from p2p.NodeID
-					body ReconMessage
-				}{from: from, body: body})
+					from     p2p.NodeID
+					instance string
+					body     ReconMessage
+				}{from: from, instance: message.Instance, body: message.Body})
 			}
 		}
 		n.pendingReconCount -= len(bucket.Messages)
@@ -1927,9 +1648,9 @@ func (n *Node) replayPendingRecon(ctx context.Context, obj Object) {
 	}
 	n.mu.Unlock()
 	for _, item := range pending {
-		if err := n.handleRecon(ctx, item.from, item.body); err != nil {
+		if err := n.handleRecon(ctx, item.from, item.instance, item.body); err != nil {
 			debugf("node=%s reject replayed recon from=%s config=%d source=%s seq=%d err=%v",
-				n.ID, item.from, item.body.ConfigVersion, item.body.Source, item.body.Seq, err)
+				n.ID, item.from, obj.ConfigVersion, obj.Producer, obj.Seq, err)
 		}
 	}
 }
@@ -1943,13 +1664,12 @@ func debugf(format string, args ...any) {
 func (n *Node) broadcastBeaconVote(ctx context.Context, configVersion, epoch uint64, source p2p.NodeID, seq uint64, random []byte) error {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	mark, removalDue := n.State.RmMark[source]
-	attempt, opened := n.epochAttempts[aba.EpochInstanceFor(configVersion, epoch)]
+	attempt, opened := n.epochAttempts[consumerEpochKey(configVersion, epoch)]
 	if n.beaconVoteSent[key] {
 		n.mu.Unlock()
 		return nil
 	}
-	if n.State.Epoch+1 != epoch || (removalDue && mark.Seq == seq) {
+	if n.State.Epoch+1 != epoch {
 		n.mu.Unlock()
 		return errRestartEpoch
 	}
@@ -1958,20 +1678,21 @@ func (n *Node) broadcastBeaconVote(ctx context.Context, configVersion, epoch uin
 		n.mu.Unlock()
 		return errRestartEpoch
 	}
-	config, ok := n.Configurations[configVersion]
+	config := n.Configuration
 	parentHash := attempt.ParentHash
+	skippedHash := HashSkippedTuples(attempt.Skipped)
 	n.mu.Unlock()
-	if !ok {
+	if config.Version != configVersion {
 		return errors.New("missing configuration for BEACON vote")
 	}
-	transcript := BeaconVoteTranscript(config.Version, epoch, parentHash, source, seq, random)
+	transcript := BeaconVoteTranscript(config.Version, epoch, parentHash, skippedHash, source, seq, random)
 	voteHash := fmt.Sprintf("%x", crypto.DomainHash("Tyche/BeaconVoteReservation/v1", transcript))
-	voteSlot := fmt.Sprintf("epoch/%d", epoch)
+	voteSlot := fmt.Sprintf("beacon/v2/epoch/%d", epoch)
 	if err := n.Store.ReserveBeaconVote(voteSlot, voteHash); err != nil {
 		return err
 	}
 	start := time.Now()
-	signature, err := SignBeaconVote(n.ID, n.IdentityPrivate, config, epoch, parentHash, source, seq, random)
+	signature, err := SignBeaconVote(n.ID, n.IdentityPrivate, config, epoch, parentHash, skippedHash, source, seq, random)
 	if n.Perf != nil {
 		n.Perf.addCertSign(time.Since(start))
 	}
@@ -1979,12 +1700,11 @@ func (n *Node) broadcastBeaconVote(ctx context.Context, configVersion, epoch uin
 		return err
 	}
 	n.mu.Lock()
-	mark, removalDue = n.State.RmMark[source]
 	if n.beaconVoteSent[key] {
 		n.mu.Unlock()
 		return nil
 	}
-	if n.Schedule.BeaconHead != parentHash || (removalDue && mark.Seq == seq) {
+	if n.Schedule.BeaconHead != parentHash {
 		n.mu.Unlock()
 		return errRestartEpoch
 	}
@@ -1992,7 +1712,8 @@ func (n *Node) broadcastBeaconVote(ctx context.Context, configVersion, epoch uin
 	n.mu.Unlock()
 	message := signedBeaconMessage{
 		ConfigVersion: config.Version, Epoch: epoch, ParentHash: parentHash,
-		Source: source, Seq: seq, Random: append([]byte(nil), random...), Signature: signature,
+		SkippedHash: skippedHash, Source: source, Seq: seq,
+		Random: append([]byte(nil), random...), Signature: signature,
 	}
 	wire, err := p2p.NewMessage(Protocol, "BEACON", key, n.ID, "", message)
 	if err != nil {
@@ -2004,18 +1725,17 @@ func (n *Node) broadcastBeaconVote(ctx context.Context, configVersion, epoch uin
 func (n *Node) observeBeaconVote(ctx context.Context, from p2p.NodeID, body signedBeaconMessage) {
 	voteKey := beaconVoteKey(body)
 	n.mu.Lock()
-	mark, removalDue := n.State.RmMark[body.Source]
 	attempt, opened := n.beaconAttemptLocked(body)
 	if n.State.Epoch+1 != body.Epoch ||
 		body.ParentHash != n.Schedule.BeaconHead || body.Signature.Signer != string(from) ||
 		!opened || attempt.ParentHash != body.ParentHash ||
 		attempt.Source != body.Source || attempt.Seq != body.Seq ||
-		(removalDue && mark.Seq == body.Seq) || !contains(n.State.Members, body.Source) {
+		HashSkippedTuples(attempt.Skipped) != body.SkippedHash || !contains(n.State.Members, body.Source) {
 		n.mu.Unlock()
 		return
 	}
-	config, configured := n.Configurations[body.ConfigVersion]
-	if !configured || !config.Contains(from) || !config.Contains(body.Source) ||
+	config := n.Configuration
+	if config.Version != body.ConfigVersion || !config.Contains(from) || !config.Contains(body.Source) ||
 		body.Seq != n.State.Seqs[body.Source]+1 {
 		n.mu.Unlock()
 		return
@@ -2030,7 +1750,7 @@ func (n *Node) observeBeaconVote(ctx context.Context, from p2p.NodeID, body sign
 	start := time.Now()
 	err := crypto.VerifySignedVote(
 		body.Signature, config.PublicKeys(),
-		BeaconVoteTranscript(body.ConfigVersion, body.Epoch, body.ParentHash, body.Source, body.Seq, body.Random),
+		BeaconVoteTranscript(body.ConfigVersion, body.Epoch, body.ParentHash, body.SkippedHash, body.Source, body.Seq, body.Random),
 	)
 	if n.Perf != nil {
 		n.Perf.addCertVerify(time.Since(start))
@@ -2039,11 +1759,10 @@ func (n *Node) observeBeaconVote(ctx context.Context, from p2p.NodeID, body sign
 		return
 	}
 	n.mu.Lock()
-	mark, removalDue = n.State.RmMark[body.Source]
-	attempt, opened = n.epochAttempts[aba.EpochInstanceFor(body.ConfigVersion, body.Epoch)]
+	attempt, opened = n.epochAttempts[consumerEpochKey(body.ConfigVersion, body.Epoch)]
 	if n.State.Epoch+1 != body.Epoch || body.ParentHash != n.Schedule.BeaconHead ||
 		!opened || attempt.Source != body.Source || attempt.Seq != body.Seq ||
-		(removalDue && mark.Seq == body.Seq) {
+		HashSkippedTuples(attempt.Skipped) != body.SkippedHash {
 		n.mu.Unlock()
 		return
 	}
@@ -2056,169 +1775,43 @@ func (n *Node) observeBeaconVote(ctx context.Context, from p2p.NodeID, body sign
 		return
 	}
 	votes := make([]crypto.SignedVote, 0, len(n.beaconVotes[voteKey]))
-	senders := make([]p2p.NodeID, 0, len(n.beaconVotes[voteKey]))
 	for signer, vote := range n.beaconVotes[voteKey] {
-		senders = append(senders, signer)
+		_ = signer
 		votes = append(votes, vote)
 	}
-	sort.Slice(senders, func(i, j int) bool { return senders[i] < senders[j] })
 	n.certified[voteKey] = true
 	parent := CloneSchedulingState(n.Schedule)
 	n.mu.Unlock()
 	start = time.Now()
-	qc, err := BuildBeaconQC(config, body.Epoch, body.ParentHash, body.Source, body.Seq, body.Random, votes)
+	qc, err := BuildBeaconQC(config, body.Epoch, body.ParentHash, body.SkippedHash, body.Source, body.Seq, body.Random, votes)
 	if n.Perf != nil {
 		n.Perf.addCertAggregate(time.Since(start))
 	}
 	if err != nil {
 		return
 	}
-	n.relayBeaconCertificate(context.Background(), qc)
-	child, err := entropySuccessorForRecord(parent, body.ConfigVersion, config.F, body.Random, body.Source, body.Seq)
+	skipped := append([]SkippedTuple(nil), attempt.Skipped...)
+	child, err := entropySuccessorForRecord(parent, body.ConfigVersion, config.F, body.Random, body.Source, body.Seq, skipped)
 	if err != nil {
 		return
 	}
-	n.certifyBeacon(body.Epoch, body.Source, body.Seq, body.Random, child, qc, senders)
+	n.certifyBeacon(body.Epoch, body.Source, body.Seq, body.Random, child, qc, skipped)
 	_ = ctx
 }
 
-// relayBeaconCertificate disseminates the exact-parent certified record P_e.
-// This is required by the paper's asynchronous delivery model: a member may
-// install a membership decision before receiving the immediately following
-// beacon record and must not depend on having observed every individual vote.
-func (n *Node) relayBeaconCertificate(ctx context.Context, qc BeaconQC) {
-	key := BeaconHeaderHash(qc.ConfigVersion, qc.Epoch, qc.ParentHash, qc.Source, qc.Seq, qc.Random)
-	n.mu.Lock()
-	configuration, configured := n.Configurations[qc.ConfigVersion]
-	parent, hasParent := n.Configurations[qc.ConfigVersion-1]
-	if !configured || !hasParent || len(configuration.Members) != len(parent.Members)+1 {
-		n.mu.Unlock()
-		return
-	}
-	var target p2p.NodeID
-	for _, member := range configuration.Members {
-		if !parent.Contains(member) {
-			if target != "" {
-				n.mu.Unlock()
-				return
-			}
-			target = member
-		}
-	}
-	relay := false
-	for index, member := range configuration.Members {
-		if index >= configuration.F+1 {
-			break
-		}
-		if member == n.ID {
-			relay = true
-			break
-		}
-	}
-	if target == "" || !relay {
-		n.mu.Unlock()
-		return
-	}
-	if n.beaconCertRelayed[key] {
-		n.mu.Unlock()
-		return
-	}
-	n.beaconCertRelayed[key] = true
-	n.mu.Unlock()
-	msg, err := p2p.NewMessage(
-		Protocol, "BEACON_CERT", key, n.ID, target, certifiedBeaconRecord{QC: qc},
-	)
-	if err == nil {
-		_ = n.Transport.Send(ctx, target, msg)
-	}
-}
-
-func (n *Node) handleCertifiedBeacon(ctx context.Context, qc BeaconQC) error {
-	n.mu.Lock()
-	configuration, configured := n.Configurations[qc.ConfigVersion]
-	if !configured {
-		n.mu.Unlock()
-		return nil
-	}
-	if n.State.Epoch >= qc.Epoch {
-		n.mu.Unlock()
-		return nil
-	}
-	body := signedBeaconMessage{
-		ConfigVersion: qc.ConfigVersion,
-		Epoch:         qc.Epoch,
-		ParentHash:    qc.ParentHash,
-		Source:        qc.Source,
-		Seq:           qc.Seq,
-		Random:        append([]byte(nil), qc.Random...),
-	}
-	attempt, opened := n.beaconAttemptLocked(body)
-	mark, removalDue := n.State.RmMark[qc.Source]
-	validNext := n.State.Epoch+1 == qc.Epoch &&
-		n.Schedule.BeaconHead == qc.ParentHash && opened &&
-		attempt.Source == qc.Source && attempt.Seq == qc.Seq &&
-		(!removalDue || mark.Seq != qc.Seq)
-	parent := CloneSchedulingState(n.Schedule)
-	n.mu.Unlock()
-	if !validNext {
-		return nil
-	}
-	if err := VerifyBeaconQC(configuration, qc); err != nil {
-		return err
-	}
-	signerStrings, err := crypto.SignedQuorumCertificateSigners(qc.Signature, configuration.PublicKeys())
-	if err != nil {
-		return err
-	}
-	signers := make([]p2p.NodeID, len(signerStrings))
-	for i, signer := range signerStrings {
-		signers[i] = p2p.NodeID(signer)
-	}
-	child, err := entropySuccessorForRecord(parent, qc.ConfigVersion, configuration.F, qc.Random, qc.Source, qc.Seq)
-	if err != nil {
-		return err
-	}
-	n.relayBeaconCertificate(ctx, qc)
-	n.certifyBeacon(qc.Epoch, qc.Source, qc.Seq, qc.Random, child, qc, signers)
-	return nil
-}
-
-// beaconAttemptLocked returns the immutable Step-0 context for a vote. A
-// joiner or an old member that installed JOIN first may not have opened this
-// old-configuration epoch locally. For a one-member addition, filtering the
-// new member from the current scheduling lists exactly reconstructs the old
-// parent schedule because joining leaves RSQ and all old sequence counters
-// unchanged.
+// beaconAttemptLocked returns the immutable Step-0 context for a vote.
 func (n *Node) beaconAttemptLocked(body signedBeaconMessage) (epochAttempt, bool) {
-	instance := aba.EpochInstanceFor(body.ConfigVersion, body.Epoch)
+	instance := consumerEpochKey(body.ConfigVersion, body.Epoch)
 	if attempt, ok := n.epochAttempts[instance]; ok {
 		return attempt, true
 	}
 	if body.Epoch != n.State.Epoch+1 || body.ParentHash != n.Schedule.BeaconHead {
 		return epochAttempt{}, false
 	}
-	signing, ok := n.Configurations[body.ConfigVersion]
-	if !ok {
+	if body.ConfigVersion != n.Configuration.Version {
 		return epochAttempt{}, false
 	}
 	eligible := append([]p2p.NodeID(nil), n.State.SCL...)
-	if n.State.ConfigVersion != body.ConfigVersion {
-		if len(n.State.Members) != len(signing.Members)+1 {
-			return epochAttempt{}, false
-		}
-		for _, oldMember := range signing.Members {
-			if !contains(n.State.Members, oldMember) {
-				return epochAttempt{}, false
-			}
-		}
-		filtered := make([]p2p.NodeID, 0, len(signing.Members))
-		for _, candidate := range eligible {
-			if signing.Contains(candidate) {
-				filtered = append(filtered, candidate)
-			}
-		}
-		eligible = filtered
-	}
 	if len(eligible) == 0 {
 		return epochAttempt{}, false
 	}
@@ -2234,17 +1827,16 @@ func (n *Node) beaconAttemptLocked(body signedBeaconMessage) (epochAttempt, bool
 		Source:        body.Source,
 		Seq:           body.Seq,
 		PrevRandom:    append([]byte(nil), n.State.RPrev...),
+		Skipped:       nil,
 	}
 	n.epochAttempts[instance] = attempt
 	return attempt, true
 }
 
-func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, child SchedulingState, qc BeaconQC, senders []p2p.NodeID) {
+func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, child SchedulingState, qc BeaconQC, skipped []SkippedTuple) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	mark, removalDue := n.State.RmMark[source]
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch ||
-		(removalDue && mark.Seq == seq) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch {
 		n.mu.Unlock()
 		return
 	}
@@ -2254,28 +1846,24 @@ func (n *Node) certifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random
 	}
 	n.certifying[key] = true
 	n.mu.Unlock()
-	go n.finishCertifyBeacon(epoch, source, seq, random, child, qc, senders)
+	go n.finishCertifyBeacon(epoch, source, seq, random, child, qc, skipped)
 }
 
-func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, child SchedulingState, qc BeaconQC, senders []p2p.NodeID) {
+func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, random []byte, child SchedulingState, qc BeaconQC, skipped []SkippedTuple) {
 	key := epochKey(epoch, source, seq)
 	n.mu.Lock()
-	mark, removalDue := n.State.RmMark[source]
-	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch ||
-		(removalDue && mark.Seq == seq) {
+	if n.State.Epoch >= epoch || n.State.Epoch+1 != epoch {
 		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
 	}
-	obj := n.State.ComQ[source][seq]
 	parent := CloneSchedulingState(n.Schedule)
-	parentConfig, configured := n.Configurations[qc.ConfigVersion]
-	prev := append([]byte(nil), n.State.RPrev...)
-	secret := append([]byte(nil), n.reconSecret[key]...)
+	parentConfig := n.Configuration
 	n.mu.Unlock()
-	if !configured || VerifyBeaconQC(parentConfig, qc) != nil ||
+	if qc.ConfigVersion != parentConfig.Version || VerifyBeaconQC(parentConfig, qc) != nil ||
 		qc.Epoch != epoch || qc.ParentHash != parent.BeaconHead ||
-		qc.Source != source || qc.Seq != seq || string(qc.Random) != string(random) {
+		qc.Source != source || qc.Seq != seq || string(qc.Random) != string(random) ||
+		qc.SkippedHash != HashSkippedTuples(skipped) {
 		n.mu.Lock()
 		delete(n.certifying, key)
 		n.mu.Unlock()
@@ -2288,10 +1876,7 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		n.mu.Unlock()
 		return
 	}
-	// A membership decision may have been delivered after this old
-	// configuration signed P_e. Apply the record to the current scheduling
-	// state, preserving the already-installed membership transition.
-	effectiveChild, err := entropySuccessorForRecord(n.Schedule, qc.ConfigVersion, parentConfig.F, random, source, seq)
+	effectiveChild, err := entropySuccessorForRecord(n.Schedule, qc.ConfigVersion, parentConfig.F, random, source, seq, skipped)
 	if err != nil {
 		delete(n.certifying, key)
 		n.mu.Unlock()
@@ -2302,7 +1887,7 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	// exact coin.  The still-present certifying entry is the local barrier that
 	// prevents certification of P_{e+1} until every awakened continuation has
 	// either decided or reached its next coin wait.
-	n.installBeaconStateLocked(child, qc)
+	n.installBeaconStateLocked(child, qc, skipped)
 	if err := n.persistLocked(); err != nil {
 		delete(n.certifying, key)
 		n.mu.Unlock()
@@ -2310,26 +1895,14 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	}
 	n.beaconSeeds[epoch] = append([]byte(nil), random...)
 	feeds := n.processPendingABAsLocked(epoch)
-	joinFeed, hasJoinFeed := n.pendingJoinCoinFeedLocked(epoch)
 	n.mu.Unlock()
 	for _, feed := range feeds {
-		n.mu.Lock()
-		engine := n.ABAs[abaVersion(feed.instance)]
-		n.mu.Unlock()
+		engine := n.ABA
 		if engine == nil {
 			continue
 		}
 		engine.FeedSeed(context.Background(), feed.instance, feed.round, random)
 		n.waitPendingABAAfterSeed(context.Background(), feed)
-	}
-	if hasJoinFeed {
-		n.mu.Lock()
-		engine := n.ABAs[abaVersion(joinFeed.instance)]
-		n.mu.Unlock()
-		if engine != nil {
-			engine.FeedSeed(context.Background(), joinFeed.instance, joinFeed.round, random)
-			n.waitPendingJoinAfterSeed(context.Background(), joinFeed)
-		}
 	}
 	n.mu.Lock()
 	if n.State.Epoch != epoch || n.Schedule.BeaconHead != child.BeaconHead {
@@ -2337,21 +1910,13 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 		n.mu.Unlock()
 		return
 	}
-	// An awakened JOIN-ABA may already have installed c+1.  P_e remains the
-	// certified beacon head, so never overwrite that forward transition with
-	// the old-configuration child captured above.
-	configVersion := qc.ConfigVersion
 	if err := n.persistLocked(); err != nil {
 		delete(n.certifying, key)
 		n.mu.Unlock()
 		return
 	}
 	n.cleanupEpochStateLocked(epoch)
-	b := Beacon{
-		Epoch: epoch, Source: source, Seq: seq, PrevRandom: prev, Random: append([]byte(nil), random...),
-		Secret: secret, ObjectID: obj.Commitment.SecretID, BeaconSigners: senders,
-		ConfigVersion: configVersion, QC: qc,
-	}
+	b := Beacon{BeaconQC: qc, Skipped: append([]SkippedTuple(nil), skipped...)}
 	n.certBeacons[key] = b
 	delete(n.certifying, key)
 	waiters := append([]chan Beacon(nil), n.waiters[key]...)
@@ -2361,10 +1926,7 @@ func (n *Node) finishCertifyBeacon(epoch uint64, source p2p.NodeID, seq uint64, 
 	default:
 	}
 	n.mu.Unlock()
-	_ = n.maybeStartJoin(context.Background())
-	_ = n.maybeInstallJoin(context.Background())
 	n.retryPendingABACertificates(context.Background())
-	n.retryPendingJoinCertificate(context.Background())
 	for _, waiter := range waiters {
 		select {
 		case waiter <- b:
@@ -2392,11 +1954,17 @@ func abaVersion(instance string) uint64 {
 
 func (n *Node) processPendingABAsLocked(certEpoch uint64) []coinFeed {
 	var feeds []coinFeed
-	for epoch, p := range n.State.PendingABAs {
-		if p.CoinWait && p.Epoch+p.Round+1 == certEpoch {
+	for instance := range n.State.PendingABAs {
+		originEpoch, _, _, ok := aba.TupleFromInstance(instance)
+		engine := n.ABA
+		if !ok || engine == nil {
+			continue
+		}
+		status := engine.Status(instance)
+		if status.CoinWait && originEpoch+status.Round+1 == certEpoch {
 			feeds = append(feeds, coinFeed{
-				instance: aba.EpochInstanceFor(p.ConfigVersion, epoch),
-				round:    p.Round,
+				instance: instance,
+				round:    status.Round,
 			})
 		}
 	}
@@ -2407,37 +1975,31 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		n.mu.Lock()
-		engine := n.ABAs[abaVersion(feed.instance)]
-		n.mu.Unlock()
+		engine := n.ABA
 		if engine == nil {
 			return
 		}
 		st := engine.Status(feed.instance)
 		n.mu.Lock()
-		epoch, ok := aba.EpochFromInstance(feed.instance)
-		p := n.State.PendingABAs[epoch]
-		if !ok || p == nil {
+		_, _, _, ok := aba.TupleFromInstance(feed.instance)
+		if _, pending := n.State.PendingABAs[feed.instance]; !ok || !pending {
 			n.mu.Unlock()
 			return
 		}
 		if st.Decided {
-			if !st.Value {
-				n.markRemovalLocked(p, st.Certificate)
+			n.State.ABADecisions[feed.instance] = aba.Decision{
+				ConfigVersion: abaVersion(feed.instance), Instance: feed.instance,
+				Value: st.Value, FastPath: st.Certificate.FastPath, Certificate: st.Certificate,
 			}
-			delete(n.State.PendingABAs, epoch)
+			delete(n.State.PendingABAs, feed.instance)
 			delete(n.abaInputSent, feed.instance)
 			delete(n.abaInputs, feed.instance)
+			_ = n.persistLocked()
 			n.mu.Unlock()
 			engine.Prune(feed.instance)
 			return
 		}
-		p.Round = st.Round
-		p.CoinWait = st.CoinWait
 		if st.CoinWait && st.Round > feed.round {
-			if len(n.beaconSeeds[p.Epoch+st.Round+1]) == 0 {
-				n.noteJoinControlLocked()
-			}
 			n.mu.Unlock()
 			return
 		}
@@ -2452,23 +2014,6 @@ func (n *Node) waitPendingABAAfterSeed(ctx context.Context, feed coinFeed) {
 
 func (n *Node) exclusionWindowLocked() int {
 	return 2 * n.State.F
-}
-
-func (n *Node) markRemovalLocked(p *PendingABA, certificate aba.Certificate) {
-	if p == nil {
-		return
-	}
-	if p.ConfigVersion != n.State.ConfigVersion {
-		return
-	}
-	if _, exists := n.State.RmMark[p.Source]; exists {
-		return
-	}
-	n.State.RmMark[p.Source] = RemovalMark{
-		Seq: p.Seq + 1, ConfigVersion: p.ConfigVersion,
-		Epoch: p.Epoch, Certificate: certificate,
-	}
-	n.noteJoinControlLocked()
 }
 
 func (n *Node) refillSCLLocked() {
@@ -2487,18 +2032,10 @@ func (n *Node) cleanupEpochStateLocked(epoch uint64) {
 	}
 	minSeed := epoch - keepSeeds
 	protectedSeeds := make(map[uint64]bool)
-	for _, mark := range n.State.RmMark {
-		if !mark.Certificate.FastPath {
-			protectedSeeds[mark.Epoch+mark.Certificate.Round+1] = true
-		}
-	}
-	if n.PendingJoin != nil && n.PendingJoin.Phase == JoinDecided &&
-		!n.PendingJoin.ABACert.FastPath {
-		protectedSeeds[n.PendingJoin.Proposal.AnchorEpoch+n.PendingJoin.ABACert.Round] = true
-	}
-	for _, proposal := range n.joinProposals {
-		for e := proposal.AnchorEpoch; e <= epoch; e++ {
-			protectedSeeds[e] = true
+	for instance, decision := range n.State.ABADecisions {
+		originEpoch, _, _, ok := aba.TupleFromInstance(instance)
+		if ok && !decision.Certificate.FastPath {
+			protectedSeeds[originEpoch+decision.Certificate.Round+1] = true
 		}
 	}
 	for e := range n.beaconSeeds {
@@ -2510,7 +2047,6 @@ func (n *Node) cleanupEpochStateLocked(epoch uint64) {
 	for key := range n.reconDone {
 		if keyEpoch(key) < minRecon {
 			delete(n.recon, key)
-			delete(n.reconSecret, key)
 			delete(n.reconDone, key)
 			delete(n.reconClosing, key)
 			delete(n.reconSent, key)
@@ -2554,17 +2090,16 @@ func (n *Node) cleanupEpochStateLocked(epoch uint64) {
 	for id, seq := range n.State.Seqs {
 		consumed[id] = seq
 	}
-	if engine := n.RBCs[n.State.ConfigVersion]; engine != nil {
+	if engine := n.RBC; engine != nil {
 		engine.PruneThrough(consumed)
 	}
 }
 
-func (n *Node) installBeaconStateLocked(child SchedulingState, qc BeaconQC) {
-	localMarks := cloneMarkMap(n.State.RmMark)
+func (n *Node) installBeaconStateLocked(child SchedulingState, qc BeaconQC, skipped []SkippedTuple) {
 	n.Schedule = CloneSchedulingState(child)
 	qcCopy := qc
 	n.LatestBeaconQC = &qcCopy
-	n.BeaconHistory = append(n.BeaconHistory, BeaconHistoryLink{Child: CloneSchedulingState(child), QC: qc})
+	n.BeaconHistory = append(n.BeaconHistory, BeaconHistoryLink{Child: CloneSchedulingState(child), QC: qc, Skipped: append([]SkippedTuple(nil), skipped...)})
 	n.State.ConfigVersion = child.ConfigVersion
 	n.State.F = child.F
 	n.State.Epoch = child.Epoch
@@ -2573,10 +2108,12 @@ func (n *Node) installBeaconStateLocked(child SchedulingState, qc BeaconQC) {
 	n.State.SCL = append([]p2p.NodeID(nil), child.SCL...)
 	n.State.RSQ = append([]p2p.NodeID(nil), child.RSQ...)
 	n.State.Seqs = cloneSeqMap(child.Seqs)
-	// rmMark is ABA-certified local control state. It is deliberately not part
-	// of P_e and therefore survives installation of the deterministic entropy
-	// snapshot independently of the beacon certificate.
-	n.State.RmMark = localMarks
+	for instance := range n.State.ABADecisions {
+		_, source, seq, ok := aba.TupleFromInstance(instance)
+		if ok && child.Seqs[source] >= seq+1 {
+			delete(n.State.ABADecisions, instance)
+		}
+	}
 	for id := range n.State.ComQ {
 		if !contains(child.Members, id) {
 			continue
@@ -2596,11 +2133,11 @@ func (n *Node) lookupEpochObject(epoch uint64, source p2p.NodeID, seq uint64) (O
 	if epoch != n.State.Epoch+1 {
 		return Object{}, errors.New("unexpected epoch")
 	}
-	obj, ok := n.State.ComQ[source][seq]
+	entry, ok := n.State.ComQ[source][seq]
 	if !ok {
 		return Object{}, errors.New("unknown object")
 	}
-	return obj, nil
+	return entry.Object, nil
 }
 
 func (n *Node) CompletedEpoch() uint64 {
@@ -2641,11 +2178,11 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 		idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
 		s.Source = n.State.SCL[idx]
 		s.Seq = n.State.Seqs[s.Source] + 1
-		s.Instance = aba.EpochInstanceFor(n.State.ConfigVersion, s.NextEpoch)
+		s.Instance = aba.TupleInstanceFor(n.State.ConfigVersion, s.NextEpoch, s.Source, s.Seq)
 		key := epochKey(s.NextEpoch, s.Source, s.Seq)
-		if obj, ok := n.State.ComQ[s.Source][s.Seq]; ok {
+		if entry, ok := n.State.ComQ[s.Source][s.Seq]; ok {
 			s.Object = true
-			s.ReconNeed = obj.Commitment.Threshold
+			s.ReconNeed = entry.Object.Commitment.Threshold
 		}
 		if _, ok := n.State.ComQ[s.Source][s.Seq+1]; ok {
 			s.NextObject = true
@@ -2697,24 +2234,12 @@ func (n *Node) DebugSnapshot() DebugSnapshot {
 
 func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 	n.relayABADecision(ctx, dec)
-	if n.handleJoinDecision(ctx, dec) {
-		n.mu.Lock()
-		engine := n.ABAs[dec.ConfigVersion]
-		n.mu.Unlock()
-		if engine != nil {
-			engine.Prune(dec.Instance)
-		}
-		return
-	}
 	n.mu.Lock()
-	engine := n.ABAs[dec.ConfigVersion]
-	epoch, isEpoch := aba.EpochFromInstance(dec.Instance)
-	if p := n.State.PendingABAs[epoch]; isEpoch && p != nil &&
-		p.ConfigVersion == dec.ConfigVersion {
-		if !dec.Value {
-			n.markRemovalLocked(p, dec.Certificate)
-		}
-		delete(n.State.PendingABAs, epoch)
+	engine := n.ABA
+	_, _, _, isTuple := aba.TupleFromInstance(dec.Instance)
+	if isTuple {
+		n.State.ABADecisions[dec.Instance] = dec
+		delete(n.State.PendingABAs, dec.Instance)
 		delete(n.abaInputSent, dec.Instance)
 		delete(n.abaInputs, dec.Instance)
 		_ = n.persistLocked()
@@ -2723,7 +2248,6 @@ func (n *Node) handleABADecision(ctx context.Context, dec aba.Decision) {
 	if engine != nil {
 		engine.Prune(dec.Instance)
 	}
-	_ = n.maybeInstallJoin(ctx)
 }
 
 func (n *Node) relayABADecision(ctx context.Context, dec aba.Decision) {
@@ -2731,9 +2255,9 @@ func (n *Node) relayABADecision(ctx context.Context, dec aba.Decision) {
 		return
 	}
 	n.mu.Lock()
-	configuration, configured := n.Configurations[dec.ConfigVersion]
+	configuration := n.Configuration
 	relay := false
-	if configured {
+	if configuration.Version == dec.ConfigVersion {
 		for index, member := range configuration.Members {
 			if index >= configuration.F+1 {
 				break
@@ -2760,7 +2284,7 @@ func (n *Node) relayABADecision(ctx context.Context, dec aba.Decision) {
 		}
 		msg, err := p2p.NewMessage(
 			Protocol, "ABA_CERT", dec.Instance, n.ID, member,
-			certifiedABADecision{Decision: dec},
+			certifiedABADecision{Certificate: dec.Certificate},
 		)
 		if err == nil {
 			_ = n.Transport.Send(ctx, member, msg)
@@ -2779,10 +2303,10 @@ func (n *Node) handleCertifiedABADecision(ctx context.Context, dec aba.Decision)
 		return errors.New("malformed ABA decision certificate")
 	}
 	n.mu.Lock()
-	configuration, configured := n.Configurations[dec.ConfigVersion]
-	engine := n.ABAs[dec.ConfigVersion]
+	configuration := n.Configuration
+	engine := n.ABA
 	seed, ready := n.abaDecisionSeedLocked(dec)
-	if !configured || engine == nil {
+	if configuration.Version != dec.ConfigVersion || engine == nil {
 		n.mu.Unlock()
 		return nil
 	}
@@ -2817,28 +2341,14 @@ func (n *Node) handleCertifiedABADecision(ctx context.Context, dec aba.Decision)
 // context and the certified seed needed to validate a regular certificate are
 // available. Fast-path certificates do not use a beacon seed.
 func (n *Node) abaDecisionSeedLocked(dec aba.Decision) ([]byte, bool) {
-	if epoch, ok := aba.EpochFromInstance(dec.Instance); ok {
-		if pending := n.State.PendingABAs[epoch]; pending == nil ||
-			pending.ConfigVersion != dec.ConfigVersion {
-			return nil, false
-		}
+	if originEpoch, _, _, ok := aba.TupleFromInstance(dec.Instance); ok {
 		if dec.FastPath {
 			return nil, true
 		}
-		seed := n.beaconSeeds[epoch+dec.Certificate.Round+1]
+		seed := n.beaconSeeds[originEpoch+dec.Certificate.Round+1]
 		return append([]byte(nil), seed...), len(seed) > 0
 	}
-	joiner, ok := aba.JoinerFromInstance(dec.Instance)
-	if !ok || n.PendingJoin == nil ||
-		n.PendingJoin.Proposal.ConfigVersion != dec.ConfigVersion ||
-		string(n.PendingJoin.Proposal.Joiner) != joiner {
-		return nil, false
-	}
-	if dec.FastPath {
-		return nil, true
-	}
-	seed := n.beaconSeeds[n.PendingJoin.Proposal.AnchorEpoch+dec.Certificate.Round]
-	return append([]byte(nil), seed...), len(seed) > 0
+	return nil, false
 }
 
 func (n *Node) retryPendingABACertificates(ctx context.Context) {
@@ -2855,33 +2365,14 @@ func (n *Node) retryPendingABACertificates(ctx context.Context) {
 
 func (n *Node) handleCoinRequest(req aba.CoinRequest) {
 	n.mu.Lock()
-	engine := n.ABAs[req.ConfigVersion]
+	engine := n.ABA
 	var seed []byte
-	if n.PendingJoin != nil {
-		join := n.PendingJoin.Proposal
-		instance := aba.JoinInstanceFor(join.ConfigVersion, string(join.Joiner))
-		if req.Instance == instance {
-			target := join.AnchorEpoch + req.Round
-			if known := n.beaconSeeds[target]; len(known) > 0 {
-				seed = append([]byte(nil), known...)
-				n.PendingJoin.CoinWait = false
-			} else {
-				n.PendingJoin.CoinRound = req.Round
-				n.PendingJoin.CoinWait = true
-			}
-		}
-	}
-	epoch, isEpoch := aba.EpochFromInstance(req.Instance)
-	if p := n.State.PendingABAs[epoch]; isEpoch && p != nil &&
-		p.ConfigVersion == req.ConfigVersion {
-		p.Round = req.Round
-		p.CoinWait = true
-		target := p.Epoch + req.Round + 1
+	originEpoch, _, _, isTuple := aba.TupleFromInstance(req.Instance)
+	if isTuple {
+		n.State.PendingABAs[req.Instance] = struct{}{}
+		target := originEpoch + req.Round + 1
 		if known := n.beaconSeeds[target]; len(known) > 0 {
 			seed = append([]byte(nil), known...)
-			p.CoinWait = false
-		} else {
-			n.noteJoinControlLocked()
 		}
 	}
 	n.mu.Unlock()
@@ -2894,9 +2385,33 @@ func epochKey(epoch uint64, source p2p.NodeID, seq uint64) string {
 	return fmt.Sprintf("epoch/%d/%s/%d", epoch, source, seq)
 }
 
+func reconInstance(configVersion, epoch uint64, parentHash string, source p2p.NodeID, seq uint64) string {
+	return fmt.Sprintf("recon/%d/%d/%s/%s/%d", configVersion, epoch, parentHash, source, seq)
+}
+
+func parseReconInstance(instance string) (reconScope, bool) {
+	parts := strings.Split(instance, "/")
+	if len(parts) != 6 || parts[0] != "recon" || parts[3] == "" || parts[4] == "" {
+		return reconScope{}, false
+	}
+	version, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return reconScope{}, false
+	}
+	epoch, err := strconv.ParseUint(parts[2], 10, 64)
+	if err != nil || epoch == 0 {
+		return reconScope{}, false
+	}
+	seq, err := strconv.ParseUint(parts[5], 10, 64)
+	if err != nil || seq == 0 {
+		return reconScope{}, false
+	}
+	return reconScope{ConfigVersion: version, Epoch: epoch, ParentHash: parts[3], Source: p2p.NodeID(parts[4]), Seq: seq}, true
+}
+
 func beaconVoteKey(body signedBeaconMessage) string {
 	transcript := BeaconVoteTranscript(
-		body.ConfigVersion, body.Epoch, body.ParentHash,
+		body.ConfigVersion, body.Epoch, body.ParentHash, body.SkippedHash,
 		body.Source, body.Seq, body.Random,
 	)
 	return fmt.Sprintf("epoch/%d/vote/%x", body.Epoch, crypto.DomainHash("Tyche/BeaconVoteBucket/v1", transcript))
@@ -2908,6 +2423,40 @@ func beaconIndex(random []byte, size int) int {
 	}
 	x := new(big.Int).SetBytes(random)
 	return int(new(big.Int).Mod(x, big.NewInt(int64(size))).Int64())
+}
+
+func consumerEpochKey(configVersion, epoch uint64) string {
+	return fmt.Sprintf("consumer/%d/epoch/%d", configVersion, epoch)
+}
+
+func verifySkippedCertificates(configurations map[uint64]Configuration, seeds map[uint64][]byte, skipped []SkippedTuple) error {
+	for _, item := range skipped {
+		cert := item.Certificate
+		originEpoch, source, seq, ok := aba.TupleFromInstance(cert.Instance)
+		if !ok || source != item.Source || seq+1 != item.Seq || cert.Value || cert.FastPath {
+			return errors.New("invalid tuple-bound skip certificate")
+		}
+		configuration, ok := configurations[cert.ConfigVersion]
+		if !ok {
+			return fmt.Errorf("missing configuration %d for skip certificate", cert.ConfigVersion)
+		}
+		seed := seeds[originEpoch+cert.Round+1]
+		if err := aba.VerifyCertificate(cert, configuration.PublicKeys(), configuration.Q, seed); err != nil {
+			return fmt.Errorf("invalid skip certificate for (%s,%d): %w", item.Source, item.Seq, err)
+		}
+	}
+	return nil
+}
+
+func selectionIndex(epoch uint64, random []byte, attempt, size int) int {
+	if size <= 0 {
+		return 0
+	}
+	digest := crypto.DomainHash(
+		"Tyche/SourceSelection/v1", random,
+		[]byte(fmt.Sprintf("%d", epoch)), []byte(fmt.Sprintf("%d", attempt)),
+	)
+	return beaconIndex(digest, size)
 }
 
 func keyEpoch(key string) uint64 {

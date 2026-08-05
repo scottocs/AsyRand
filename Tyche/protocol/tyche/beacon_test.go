@@ -78,6 +78,31 @@ func (s *blockingPVSSScheme) Share(dealer p2p.NodeID, seq uint64, secret kyber.S
 	return s.PVSSScheme.Share(dealer, seq, secret)
 }
 
+func TestStoreObjectRetainsCertifiedFutureSlotForLaggingConsumer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	nodes := newTestNodes(t, ctx)
+	producer, consumer := nodes[0], nodes[1]
+	consumer.mu.Lock()
+	consumer.State.QueueLen = 2
+	consumer.mu.Unlock()
+
+	commitment, _, err := producer.PVSS.Share(producer.ID, 3, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := Object{ConfigVersion: producer.State.ConfigVersion, Producer: producer.ID, Seq: 3, Commitment: commitment}
+	if err := consumer.storeObject(obj, rbc.DeliveryCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+	consumer.mu.Lock()
+	_, retained := consumer.State.ComQ[producer.ID][3]
+	consumer.mu.Unlock()
+	if !retained {
+		t.Fatal("lagging consumer discarded a certified future slot")
+	}
+}
+
 func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -126,13 +151,8 @@ func TestBeaconProducerConsumerCertifiesEpoch(t *testing.T) {
 			} else if !bytes.Equal(first.Random, b.Random) || first.Source != b.Source || first.Seq != b.Seq {
 				t.Fatalf("beacon mismatch: first=%+v got=%+v", first, b)
 			}
-			if len(b.BeaconSigners) < 3 {
-				t.Fatalf("weak beacon certificate: %+v", b.BeaconSigners)
-			}
-			nodes[0].mu.Lock()
-			parentConfig := nodes[0].Configurations[b.QC.ConfigVersion]
-			nodes[0].mu.Unlock()
-			signerCount := crypto.SignedQuorumCertificateSignerCount(b.QC.Signature)
+			parentConfig := nodes[0].Configuration
+			signerCount := crypto.SignedQuorumCertificateSignerCount(b.Signature)
 			if signerCount < parentConfig.Q {
 				t.Fatalf("invalid beacon certificate quorum size: %d", signerCount)
 			}
@@ -174,7 +194,8 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 	counter := &countingPVSSScheme{PVSSScheme: target.PVSS}
 	target.PVSS = counter
 	target.mu.Lock()
-	target.PVSSContexts[target.State.ConfigVersion].Scheme = counter
+	target.PVSSContext.Scheme = counter
+	reconWireInstance := reconInstance(obj.ConfigVersion, 1, target.Schedule.BeaconHead, source, obj.Seq)
 	target.mu.Unlock()
 	for i := 0; i < obj.Commitment.Threshold+1; i++ {
 		holder := nodes[i]
@@ -182,10 +203,8 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := target.handleRecon(ctx, holder.ID, ReconMessage{
-			ConfigVersion: obj.ConfigVersion, ObjectConfigVersion: obj.ConfigVersion,
-			Epoch: 1, Source: source, Seq: obj.Seq,
-			ObjectID: obj.Commitment.SecretID, Share: share,
+		if err := target.handleRecon(ctx, holder.ID, reconWireInstance, ReconMessage{
+			ObjectConfigVersion: obj.ConfigVersion, Share: share,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -227,18 +246,17 @@ func TestHandleReconBuffersUntilRBCDelivery(t *testing.T) {
 		holder = nodes[2]
 	}
 	target.mu.Lock()
+	certificate := target.State.ComQ[source][obj.Seq].Certificate
 	delete(target.State.ComQ[source], obj.Seq)
-	certificate := target.RBCCertificates[rbcCertificateKey(obj.ConfigVersion, obj.Commitment.SecretID)]
+	reconWireInstance := reconInstance(obj.ConfigVersion, 1, target.Schedule.BeaconHead, source, obj.Seq)
 	target.mu.Unlock()
 
 	share, err := holder.PVSS.PreReconVerified(obj.Commitment, holder.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := target.handleRecon(ctx, holder.ID, ReconMessage{
-		ConfigVersion: obj.ConfigVersion, ObjectConfigVersion: obj.ConfigVersion,
-		Epoch: 1, Source: source, Seq: obj.Seq,
-		ObjectID: obj.Commitment.SecretID, Share: share,
+	if err := target.handleRecon(ctx, holder.ID, reconWireInstance, ReconMessage{
+		ObjectConfigVersion: obj.ConfigVersion, Share: share,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -275,6 +293,42 @@ func TestHandleReconBuffersUntilRBCDelivery(t *testing.T) {
 	})
 }
 
+func TestReconRejectsWrongCertifiedParent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	nodes := newTestNodes(t, ctx)
+	target := nodes[0]
+	source := nextSource(target)
+	var producer *Node
+	for _, node := range nodes {
+		if node.ID == source {
+			producer = node
+			break
+		}
+	}
+	obj, err := producer.Produce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStored(t, ctx, nodes, source, obj.Seq)
+	if _, _, _, _, _, err := target.prepareEpoch(1); err != nil {
+		t.Fatal(err)
+	}
+	share, err := nodes[1].PVSS.PreReconVerified(obj.Commitment, nodes[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := reconInstance(obj.ConfigVersion, 1, "wrong-parent", source, obj.Seq)
+	if err := target.handleRecon(ctx, nodes[1].ID, instance, ReconMessage{ObjectConfigVersion: obj.ConfigVersion, Share: share}); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.pendingReconCount != 0 || len(target.recon[epochKey(1, source, obj.Seq)]) != 0 {
+		t.Fatal("RECON from a different certified parent was retained")
+	}
+}
+
 func TestPendingReconIsBoundedAndDeduplicated(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -291,28 +345,23 @@ func TestPendingReconIsBoundedAndDeduplicated(t *testing.T) {
 	}
 	target.mu.Lock()
 	members := append([]p2p.NodeID(nil), target.State.Members...)
+	reconWireInstance := reconInstance(version, epoch, target.Schedule.BeaconHead, source, seq)
 	target.mu.Unlock()
 
 	for _, from := range members {
 		objectID := "pending-" + string(source) + "-" + string(from)
 		body := ReconMessage{
-			ConfigVersion:       version,
 			ObjectConfigVersion: version,
-			Epoch:               epoch,
-			Source:              source,
-			Seq:                 seq,
-			ObjectID:            objectID,
 			Share: crypto.DecryptedShare{
 				CommitmentID: objectID,
 				Holder:       from,
 			},
 		}
-		if err := target.handleRecon(ctx, from, body); err != nil {
+		if err := target.handleRecon(ctx, from, reconWireInstance, body); err != nil {
 			t.Fatal(err)
 		}
-		body.ObjectID += "-conflict"
-		body.Share.CommitmentID = body.ObjectID
-		if err := target.handleRecon(ctx, from, body); err != nil {
+		body.Share.CommitmentID += "-conflict"
+		if err := target.handleRecon(ctx, from, reconWireInstance, body); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -324,51 +373,6 @@ func TestPendingReconIsBoundedAndDeduplicated(t *testing.T) {
 	}
 	if len(target.pendingRecon) != 1 {
 		t.Fatalf("pending recon buckets=%d, want 1", len(target.pendingRecon))
-	}
-}
-
-func TestPendingReconClearsAcrossConfigurationReset(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	target := nodes[0]
-	target.mu.Lock()
-	version := target.State.ConfigVersion
-	epoch := target.State.Epoch + 1
-	// Open the immutable Step-0 context before accepting reconstruction events.
-	from := target.State.Members[1]
-	target.mu.Unlock()
-	source, seq, _, _, _, err := target.prepareEpoch(epoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := ReconMessage{
-		ConfigVersion:       version,
-		ObjectConfigVersion: version,
-		Epoch:               epoch,
-		Source:              source,
-		Seq:                 seq,
-		ObjectID:            "pending-reset",
-		Share: crypto.DecryptedShare{
-			CommitmentID: "pending-reset",
-			Holder:       from,
-		},
-	}
-	if err := target.handleRecon(ctx, from, body); err != nil {
-		t.Fatal(err)
-	}
-	target.mu.Lock()
-	if target.pendingReconCount != 1 {
-		target.mu.Unlock()
-		t.Fatalf("pending recon count=%d, want 1 before reset", target.pendingReconCount)
-	}
-	target.resetCurrentConfigurationCachesLocked()
-	count := target.pendingReconCount
-	buckets := len(target.pendingRecon)
-	target.mu.Unlock()
-	if count != 0 || buckets != 0 {
-		t.Fatalf("pending recon survived configuration reset: count=%d buckets=%d", count, buckets)
 	}
 }
 
@@ -564,20 +568,20 @@ func TestLookForwardExpirationRequiresDistinctProducers(t *testing.T) {
 	members := append([]p2p.NodeID(nil), node.State.Members...)
 	target := members[0]
 	node.mu.Lock()
-	node.State.ComQ[target][1] = Object{Producer: target, Seq: 1}
+	node.State.ComQ[target][1] = CertifiedObject{Object: Object{Producer: target, Seq: 1}}
 	for seq := uint64(1); seq <= 3; seq++ {
-		node.State.ComQ[members[1]][seq] = Object{Producer: members[1], Seq: seq}
+		node.State.ComQ[members[1]][seq] = CertifiedObject{Object: Object{Producer: members[1], Seq: seq}}
 	}
 	if node.lookForwardExpiredLocked(target, 2) {
 		node.mu.Unlock()
 		t.Fatal("objects from one producer must not satisfy the distinct-producer rule")
 	}
-	node.State.ComQ[members[2]][1] = Object{Producer: members[2], Seq: 1}
+	node.State.ComQ[members[2]][1] = CertifiedObject{Object: Object{Producer: members[2], Seq: 1}}
 	if node.lookForwardExpiredLocked(target, 2) {
 		node.mu.Unlock()
 		t.Fatal("the current target plus two progressing producers must not satisfy 2f+1")
 	}
-	node.State.ComQ[members[3]][1] = Object{Producer: members[3], Seq: 1}
+	node.State.ComQ[members[3]][1] = CertifiedObject{Object: Object{Producer: members[3], Seq: 1}}
 	expired := node.lookForwardExpiredLocked(target, 2)
 	node.mu.Unlock()
 	if !expired {
@@ -726,29 +730,12 @@ func TestRunnerIDNode1ObjectStores(t *testing.T) {
 	waitStored(t, ctx, nodes, "node1", 1)
 }
 
-func TestCoinBarrierIgnoresCurrentABA(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	nodes := newTestNodes(t, ctx)
-	nodes[0].mu.Lock()
-	nodes[0].State.PendingABAs[1] = &PendingABA{ConfigVersion: 0, Epoch: 1, Source: "n0", Seq: 1}
-	nodes[0].mu.Unlock()
-
-	if err := nodes[0].waitCoinBarrier(ctx, 1); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
+func TestTuplePendingABAIsFedOnlyByAssignedBeacon(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	nodes := newTestNodes(t, ctx)
-	inst := aba.EpochInstanceFor(0, 1)
-	nodes[0].mu.Lock()
-	nodes[0].State.PendingABAs[1] = &PendingABA{ConfigVersion: 0, Epoch: 1, Source: "n0", Seq: 1}
-	nodes[0].mu.Unlock()
+	inst := aba.TupleInstanceFor(0, 1, "n0", 1)
 
 	for _, node := range nodes {
 		if err := node.ABA.Propose(ctx, inst, false); err != nil {
@@ -756,88 +743,21 @@ func TestCoinBarrierFeedsLateCoinRequestFromCertifiedBeacon(t *testing.T) {
 		}
 	}
 	waitABAStatus(t, ctx, nodes[0], inst, func(st aba.Status) bool { return st.CoinWait })
-
 	st := nodes[0].ABA.Status(inst)
 	seed := []byte("certified-beacon-seed")
 	for i := 0; aba.CoinFromSeed(inst, st.Round, seed); i++ {
 		seed = []byte("certified-beacon-seed-" + string(rune('a'+i)))
 	}
 	nodes[0].mu.Lock()
-	nodes[0].beaconSeeds[1+st.Round+1] = seed
+	nodes[0].State.PendingABAs[inst] = struct{}{}
+	if feeds := nodes[0].processPendingABAsLocked(1 + st.Round); len(feeds) != 0 {
+		nodes[0].mu.Unlock()
+		t.Fatal("an ABA was fed by the epoch before its assigned seed")
+	}
+	feeds := nodes[0].processPendingABAsLocked(1 + st.Round + 1)
 	nodes[0].mu.Unlock()
-
-	if err := nodes[0].waitCoinBarrier(ctx, 2); err != nil {
-		t.Fatal(err)
-	}
-	nodes[0].mu.Lock()
-	_, pending := nodes[0].State.PendingABAs[1]
-	rm := nodes[0].State.RmMark["n0"]
-	nodes[0].mu.Unlock()
-	if pending || rm.Seq != 2 {
-		t.Fatalf("cached seed did not advance pending ABA to sequence marker: pending=%v rm=%+v", pending, rm)
-	}
-}
-
-func TestRemovalInstallsDirectlyFromABACertificate(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	nodes := newTestNodes(t, ctx)
-	inst := aba.EpochInstanceFor(0, 1)
-	for _, node := range nodes {
-		node.mu.Lock()
-		node.State.PendingABAs[1] = &PendingABA{
-			ConfigVersion: 0, Epoch: 1, Source: "n0", Seq: 1,
-		}
-		node.mu.Unlock()
-		if err := node.ABA.Propose(ctx, inst, false); err != nil {
-			t.Fatal(err)
-		}
-	}
-	waitABAStatus(t, ctx, nodes[0], inst, func(st aba.Status) bool { return st.CoinWait })
-	round := nodes[0].ABA.Status(inst).Round
-	seed := []byte("remove-coin")
-	for aba.CoinFromSeed(inst, round, seed) {
-		seed = append(seed, byte(len(seed)))
-	}
-	for _, node := range nodes {
-		node.mu.Lock()
-		node.beaconSeeds[1+round+1] = append([]byte(nil), seed...)
-		node.mu.Unlock()
-		node.ABA.FeedSeed(ctx, inst, round, seed)
-	}
-	waitUntil(t, ctx, func() bool {
-		for _, node := range nodes {
-			node.mu.Lock()
-			mark, ok := node.State.RmMark["n0"]
-			node.mu.Unlock()
-			if !ok || mark.Seq != 2 || mark.Certificate.Value {
-				return false
-			}
-		}
-		return true
-	})
-	for _, node := range nodes {
-		node.mu.Lock()
-		node.Schedule.Seqs["n0"] = 1
-		node.State.Seqs["n0"] = 1
-		node.mu.Unlock()
-	}
-	results := make(chan error, len(nodes))
-	for _, node := range nodes {
-		go func(node *Node) { results <- node.runCertifiedRemoval(ctx, "n0") }(node)
-	}
-	for range nodes {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, node := range nodes {
-		node.mu.Lock()
-		removed := !contains(node.State.Members, "n0") && node.State.ConfigVersion == 1
-		node.mu.Unlock()
-		if !removed {
-			t.Fatalf("node %s did not install ABA-certified removal", node.ID)
-		}
+	if len(feeds) != 1 || feeds[0].instance != inst || feeds[0].round != st.Round {
+		t.Fatalf("wrong assigned feed: %+v", feeds)
 	}
 }
 
@@ -847,7 +767,7 @@ func TestBeaconIndexUsesFullRandomValue(t *testing.T) {
 	}
 }
 
-func TestMissingCurrentObjectDoesNotTriggerUncertifiedRemoval(t *testing.T) {
+func TestMissingCurrentObjectDoesNotMutateCertifiedSequence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -877,15 +797,16 @@ func TestMissingCurrentObjectDoesNotTriggerUncertifiedRemoval(t *testing.T) {
 	defer cancelMissing()
 	source := p2p.NodeID("n1")
 	seq := uint64(1)
-	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, aba.EpochInstanceFor(0, 1), make(chan Beacon, 1))
+	instance := aba.TupleInstanceFor(0, 1, source, seq)
+	_, _, err = node.waitObjectOrBeacon(missingCtx, 1, source, seq, instance, make(chan Beacon, 1))
 	if err == nil {
 		t.Fatal("expected missing current object to wait for context")
 	}
 	node.mu.Lock()
-	_, marked := node.State.RmMark[source]
+	certifiedSeq := node.State.Seqs[source]
 	node.mu.Unlock()
-	if marked {
-		t.Fatalf("missing object auto-marked source without ABA evidence %s", source)
+	if certifiedSeq != 0 {
+		t.Fatalf("missing object advanced source %s without certified skip", source)
 	}
 }
 
@@ -934,7 +855,7 @@ func newTestNodes(t *testing.T, ctx context.Context) []*Node {
 func nextSource(n *Node) p2p.NodeID {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	idx := beaconIndex(n.State.RPrev, len(n.State.SCL))
+	idx := selectionIndex(n.State.Epoch+1, n.State.RPrev, 0, len(n.State.SCL))
 	return n.State.SCL[idx]
 }
 
@@ -942,6 +863,8 @@ func waitStored(t *testing.T, ctx context.Context, nodes []*Node, source p2p.Nod
 	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
 	for {
 		ok := true
 		for _, n := range nodes {
@@ -955,6 +878,8 @@ func waitStored(t *testing.T, ctx context.Context, nodes []*Node, source p2p.Nod
 		}
 		select {
 		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for stored object %s/%d\n%s", source, seq, dumpNodes(nodes))
 		case <-ctx.Done():
 			t.Fatalf("timed out waiting for stored object %s/%d", source, seq)
 		}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"Tyche/Tyche/protocol/aba"
 	"Tyche/utils/p2p"
 )
 
@@ -15,13 +16,13 @@ import (
 // process restart. Configuration material and private PVSS keys are deployment
 // inputs and are deliberately not copied into this record.
 type PersistentState struct {
-	Schedule          SchedulingState            `json:"schedule"`
-	Certificate       *BeaconQC                  `json:"certificate,omitempty"`
-	HistoryAnchor     SchedulingState            `json:"history_anchor"`
-	BeaconHistory     []BeaconHistoryLink        `json:"beacon_history,omitempty"`
-	SignedBeaconSlots map[string]string          `json:"signed_beacon_slots"`
-	ProducerSeq       uint64                     `json:"producer_seq"`
-	RmMark            map[p2p.NodeID]RemovalMark `json:"rm_mark,omitempty"`
+	Schedule          SchedulingState         `json:"schedule"`
+	Certificate       *BeaconQC               `json:"certificate,omitempty"`
+	HistoryAnchor     SchedulingState         `json:"history_anchor"`
+	BeaconHistory     []BeaconHistoryLink     `json:"beacon_history,omitempty"`
+	SignedBeaconSlots map[string]string       `json:"signed_beacon_slots"`
+	ProducerSeq       uint64                  `json:"producer_seq"`
+	ABADecisions      map[string]aba.Decision `json:"aba_decisions,omitempty"`
 }
 
 // StateStore provides atomic BEACON-vote reservation and snapshot replacement.
@@ -216,7 +217,7 @@ func clonePersistentState(in PersistentState) PersistentState {
 	for slot, voteHash := range in.SignedBeaconSlots {
 		out.SignedBeaconSlots[slot] = voteHash
 	}
-	out.RmMark = cloneMarkMap(in.RmMark)
+	out.ABADecisions = cloneABADecisions(in.ABADecisions)
 	return out
 }
 
@@ -227,7 +228,7 @@ func (n *Node) persistentStateLocked() PersistentState {
 		BeaconHistory:     append([]BeaconHistoryLink(nil), n.BeaconHistory...),
 		SignedBeaconSlots: make(map[string]string),
 		ProducerSeq:       n.State.ProducerSeq,
-		RmMark:            cloneMarkMap(n.State.RmMark),
+		ABADecisions:      cloneABADecisions(n.State.ABADecisions),
 	}
 	if n.LatestBeaconQC != nil {
 		qc := *n.LatestBeaconQC
@@ -256,11 +257,11 @@ func (n *Node) restorePersistentState() error {
 	if state.Schedule.ConfigDigest == "" {
 		return nil
 	}
-	setup, exists := n.ConfigurationSetups[state.Schedule.ConfigVersion]
-	if !exists || setup.Configuration.Digest() != state.Schedule.ConfigDigest {
-		return fmt.Errorf("persisted state needs exact configuration setup %d (%s)", state.Schedule.ConfigVersion, state.Schedule.ConfigDigest)
+	configuration := n.Configuration
+	if configuration.Version != state.Schedule.ConfigVersion || configuration.Digest() != state.Schedule.ConfigDigest {
+		return fmt.Errorf("persisted state does not match the fixed configuration (%s)", state.Schedule.ConfigDigest)
 	}
-	if !sameMembers(state.Schedule.Members, setup.Configuration.Members) {
+	if !sameMembers(state.Schedule.Members, configuration.Members) {
 		return errors.New("persisted scheduling state membership does not match configured setup")
 	}
 	n.Schedule = CloneSchedulingState(state.Schedule)
@@ -280,9 +281,17 @@ func (n *Node) restorePersistentState() error {
 	n.State.SCL = append([]p2p.NodeID(nil), state.Schedule.SCL...)
 	n.State.RSQ = append([]p2p.NodeID(nil), state.Schedule.RSQ...)
 	n.State.Seqs = cloneSeqMap(state.Schedule.Seqs)
-	n.State.RmMark = cloneMarkMap(state.RmMark)
+	n.State.ABADecisions = cloneABADecisions(state.ABADecisions)
 	n.State.ProducerSeq = maxUint64(n.State.ProducerSeq, state.ProducerSeq)
 	return nil
+}
+
+func cloneABADecisions(in map[string]aba.Decision) map[string]aba.Decision {
+	out := make(map[string]aba.Decision, len(in))
+	for instance, decision := range in {
+		out[instance] = decision
+	}
+	return out
 }
 
 func maxUint64(a, b uint64) uint64 {

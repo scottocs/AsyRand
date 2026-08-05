@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"Tyche/Tyche/crypto"
+	"Tyche/Tyche/protocol/aba"
 	"Tyche/utils/p2p"
 )
 
@@ -23,7 +24,18 @@ type SchedulingState struct {
 	SCL           []p2p.NodeID          `json:"scl"`
 	RSQ           []p2p.NodeID          `json:"rsq"`
 	Seqs          map[p2p.NodeID]uint64 `json:"seqs"`
-	ConfigDigest  string                `json:"config_digest"`
+	// ControlInstances keeps only each producer's latest tuple-bound ABA,
+	// which is exactly the instance needed to evaluate its next sequence.
+	ControlInstances map[p2p.NodeID]string `json:"control_instances,omitempty"`
+	ConfigDigest     string                `json:"config_digest"`
+}
+
+// BeaconHistoryLink retains the certified scheduling transition needed to
+// replay source exclusions and verify the fixed-party beacon history.
+type BeaconHistoryLink struct {
+	Child   SchedulingState `json:"child"`
+	QC      BeaconQC        `json:"qc"`
+	Skipped []SkippedTuple  `json:"skipped,omitempty"`
 }
 
 func CloneSchedulingState(in SchedulingState) SchedulingState {
@@ -33,23 +45,22 @@ func CloneSchedulingState(in SchedulingState) SchedulingState {
 	out.SCL = append([]p2p.NodeID(nil), in.SCL...)
 	out.RSQ = append([]p2p.NodeID(nil), in.RSQ...)
 	out.Seqs = cloneSeqMap(in.Seqs)
+	out.ControlInstances = cloneControlMap(in.ControlInstances)
 	return out
 }
 
 func HashSchedulingState(state SchedulingState) string {
 	state = canonicalSchedulingState(state)
-	return hex.EncodeToString(crypto.DomainHash("Tyche/SchedulingState/v1", canonicalJSON(state)))
+	return hex.EncodeToString(crypto.DomainHash("Tyche/SchedulingState/v2", canonicalJSON(state)))
 }
 
-func EntropySuccessor(parent SchedulingState, random []byte, source p2p.NodeID, seq uint64) (SchedulingState, error) {
-	return entropySuccessorForRecord(parent, parent.ConfigVersion, parent.F, random, source, seq)
+func EntropySuccessor(parent SchedulingState, random []byte, source p2p.NodeID, seq uint64, skipped []SkippedTuple) (SchedulingState, error) {
+	return entropySuccessorForRecord(parent, parent.ConfigVersion, parent.F, random, source, seq, skipped)
 }
 
 // entropySuccessorForRecord applies a certified beacon record to the local
-// scheduling state. recordConfig is the configuration that signed P_e; it may
-// be older than parent.ConfigVersion when an already-agreed membership change
-// is delivered before that party receives P_e.
-func entropySuccessorForRecord(parent SchedulingState, recordConfig uint64, recordF int, random []byte, source p2p.NodeID, seq uint64) (SchedulingState, error) {
+// scheduling state. recordConfig domain-separates the fixed protocol setup.
+func entropySuccessorForRecord(parent SchedulingState, recordConfig uint64, recordF int, random []byte, source p2p.NodeID, seq uint64, skipped []SkippedTuple) (SchedulingState, error) {
 	if len(random) == 0 {
 		return SchedulingState{}, errors.New("entropy successor requires reconstructed randomness")
 	}
@@ -59,14 +70,30 @@ func entropySuccessorForRecord(parent SchedulingState, recordConfig uint64, reco
 	child := CloneSchedulingState(parent)
 	child.Epoch++
 	child.Random = append([]byte(nil), random...)
-	child.BeaconHead = BeaconHeaderHash(recordConfig, child.Epoch, parent.BeaconHead, source, seq, random)
+	skippedHash := HashSkippedTuples(skipped)
+	child.BeaconHead = BeaconHeaderHash(recordConfig, child.Epoch, parent.BeaconHead, skippedHash, source, seq, random)
+	for _, item := range skipped {
+		if !contains(child.Members, item.Source) || child.Seqs[item.Source]+1 != item.Seq {
+			return SchedulingState{}, errors.New("invalid certified skipped tuple sequence")
+		}
+		if item.Seq <= 1 || item.Certificate.Value || item.Certificate.Instance == "" ||
+			item.Certificate.Instance != parent.ControlInstances[item.Source] {
+			return SchedulingState{}, errors.New("skipped tuple is not bound to its predecessor ABA")
+		}
+		child.Seqs[item.Source] = item.Seq
+		if child.ControlInstances == nil {
+			child.ControlInstances = make(map[p2p.NodeID]string)
+		}
+		child.ControlInstances[item.Source] = aba.TupleInstanceFor(recordConfig, child.Epoch, item.Source, item.Seq)
+	}
 	if child.Seqs[source]+1 != seq {
 		return SchedulingState{}, fmt.Errorf("entropy sequence=%d, want %d", seq, child.Seqs[source]+1)
 	}
 	child.Seqs[source] = seq
-	// An old record remains governed by the exclusion window of the
-	// configuration that certified it, even if a JOIN certificate was
-	// delivered first at this replica.
+	if child.ControlInstances == nil {
+		child.ControlInstances = make(map[p2p.NodeID]string)
+	}
+	child.ControlInstances[source] = aba.TupleInstanceFor(recordConfig, child.Epoch, source, seq)
 	window := 2 * recordF
 	if window > 0 && len(child.RSQ) >= window {
 		child.RSQ = append([]p2p.NodeID(nil), child.RSQ[1:]...)
@@ -74,33 +101,6 @@ func entropySuccessorForRecord(parent SchedulingState, recordConfig uint64, reco
 	if window > 0 && !contains(child.RSQ, source) {
 		child.RSQ = append(child.RSQ, source)
 	}
-	return canonicalSchedulingState(child), nil
-}
-
-func RemoveSuccessor(parent SchedulingState, removed p2p.NodeID, childConfig Configuration) (SchedulingState, error) {
-	if !contains(parent.Members, removed) {
-		return SchedulingState{}, fmt.Errorf("removed node %s is not in parent configuration", removed)
-	}
-	if childConfig.Version != parent.ConfigVersion+1 {
-		return SchedulingState{}, errors.New("REMOVE child configuration must increment version exactly once")
-	}
-	expected := removeIDCopy(parent.Members, removed)
-	if !sameMembers(expected, childConfig.Members) {
-		return SchedulingState{}, errors.New("REMOVE child configuration does not remove exactly the marked member")
-	}
-	if err := childConfig.Validate(); err != nil {
-		return SchedulingState{}, err
-	}
-	child := CloneSchedulingState(parent)
-	child.ConfigVersion = childConfig.Version
-	child.F = childConfig.F
-	child.Q = childConfig.Q
-	child.PVSSThreshold = childConfig.PVSSThreshold
-	child.ConfigDigest = childConfig.Digest()
-	child.Members = append([]p2p.NodeID(nil), childConfig.Members...)
-	child.SCL = removeIDCopy(child.SCL, removed)
-	child.RSQ = removeIDCopy(child.RSQ, removed)
-	delete(child.Seqs, removed)
 	return canonicalSchedulingState(child), nil
 }
 
@@ -113,10 +113,7 @@ func canonicalSchedulingState(in SchedulingState) SchedulingState {
 			filteredRSQ = append(filteredRSQ, member)
 		}
 	}
-	// A membership transition may reduce f. Retain only the newest entries
-	// allowed by the successor exclusion window; otherwise Members-RSQ can be
-	// empty even though n >= 3f+1. Keeping the suffix also commutes with a
-	// delayed old-configuration record, which appends the newest source.
+	// Retain only the newest entries allowed by the fixed exclusion window.
 	window := 2 * out.F
 	if window == 0 {
 		filteredRSQ = nil
@@ -128,9 +125,7 @@ func canonicalSchedulingState(in SchedulingState) SchedulingState {
 	return out
 }
 
-// eligibleSourceList is a canonical representation of the eligible set.
-// Deriving it from Members-RSQ makes a one-member JOIN commute with delivery
-// of an already-certified old-configuration beacon record.
+// eligibleSourceList is the canonical fixed-member set minus the recent queue.
 func eligibleSourceList(members, recent []p2p.NodeID) []p2p.NodeID {
 	eligible := make([]p2p.NodeID, 0, len(members))
 	for _, member := range normalizeMembers(members) {
@@ -149,20 +144,10 @@ func cloneSeqMap(in map[p2p.NodeID]uint64) map[p2p.NodeID]uint64 {
 	return out
 }
 
-func cloneMarkMap(in map[p2p.NodeID]RemovalMark) map[p2p.NodeID]RemovalMark {
-	out := make(map[p2p.NodeID]RemovalMark, len(in))
-	for id, mark := range in {
-		out[id] = mark
-	}
-	return out
-}
-
-func removeIDCopy(ids []p2p.NodeID, removed p2p.NodeID) []p2p.NodeID {
-	out := make([]p2p.NodeID, 0, len(ids))
-	for _, id := range ids {
-		if id != removed {
-			out = append(out, id)
-		}
+func cloneControlMap(in map[p2p.NodeID]string) map[p2p.NodeID]string {
+	out := make(map[p2p.NodeID]string, len(in))
+	for key, value := range in {
+		out[key] = value
 	}
 	return out
 }

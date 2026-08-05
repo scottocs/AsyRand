@@ -875,8 +875,11 @@ func EpochInstanceFor(configVersion, epoch uint64) string {
 	return fmt.Sprintf("aba/%d/control/epoch/%d", configVersion, epoch)
 }
 
-func JoinInstanceFor(configVersion uint64, joiner string) string {
-	return fmt.Sprintf("aba/%d/control/join/%s", configVersion, joiner)
+// TupleInstanceFor names the epoch-control ABA created while processing
+// (source, seq) in epoch originEpoch.  Its decision applies only to the next
+// tuple (source, seq+1).
+func TupleInstanceFor(configVersion, originEpoch uint64, source p2p.NodeID, seq uint64) string {
+	return fmt.Sprintf("aba/%d/control/tuple/%d/%s/%d", configVersion, originEpoch, source, seq)
 }
 
 func ConfigVersionFromInstance(instance string) (uint64, bool) {
@@ -897,16 +900,22 @@ func EpochFromInstance(instance string) (uint64, bool) {
 	return epoch, err == nil
 }
 
-func JoinerFromInstance(instance string) (string, bool) {
+// TupleFromInstance parses an epoch-control tuple instance.
+func TupleFromInstance(instance string) (originEpoch uint64, source p2p.NodeID, seq uint64, ok bool) {
 	parts := strings.Split(instance, "/")
-	if len(parts) == 2 && parts[0] == "join" && parts[1] != "" {
-		return parts[1], true
+	if len(parts) != 7 || parts[0] != "aba" || parts[2] != "control" ||
+		parts[3] != "tuple" || parts[5] == "" {
+		return 0, "", 0, false
 	}
-	if len(parts) == 5 && parts[0] == "aba" && parts[2] == "control" &&
-		parts[3] == "join" && parts[4] != "" {
-		return parts[4], true
+	originEpoch, err := strconv.ParseUint(parts[4], 10, 64)
+	if err != nil || originEpoch == 0 {
+		return 0, "", 0, false
 	}
-	return "", false
+	seq, err = strconv.ParseUint(parts[6], 10, 64)
+	if err != nil || seq == 0 {
+		return 0, "", 0, false
+	}
+	return originEpoch, p2p.NodeID(parts[5]), seq, true
 }
 
 func (a *Agreement) acceptsSender(sender p2p.NodeID) bool {

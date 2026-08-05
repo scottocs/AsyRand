@@ -17,22 +17,14 @@ import (
 const Protocol = "rbc"
 
 type ValueMessage struct {
-	ConfigVersion uint64            `json:"config_version"`
-	Purpose       string            `json:"purpose"`
-	Dealer        p2p.NodeID        `json:"dealer"`
-	Seq           uint64            `json:"seq"`
-	Value         []byte            `json:"value"`
-	Hash          string            `json:"hash"`
-	Signature     crypto.SignedVote `json:"signature"`
+	Value     []byte            `json:"value"`
+	Hash      string            `json:"hash"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type VoteMessage struct {
-	ConfigVersion uint64            `json:"config_version"`
-	Purpose       string            `json:"purpose"`
-	Dealer        p2p.NodeID        `json:"dealer"`
-	Seq           uint64            `json:"seq"`
-	Hash          string            `json:"hash"`
-	Signature     crypto.SignedVote `json:"signature"`
+	Hash      string            `json:"hash"`
+	Signature crypto.SignedVote `json:"signature"`
 }
 
 type DeliveryCertificate struct {
@@ -41,10 +33,8 @@ type DeliveryCertificate struct {
 	Instance         string                         `json:"instance"`
 	Hash             string                         `json:"hash"`
 	ReadyCertificate crypto.SignedQuorumCertificate `json:"ready_certificate,omitempty"`
-	// ReadySenders and ReadyVotes retain compatibility with unauthenticated
-	// instances and authenticated certificates persisted by older releases.
-	ReadySenders []p2p.NodeID        `json:"ready_senders,omitempty"`
-	ReadyVotes   []crypto.SignedVote `json:"ready_votes,omitempty"`
+	// ReadySenders is used only by the isolated unauthenticated test wrapper.
+	ReadySenders []p2p.NodeID `json:"ready_senders,omitempty"`
 }
 
 type Delivery struct {
@@ -58,17 +48,16 @@ type Delivery struct {
 }
 
 type Broadcaster struct {
-	ID                 p2p.NodeID
-	N                  int
-	F                  int
-	Transport          p2p.Transport
-	Version            uint64
-	Purpose            string
-	Members            map[p2p.NodeID]struct{}
-	PrivateKey         ed25519.PrivateKey
-	PublicKeys         map[string]ed25519.PublicKey
-	ExternalDealerKeys map[p2p.NodeID]ed25519.PublicKey
-	Authenticated      bool
+	ID            p2p.NodeID
+	N             int
+	F             int
+	Transport     p2p.Transport
+	Version       uint64
+	Purpose       string
+	Members       map[p2p.NodeID]struct{}
+	PrivateKey    ed25519.PrivateKey
+	PublicKeys    map[string]ed25519.PublicKey
+	Authenticated bool
 
 	mu         sync.Mutex
 	values     map[string]ValueMessage
@@ -78,7 +67,6 @@ type Broadcaster struct {
 	echoSent   map[string]bool
 	readySent  map[string]bool
 	delivered  map[string]bool
-	instances  map[string]VoteMessage
 	Deliveries chan Delivery
 }
 
@@ -143,9 +131,7 @@ func newBroadcaster(id p2p.NodeID, version uint64, purpose string, members map[p
 		readies: make(map[string]map[p2p.NodeID]bool), echoSent: make(map[string]bool),
 		readyVotes: make(map[string]map[p2p.NodeID]crypto.SignedVote),
 		readySent:  make(map[string]bool), delivered: make(map[string]bool),
-		instances:          make(map[string]VoteMessage),
-		ExternalDealerKeys: make(map[p2p.NodeID]ed25519.PublicKey),
-		Deliveries:         make(chan Delivery, n*4),
+		Deliveries: make(chan Delivery, n*4),
 	}
 }
 
@@ -157,6 +143,23 @@ func Instance(dealer p2p.NodeID, seq uint64, _ ...string) string {
 
 func InstanceFor(version uint64, purpose string, dealer p2p.NodeID, seq uint64) string {
 	return fmt.Sprintf("rbc/%d/%s/%s/%d", version, purpose, dealer, seq)
+}
+
+func parseInstance(instance string) (uint64, string, p2p.NodeID, uint64, bool) {
+	parts := strings.Split(instance, "/")
+	if len(parts) == 4 && parts[0] == "rbc" && parts[1] == "legacy" && parts[2] != "" {
+		seq, err := strconv.ParseUint(parts[3], 10, 64)
+		return 0, "legacy", p2p.NodeID(parts[2]), seq, err == nil
+	}
+	if len(parts) != 5 || parts[0] != "rbc" || parts[2] == "" || parts[3] == "" {
+		return 0, "", "", 0, false
+	}
+	version, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, "", "", 0, false
+	}
+	seq, err := strconv.ParseUint(parts[4], 10, 64)
+	return version, parts[2], p2p.NodeID(parts[3]), seq, err == nil
 }
 
 func ConfigVersionFromInstance(instance string) (uint64, bool) {
@@ -174,23 +177,6 @@ func PurposeFromInstance(instance string) (string, bool) {
 		return "", false
 	}
 	return parts[2], true
-}
-
-// ExternalValueMessage creates the only payload-carrying message sent by an
-// authenticated dealer outside the voting configuration.
-func ExternalValueMessage(version uint64, purpose string, dealer p2p.NodeID, seq uint64, value []byte, private ed25519.PrivateKey) (p2p.Message, error) {
-	if purpose == "" || dealer == "" || len(private) != ed25519.PrivateKeySize {
-		return p2p.Message{}, fmt.Errorf("invalid external RBC dealer context")
-	}
-	hash := Digest(value)
-	instance := InstanceFor(version, purpose, dealer, seq)
-	body := ValueMessage{ConfigVersion: version, Purpose: purpose, Dealer: dealer, Seq: seq, Value: value, Hash: hash}
-	var err error
-	body.Signature, err = crypto.SignTranscript(string(dealer), private, messageTranscript(version, purpose, "VAL", instance, hash))
-	if err != nil {
-		return p2p.Message{}, err
-	}
-	return p2p.NewMessage(Protocol, "VAL", instance, dealer, "", body)
 }
 
 func (b *Broadcaster) instance(dealer p2p.NodeID, seq uint64) string {
@@ -212,29 +198,6 @@ func (b *Broadcaster) acceptsSender(id p2p.NodeID) bool {
 	return ok
 }
 
-func (b *Broadcaster) RegisterExternalDealer(dealer p2p.NodeID, public ed25519.PublicKey) error {
-	if dealer == "" || len(public) != ed25519.PublicKeySize {
-		return fmt.Errorf("invalid external RBC dealer key")
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if existing := b.ExternalDealerKeys[dealer]; len(existing) > 0 && string(existing) != string(public) {
-		return fmt.Errorf("conflicting external RBC dealer key for %s", dealer)
-	}
-	b.ExternalDealerKeys[dealer] = append(ed25519.PublicKey(nil), public...)
-	return nil
-}
-
-func (b *Broadcaster) acceptsDealer(id p2p.NodeID) bool {
-	if b.acceptsSender(id) {
-		return true
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	_, ok := b.ExternalDealerKeys[id]
-	return ok
-}
-
 func (b *Broadcaster) PruneThrough(consumed map[p2p.NodeID]uint64) {
 	if len(consumed) == 0 {
 		return
@@ -242,36 +205,15 @@ func (b *Broadcaster) PruneThrough(consumed map[p2p.NodeID]uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	shouldPrune := func(instance string) bool {
-		meta, ok := b.instances[instance]
-		if !ok {
-			if val, exists := b.values[instance]; exists {
-				meta = VoteMessage{
-					ConfigVersion: val.ConfigVersion,
-					Purpose:       val.Purpose,
-					Dealer:        val.Dealer,
-					Seq:           val.Seq,
-					Hash:          val.Hash,
-				}
-				ok = true
-			}
-		}
+		version, purpose, dealer, seq, ok := parseInstance(instance)
 		if !ok {
 			return false
 		}
-		purpose := meta.Purpose
-		if b.Purpose == "legacy" && purpose == "" {
-			purpose = "legacy"
-		}
-		return meta.ConfigVersion == b.Version && purpose == b.Purpose && meta.Seq <= consumed[meta.Dealer]
+		return version == b.Version && purpose == b.Purpose && seq <= consumed[dealer]
 	}
 	pruned := make(map[string]bool)
 	for instance := range b.values {
 		pruned[instance] = shouldPrune(instance)
-	}
-	for instance := range b.instances {
-		if shouldPrune(instance) {
-			pruned[instance] = true
-		}
 	}
 	for instance := range b.values {
 		if pruned[instance] {
@@ -309,23 +251,16 @@ func (b *Broadcaster) PruneThrough(consumed map[p2p.NodeID]uint64) {
 	for instance := range b.delivered {
 		if pruned[instance] {
 			delete(b.delivered, instance)
-			delete(b.instances, instance)
 		}
 	}
 }
 
 func (b *Broadcaster) instancesByBucketLocked(bucket string) string {
-	if _, ok := b.instances[bucket]; ok {
-		return bucket
-	}
 	if _, ok := b.values[bucket]; ok {
 		return bucket
 	}
-	for instance := range b.instances {
-		prefix := instance + "/value/"
-		if len(bucket) >= len(prefix) && bucket[:len(prefix)] == prefix {
-			return instance
-		}
+	if index := strings.LastIndex(bucket, "/value/"); index > 0 {
+		return bucket[:index]
 	}
 	return ""
 }
@@ -337,7 +272,7 @@ func Digest(value []byte) string {
 func (b *Broadcaster) Broadcast(ctx context.Context, seq uint64, value []byte) error {
 	hash := Digest(value)
 	instance := b.instance(b.ID, seq)
-	body := ValueMessage{ConfigVersion: b.Version, Purpose: b.Purpose, Dealer: b.ID, Seq: seq, Value: value, Hash: hash}
+	body := ValueMessage{Value: value, Hash: hash}
 	var err error
 	if b.Authenticated {
 		body.Signature, err = crypto.SignTranscript(string(b.ID), b.PrivateKey, b.transcript("VAL", instance, hash))
@@ -359,16 +294,15 @@ func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
 		if err != nil {
 			return err
 		}
-		if !b.validMetadata(msg.Instance, val.ConfigVersion, val.Purpose, val.Dealer, val.Seq) ||
-			msg.From != val.Dealer || !b.acceptsDealer(msg.From) || Digest(val.Value) != val.Hash ||
+		_, _, dealer, seq, valid := b.validMetadata(msg.Instance)
+		if !valid || msg.From != dealer || !b.acceptsSender(msg.From) || Digest(val.Value) != val.Hash ||
 			!b.verifyMessageSignature("VAL", msg.Instance, val.Hash, msg.From, val.Signature) {
 			return nil
 		}
-		k := b.instance(val.Dealer, val.Seq)
+		k := b.instance(dealer, seq)
 		var deliver Delivery
 		var shouldDeliver bool
 		b.mu.Lock()
-		b.instances[k] = VoteMessage{ConfigVersion: val.ConfigVersion, Purpose: val.Purpose, Dealer: val.Dealer, Seq: val.Seq, Hash: val.Hash}
 		if _, ok := b.values[k]; !ok {
 			b.values[k] = val
 		}
@@ -377,7 +311,7 @@ func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
 		deliver, shouldDeliver = b.deliveryIfReadyLocked(k)
 		b.mu.Unlock()
 		if !already {
-			if err := b.broadcastVote(ctx, "ECHO", val.Dealer, val.Seq, val.Hash); err != nil {
+			if err := b.broadcastVote(ctx, "ECHO", dealer, seq, val.Hash); err != nil {
 				return err
 			}
 		}
@@ -428,8 +362,8 @@ func (b *Broadcaster) deliveryIfReadyLocked(k string) (Delivery, bool) {
 		}
 	}
 	cert := DeliveryCertificate{
-		ConfigVersion: val.ConfigVersion,
-		Purpose:       val.Purpose,
+		ConfigVersion: b.Version,
+		Purpose:       b.Purpose,
 		Instance:      k,
 		Hash:          val.Hash,
 	}
@@ -450,11 +384,15 @@ func (b *Broadcaster) deliveryIfReadyLocked(k string) (Delivery, bool) {
 		cert.ReadySenders = append([]p2p.NodeID(nil), senders...)
 	}
 	b.delivered[k] = true
+	_, _, dealer, seq, ok := parseInstance(k)
+	if !ok {
+		return Delivery{}, false
+	}
 	return Delivery{
-		ConfigVersion: val.ConfigVersion,
-		Purpose:       val.Purpose,
-		Dealer:        val.Dealer,
-		Seq:           val.Seq,
+		ConfigVersion: b.Version,
+		Purpose:       b.Purpose,
+		Dealer:        dealer,
+		Seq:           seq,
 		Value:         val.Value,
 		Hash:          val.Hash,
 		Certificate:   cert,
@@ -463,7 +401,7 @@ func (b *Broadcaster) deliveryIfReadyLocked(k string) (Delivery, bool) {
 
 func (b *Broadcaster) broadcastVote(ctx context.Context, typ string, dealer p2p.NodeID, seq uint64, hash string) error {
 	instance := b.instance(dealer, seq)
-	body := VoteMessage{ConfigVersion: b.Version, Purpose: b.Purpose, Dealer: dealer, Seq: seq, Hash: hash}
+	body := VoteMessage{Hash: hash}
 	var err error
 	if b.Authenticated {
 		body.Signature, err = crypto.SignTranscript(string(b.ID), b.PrivateKey, b.transcript(typ, instance, hash))
@@ -479,16 +417,16 @@ func (b *Broadcaster) broadcastVote(ctx context.Context, typ string, dealer p2p.
 }
 
 func (b *Broadcaster) observe(ctx context.Context, kind string, vote VoteMessage, from p2p.NodeID, wireInstance string) {
-	if !b.validMetadata(wireInstance, vote.ConfigVersion, vote.Purpose, vote.Dealer, vote.Seq) {
+	_, _, dealer, seq, valid := b.validMetadata(wireInstance)
+	if !valid {
 		return
 	}
 	if !b.verifyMessageSignature(strings.ToUpper(kind), wireInstance, vote.Hash, from, vote.Signature) {
 		return
 	}
-	k := b.instance(vote.Dealer, vote.Seq)
+	k := b.instance(dealer, seq)
 	bucket := voteBucket(k, vote.Hash)
 	b.mu.Lock()
-	b.instances[k] = vote
 	if b.echoes[bucket] == nil {
 		b.echoes[bucket] = make(map[p2p.NodeID]bool)
 	}
@@ -516,7 +454,7 @@ func (b *Broadcaster) observe(ctx context.Context, kind string, vote VoteMessage
 	b.mu.Unlock()
 
 	if needReady {
-		_ = b.broadcastVote(ctx, "READY", vote.Dealer, vote.Seq, vote.Hash)
+		_ = b.broadcastVote(ctx, "READY", dealer, seq, vote.Hash)
 	}
 	if shouldDeliver {
 		b.Deliveries <- deliver
@@ -527,14 +465,12 @@ func (b *Broadcaster) quorum() int {
 	return b.N - b.F
 }
 
-func (b *Broadcaster) validMetadata(wireInstance string, version uint64, purpose string, dealer p2p.NodeID, seq uint64) bool {
-	if b.Purpose == "legacy" && purpose == "" {
-		purpose = "legacy"
+func (b *Broadcaster) validMetadata(wireInstance string) (uint64, string, p2p.NodeID, uint64, bool) {
+	version, purpose, dealer, seq, ok := parseInstance(wireInstance)
+	if !ok || version != b.Version || purpose != b.Purpose || wireInstance != b.instance(dealer, seq) {
+		return 0, "", "", 0, false
 	}
-	if version != b.Version || purpose != b.Purpose || dealer == "" {
-		return false
-	}
-	return wireInstance == b.instance(dealer, seq)
+	return version, purpose, dealer, seq, true
 }
 
 func (b *Broadcaster) VerifyDeliveryCertificate(cert DeliveryCertificate) error {
@@ -551,7 +487,7 @@ func (b *Broadcaster) VerifyDeliveryCertificate(cert DeliveryCertificate) error 
 	}
 	compact := len(cert.ReadyCertificate.SignerBitmap) > 0 || len(cert.ReadyCertificate.Signatures) > 0
 	if b.Authenticated && compact {
-		if len(cert.ReadySenders) != 0 || len(cert.ReadyVotes) != 0 {
+		if len(cert.ReadySenders) != 0 {
 			return fmt.Errorf("compact RBC delivery certificate contains legacy READY fields")
 		}
 		if err := crypto.VerifySignedQuorumCertificate(
@@ -579,48 +515,9 @@ func (b *Broadcaster) VerifyDeliveryCertificate(cert DeliveryCertificate) error 
 		seen[sender] = struct{}{}
 	}
 	if b.Authenticated {
-		voters := make(map[p2p.NodeID]struct{}, len(cert.ReadyVotes))
-		for _, vote := range cert.ReadyVotes {
-			if err := crypto.VerifySignedVote(vote, b.PublicKeys, b.transcript("READY", cert.Instance, cert.Hash)); err != nil {
-				return fmt.Errorf("invalid RBC READY vote: %w", err)
-			}
-			voter := p2p.NodeID(vote.Signer)
-			if _, claimed := seen[voter]; !claimed {
-				return fmt.Errorf("signed RBC READY voter %s is not listed", voter)
-			}
-			if _, duplicate := voters[voter]; duplicate {
-				return fmt.Errorf("duplicate signed RBC READY voter %s", voter)
-			}
-			voters[voter] = struct{}{}
-		}
-		if len(voters) < b.quorum() || len(voters) != len(seen) {
-			return fmt.Errorf("RBC delivery certificate signed/listed READY sets differ")
-		}
+		return fmt.Errorf("authenticated RBC certificate requires compact READY signatures")
 	}
 	return nil
-}
-
-// VerifyDeliveryCertificate verifies a compact RBC certificate without
-// constructing a participating RBC engine. It is used by a learner that is
-// still outside the certificate's voting configuration.
-func VerifyDeliveryCertificate(version uint64, purpose string, members []p2p.NodeID, f int, publicKeys map[string]ed25519.PublicKey, cert DeliveryCertificate) error {
-	if len(members) < 3*f+1 {
-		return fmt.Errorf("invalid RBC verifier configuration")
-	}
-	memberSet := make(map[p2p.NodeID]struct{}, len(members))
-	for _, member := range members {
-		memberSet[member] = struct{}{}
-	}
-	verifier := &Broadcaster{
-		N:             len(members),
-		F:             f,
-		Version:       version,
-		Purpose:       purpose,
-		Members:       memberSet,
-		PublicKeys:    publicKeys,
-		Authenticated: true,
-	}
-	return verifier.VerifyDeliveryCertificate(cert)
 }
 
 func (b *Broadcaster) transcript(kind, instance, hash string) []byte {
@@ -645,14 +542,5 @@ func (b *Broadcaster) verifyMessageSignature(kind, instance, hash string, sender
 	if signature.Signer != string(sender) {
 		return false
 	}
-	keys := b.PublicKeys
-	if kind == "VAL" {
-		if _, member := b.Members[sender]; !member {
-			b.mu.Lock()
-			public := append(ed25519.PublicKey(nil), b.ExternalDealerKeys[sender]...)
-			b.mu.Unlock()
-			keys = map[string]ed25519.PublicKey{string(sender): public}
-		}
-	}
-	return crypto.VerifySignedVote(signature, keys, b.transcript(kind, instance, hash)) == nil
+	return crypto.VerifySignedVote(signature, b.PublicKeys, b.transcript(kind, instance, hash)) == nil
 }
