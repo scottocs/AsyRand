@@ -1,249 +1,233 @@
+// Package rbc implements digest Bracha broadcast with transferable READY proofs.
+// Application payloads must be validated before passing VAL/REPLY to Handle.
 package rbc
 
 import (
-	"context"
-	"encoding/hex"
-	"fmt"
-	"sync"
-
-	"Tyche/asyrand/crypto"
 	"Tyche/utils/p2p"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
 )
 
-const Protocol = "rbc"
+const Protocol = "asyrand/rbc/v1"
 
-type ValueMessage struct {
-	Dealer p2p.NodeID `json:"dealer"`
-	Seq    uint64     `json:"seq"`
-	Value  []byte     `json:"value"`
-	Hash   string     `json:"hash"`
+type Signature struct {
+	Signer    p2p.NodeID `json:"signer"`
+	Signature string     `json:"signature"`
 }
-
-type RequestMessage struct {
-	Dealer p2p.NodeID `json:"dealer"`
-	Seq    uint64     `json:"seq"`
-	Hash   string     `json:"hash"`
+type Certificate struct {
+	Context    string      `json:"context"`
+	Dealer     p2p.NodeID  `json:"dealer"`
+	Seq        uint64      `json:"seq"`
+	Hash       string      `json:"hash"`
+	Signatures []Signature `json:"signatures"`
 }
-
-type VoteMessage struct {
-	Dealer p2p.NodeID `json:"dealer"`
-	Seq    uint64     `json:"seq"`
-	Hash   string     `json:"hash"`
+type Packet struct {
+	Context     string       `json:"context"`
+	Dealer      p2p.NodeID   `json:"dealer"`
+	Seq         uint64       `json:"seq"`
+	Hash        string       `json:"hash"`
+	Value       []byte       `json:"value,omitempty"`
+	Certificate *Certificate `json:"certificate,omitempty"`
+	Signature   string       `json:"signature"`
 }
-
 type Delivery struct {
-	Dealer p2p.NodeID
-	Seq    uint64
-	Value  []byte
-	Hash   string
+	Dealer      p2p.NodeID
+	Seq         uint64
+	Hash        string
+	Value       []byte
+	Certificate Certificate
 }
-
+type Config struct {
+	ID      p2p.NodeID
+	F       int
+	Members []p2p.NodeID
+	Context string
+	Private ed25519.PrivateKey
+	Public  map[string]ed25519.PublicKey
+}
+type valueState struct {
+	value           []byte
+	echoes, readies map[p2p.NodeID]string
+	delivered       bool
+}
+type instance struct {
+	values              map[string]*valueState
+	echo, ready         string
+	seenEcho, seenReady map[p2p.NodeID]string
+}
 type Broadcaster struct {
-	ID        p2p.NodeID
-	N         int
-	F         int
-	Transport p2p.Transport
-
-	mu         sync.Mutex
-	values     map[string]ValueMessage
-	hasValue   map[string]bool
-	echoes     map[string]map[p2p.NodeID]bool
-	readies    map[string]map[p2p.NodeID]bool
-	echoSent   map[string]bool
-	readySent  map[string]bool
-	delivered  map[string]bool
-	requested  map[string]map[p2p.NodeID]bool
-	Deliveries chan Delivery
+	cfg    Config
+	states map[string]*instance
 }
 
-func New(id p2p.NodeID, n, f int, transport p2p.Transport) *Broadcaster {
-	return &Broadcaster{
-		ID: id, N: n, F: f, Transport: transport,
-		values: make(map[string]ValueMessage), hasValue: make(map[string]bool), echoes: make(map[string]map[p2p.NodeID]bool),
-		readies: make(map[string]map[p2p.NodeID]bool), echoSent: make(map[string]bool),
-		readySent: make(map[string]bool), delivered: make(map[string]bool), requested: make(map[string]map[p2p.NodeID]bool),
-		Deliveries: make(chan Delivery, n*4),
+func New(cfg Config) *Broadcaster              { return &Broadcaster{cfg: cfg, states: make(map[string]*instance)} }
+func Key(dealer p2p.NodeID, seq uint64) string { return fmt.Sprintf("%s/%d", dealer, seq) }
+func Hash(value []byte) string                 { h := sha256.Sum256(value); return hex.EncodeToString(h[:]) }
+func statement(typ string, from p2p.NodeID, p Packet) []byte {
+	b, _ := json.Marshal(struct {
+		Domain, Context, Type string
+		From, Dealer          p2p.NodeID
+		Seq                   uint64
+		Hash                  string
+	}{Protocol, p.Context, typ, from, p.Dealer, p.Seq, p.Hash})
+	return b
+}
+func Authenticate(context string, public map[string]ed25519.PublicKey, msg p2p.Message) (Packet, bool) {
+	p, err := p2p.DecodePayload[Packet](msg)
+	pub := public[string(msg.From)]
+	sig, err2 := hex.DecodeString(p.Signature)
+	ok := err == nil && err2 == nil && len(pub) == 32 && msg.Protocol == Protocol && p.Context == context && p.Seq > 0 && public[string(p.Dealer)] != nil && msg.Instance == Key(p.Dealer, p.Seq) && len(p.Hash) == 64 && ed25519.Verify(pub, statement(msg.Type, msg.From, p), sig)
+	if msg.Type == "VAL" {
+		ok = ok && msg.From == p.Dealer
 	}
-}
-
-func key(dealer p2p.NodeID, seq uint64, hash string) string {
-	return fmt.Sprintf("%s/%d/%s", dealer, seq, hash)
-}
-
-func (b *Broadcaster) Broadcast(ctx context.Context, seq uint64, value []byte) error {
-	hash := hex.EncodeToString(crypto.HashBytes(value))
-	k := key(b.ID, seq, hash)
-	val := ValueMessage{Dealer: b.ID, Seq: seq, Value: append([]byte(nil), value...), Hash: hash}
-	b.mu.Lock()
-	if _, ok := b.values[k]; !ok {
-		b.values[k] = val
+	switch msg.Type {
+	case "VAL", "REPLY":
+		ok = ok && Hash(p.Value) == p.Hash
+	case "ECHO", "READY", "REQUEST":
+	default:
+		ok = false
 	}
-	b.hasValue[k] = true
-	b.mu.Unlock()
-	msg, err := p2p.NewMessage(Protocol, "VAL", k, b.ID, "", val)
-	if err != nil {
-		return err
+	return p, ok
+}
+func VerifyCertificate(context string, public map[string]ed25519.PublicKey, f int, c Certificate) bool {
+	if c.Context != context || c.Seq == 0 || public[string(c.Dealer)] == nil || len(c.Signatures) < len(public)-f || len(c.Signatures) > len(public) || len(c.Hash) != 64 {
+		return false
 	}
-	return b.Transport.Broadcast(ctx, msg)
+	p := Packet{Context: c.Context, Dealer: c.Dealer, Seq: c.Seq, Hash: c.Hash}
+	for i, s := range c.Signatures {
+		pub := public[string(s.Signer)]
+		sig, err := hex.DecodeString(s.Signature)
+		if (i > 0 && c.Signatures[i-1].Signer >= s.Signer) || err != nil || len(pub) != 32 || !ed25519.Verify(pub, statement("READY", s.Signer, p), sig) {
+			return false
+		}
+	}
+	return true
+}
+func (b *Broadcaster) message(typ string, to p2p.NodeID, p Packet) p2p.Message {
+	p.Context = b.cfg.Context
+	p.Signature = hex.EncodeToString(ed25519.Sign(b.cfg.Private, statement(typ, b.cfg.ID, p)))
+	m, _ := p2p.NewMessage(Protocol, typ, Key(p.Dealer, p.Seq), b.cfg.ID, to, p)
+	return m
+}
+func (b *Broadcaster) Broadcast(seq uint64, value []byte) []p2p.Message {
+	return []p2p.Message{b.message("VAL", "", Packet{Dealer: b.cfg.ID, Seq: seq, Hash: Hash(value), Value: value})}
+}
+func (b *Broadcaster) Request(dealer p2p.NodeID, seq uint64, hash string) p2p.Message {
+	return b.message("REQUEST", "", Packet{Dealer: dealer, Seq: seq, Hash: hash})
+}
+func (b *Broadcaster) state(p Packet) (*instance, *valueState) {
+	key := Key(p.Dealer, p.Seq)
+	i := b.states[key]
+	if i == nil {
+		i = &instance{values: make(map[string]*valueState), seenEcho: make(map[p2p.NodeID]string), seenReady: make(map[p2p.NodeID]string)}
+		b.states[key] = i
+	}
+	v := i.values[p.Hash]
+	if v == nil {
+		v = &valueState{echoes: make(map[p2p.NodeID]string), readies: make(map[p2p.NodeID]string)}
+		i.values[p.Hash] = v
+	}
+	return i, v
 }
 
-func (b *Broadcaster) Handle(ctx context.Context, msg p2p.Message) error {
+// Admit avoids allocating a new hash state for equivocations or unsolicited
+// payload replies. A full valid READY certificate can always recover a value.
+func (b *Broadcaster) Admit(msg p2p.Message, p Packet) bool {
+	i := b.states[Key(p.Dealer, p.Seq)]
+	if i == nil {
+		return msg.Type == "VAL" || msg.Type == "ECHO" || msg.Type == "READY" || (msg.Type == "REPLY" && p.Certificate != nil && VerifyCertificate(b.cfg.Context, b.cfg.Public, b.cfg.F, *p.Certificate))
+	}
 	switch msg.Type {
 	case "VAL":
-		val, err := p2p.DecodePayload[ValueMessage](msg)
-		if err != nil {
-			return err
-		}
-		return b.acceptValue(ctx, val)
-	case "REQ":
-		req, err := p2p.DecodePayload[RequestMessage](msg)
-		if err != nil {
-			return err
-		}
-		return b.sendValue(ctx, msg.From, req.Dealer, req.Seq, req.Hash)
-	case "DATA":
-		val, err := p2p.DecodePayload[ValueMessage](msg)
-		if err != nil {
-			return err
-		}
-		return b.acceptValue(ctx, val)
+		return i.echo == "" || i.echo == p.Hash
 	case "ECHO":
-		vote, err := p2p.DecodePayload[VoteMessage](msg)
-		if err != nil {
-			return err
-		}
-		b.observe(ctx, "echo", vote, msg.From)
+		old, ok := i.seenEcho[msg.From]
+		return !ok || old == p.Hash
 	case "READY":
-		vote, err := p2p.DecodePayload[VoteMessage](msg)
-		if err != nil {
-			return err
+		old, ok := i.seenReady[msg.From]
+		return !ok || old == p.Hash
+	case "REQUEST":
+		return i.values[p.Hash] != nil
+	case "REPLY":
+		return i.values[p.Hash] != nil || (p.Certificate != nil && VerifyCertificate(b.cfg.Context, b.cfg.Public, b.cfg.F, *p.Certificate))
+	}
+	return false
+}
+
+// Handle counts at most one local ECHO and READY per dealer/sequence.
+func (b *Broadcaster) Handle(msg p2p.Message, p Packet) ([]p2p.Message, []Delivery) {
+	if !b.Admit(msg, p) {
+		return nil, nil
+	}
+	i, v := b.state(p)
+	var out []p2p.Message
+	var deliveries []Delivery
+	switch msg.Type {
+	case "VAL", "REPLY":
+		v.value = append([]byte(nil), p.Value...)
+		if msg.Type == "VAL" && i.echo == "" {
+			i.echo = p.Hash
+			m := b.message("ECHO", "", pVote(p))
+			x, _ := p2p.DecodePayload[Packet](m)
+			v.echoes[b.cfg.ID] = x.Signature
+			out = append(out, m)
 		}
-		b.observe(ctx, "ready", vote, msg.From)
+		if p.Certificate != nil && VerifyCertificate(b.cfg.Context, b.cfg.Public, b.cfg.F, *p.Certificate) && p.Certificate.Hash == p.Hash && p.Certificate.Dealer == p.Dealer && p.Certificate.Seq == p.Seq {
+			for _, s := range p.Certificate.Signatures {
+				v.readies[s.Signer] = s.Signature
+			}
+		}
+	case "ECHO":
+		if old, ok := i.seenEcho[msg.From]; !ok || old == p.Hash {
+			i.seenEcho[msg.From] = p.Hash
+			v.echoes[msg.From] = p.Signature
+		}
+	case "READY":
+		if old, ok := i.seenReady[msg.From]; !ok || old == p.Hash {
+			i.seenReady[msg.From] = p.Hash
+			v.readies[msg.From] = p.Signature
+		}
+	case "REQUEST":
+		if v.value != nil {
+			reply := pVote(p)
+			reply.Value = v.value
+			if len(v.readies) >= len(b.cfg.Members)-b.cfg.F {
+				c := b.certificate(p, v)
+				reply.Certificate = &c
+			}
+			out = append(out, b.message("REPLY", msg.From, reply))
+		}
+		return out, nil
 	}
-	return nil
-}
-
-func (b *Broadcaster) RequestValue(ctx context.Context, dealer p2p.NodeID, seq uint64, hash string, to p2p.NodeID) error {
-	return b.requestValue(ctx, dealer, seq, hash, to)
-}
-
-func (b *Broadcaster) requestValue(ctx context.Context, dealer p2p.NodeID, seq uint64, hash string, to p2p.NodeID) error {
-	if hash == "" || to == "" {
-		return nil
-	}
-	k := key(dealer, seq, hash)
-	b.mu.Lock()
-	if b.hasValue[k] {
-		b.mu.Unlock()
-		return nil
-	}
-	if b.requested[k] == nil {
-		b.requested[k] = make(map[p2p.NodeID]bool)
-	}
-	if b.requested[k][to] {
-		b.mu.Unlock()
-		return nil
-	}
-	b.requested[k][to] = true
-	b.mu.Unlock()
-	msg, err := p2p.NewMessage(Protocol, "REQ", k, b.ID, to, RequestMessage{Dealer: dealer, Seq: seq, Hash: hash})
-	if err != nil {
-		return err
-	}
-	return b.Transport.Send(ctx, to, msg)
-}
-
-func (b *Broadcaster) sendValue(ctx context.Context, to p2p.NodeID, dealer p2p.NodeID, seq uint64, hash string) error {
-	k := key(dealer, seq, hash)
-	b.mu.Lock()
-	val := b.values[k]
-	hasValue := b.hasValue[k]
-	b.mu.Unlock()
-	if !hasValue || val.Hash != hash {
-		return nil
-	}
-	msg, err := p2p.NewMessage(Protocol, "DATA", k, b.ID, to, val)
-	if err != nil {
-		return err
-	}
-	return b.Transport.Send(ctx, to, msg)
-}
-
-func (b *Broadcaster) acceptValue(ctx context.Context, val ValueMessage) error {
-	if val.Hash == "" || val.Value == nil || hex.EncodeToString(crypto.HashBytes(val.Value)) != val.Hash {
-		return nil
-	}
-	k := key(val.Dealer, val.Seq, val.Hash)
-	var deliver Delivery
-	b.mu.Lock()
-	if _, ok := b.values[k]; !ok {
-		b.values[k] = val
-	}
-	b.hasValue[k] = true
-	alreadyEcho := b.echoSent[k]
-	b.echoSent[k] = true
-	shouldDeliver := !b.delivered[k] && b.hasValue[k] && len(b.readies[k]) >= 2*b.F+1
-	if shouldDeliver {
-		b.delivered[k] = true
-		deliver = Delivery{Dealer: val.Dealer, Seq: val.Seq, Value: val.Value, Hash: val.Hash}
-	}
-	b.mu.Unlock()
-
-	if !alreadyEcho {
-		if err := b.broadcastVote(ctx, "ECHO", val.Dealer, val.Seq, val.Hash); err != nil {
-			return err
+	if i.ready == "" && (len(v.echoes) >= len(b.cfg.Members)-b.cfg.F || len(v.readies) >= b.cfg.F+1) {
+		i.ready = p.Hash
+		m := b.message("READY", "", pVote(p))
+		x, _ := p2p.DecodePayload[Packet](m)
+		v.readies[b.cfg.ID] = x.Signature
+		out = append(out, m)
+		if v.value == nil {
+			out = append(out, b.Request(p.Dealer, p.Seq, p.Hash))
 		}
 	}
-	if deliver.Hash != "" {
-		b.Deliveries <- deliver
+	if !v.delivered && v.value != nil && len(v.readies) >= len(b.cfg.Members)-b.cfg.F {
+		v.delivered = true
+		deliveries = append(deliveries, Delivery{p.Dealer, p.Seq, p.Hash, v.value, b.certificate(p, v)})
 	}
-	return nil
+	return out, deliveries
 }
-
-func (b *Broadcaster) broadcastVote(ctx context.Context, typ string, dealer p2p.NodeID, seq uint64, hash string) error {
-	msg, err := p2p.NewMessage(Protocol, typ, key(dealer, seq, hash), b.ID, "", VoteMessage{Dealer: dealer, Seq: seq, Hash: hash})
-	if err != nil {
-		return err
-	}
-	return b.Transport.Broadcast(ctx, msg)
+func pVote(p Packet) Packet {
+	return Packet{Context: p.Context, Dealer: p.Dealer, Seq: p.Seq, Hash: p.Hash}
 }
-
-func (b *Broadcaster) observe(ctx context.Context, kind string, vote VoteMessage, from p2p.NodeID) {
-	k := key(vote.Dealer, vote.Seq, vote.Hash)
-	b.mu.Lock()
-	if b.echoes[k] == nil {
-		b.echoes[k] = make(map[p2p.NodeID]bool)
+func (b *Broadcaster) certificate(p Packet, v *valueState) Certificate {
+	c := Certificate{Context: b.cfg.Context, Dealer: p.Dealer, Seq: p.Seq, Hash: p.Hash}
+	for id, sig := range v.readies {
+		c.Signatures = append(c.Signatures, Signature{id, sig})
 	}
-	if b.readies[k] == nil {
-		b.readies[k] = make(map[p2p.NodeID]bool)
-	}
-	if kind == "echo" {
-		b.echoes[k][from] = true
-	} else {
-		b.readies[k][from] = true
-	}
-	echoCount := len(b.echoes[k])
-	readyCount := len(b.readies[k])
-	needReady := !b.readySent[k] && (echoCount >= 2*b.F+1 || readyCount >= b.F+1)
-	if needReady {
-		b.readySent[k] = true
-	}
-	deliver := !b.delivered[k] && readyCount >= 2*b.F+1
-	val := b.values[k]
-	if deliver && b.hasValue[k] {
-		b.delivered[k] = true
-	} else {
-		deliver = false
-	}
-	needValue := !b.hasValue[k]
-	b.mu.Unlock()
-	if needValue && kind == "ready" {
-		_ = b.requestValue(ctx, vote.Dealer, vote.Seq, vote.Hash, from)
-	}
-	if needReady {
-		_ = b.broadcastVote(ctx, "READY", vote.Dealer, vote.Seq, vote.Hash)
-	}
-	if deliver {
-		b.Deliveries <- Delivery{Dealer: val.Dealer, Seq: val.Seq, Value: val.Value, Hash: val.Hash}
-	}
+	sort.Slice(c.Signatures, func(i, j int) bool { return c.Signatures[i].Signer < c.Signatures[j].Signer })
+	c.Signatures = c.Signatures[:len(b.cfg.Members)-b.cfg.F]
+	return c
 }

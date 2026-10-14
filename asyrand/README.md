@@ -1,117 +1,303 @@
-# AsyRand Go Implementation
+# AsyRand implementation
 
-This directory contains the Go implementation of AsyRand v1.
+This module implements the individual-object AsyRand construction in
+`paper/Asyrand.tex`. The previous copied SPURT command/state machine has been
+replaced. The current wire/config version is `asyrand-v2`: it follows the
+shared-column Producer and BEACON-only Consumer history. Version 1 archives
+and mixed-version peers cannot be reused under this version. It uses contextual DDH SCRAPE PVSS and local-coin Quadratic-ABA;
+beacon generation has no external common-coin service.
 
-The code is organized around the protocol components in the paper: producer, consumer, source selection, PVSS commitments, RBC dissemination, reconstruction, and BLS beacon certification.
-
-## Directory Layout
-
-- `cmd/asyrand`: command-line runner for local memory clusters and TCP deployments.
-- `protocol`: AsyRand v1 state machine, producer, consumer, source removal, queue state, and performance counters.
-- `protocol/rbc`: Bracha reliable broadcast used by the producer to disseminate PVSS commitments.
-- `crypto`: PVSS commitment generation, decryption proofs, threshold reconstruction, Ed25519 signatures, BLS signatures, BLS aggregation, and hashing.
-- `../utils/p2p`: shared memory and TCP transports with message and bandwidth metrics.
-- `config`: JSON configuration loading, key derivation, and peer address construction.
-
-## Protocol Flow
-
-1. Every node continuously acts as a producer.
-2. A producer creates PVSS commitments and broadcasts each commitment with RBC.
-3. Delivered commitments are stored in `ComQ[i][seq]`, where `i` is the producer/source member index.
-4. Each epoch deterministically selects a passive `source` from the source candidate list.
-5. If the selected source has a consumable head commitment, the consumer pops it and runs `RECON -> ECHO -> READY`.
-6. READY votes are BLS signature shares. A threshold set is aggregated into the beacon certificate.
-7. If the selected source has no consumable commitment, it is removed from the candidate set.
-
-## Requirements
-
-- Go 1.24 or newer, as declared in `go.mod`.
-- Network access is only needed if dependencies are not already available in the module cache.
-
-For sandboxed environments where the default Go cache is not writable, set `GOCACHE` explicitly:
-
-```sh
-export GOCACHE=/private/tmp/asyrand-go-cache
-```
-
-## Test
+## Run
 
 ```sh
 cd asyrand
-GOSUMDB=off go test ./...
+go run ./cmd/asyrand -config configs/local_4.json
+go run ./cmd/asyrand -config configs/local_8.json
 ```
 
-The TCP transport test binds a local `127.0.0.1` port. If your sandbox blocks local socket binding, run the same command in an environment that allows local TCP listeners.
+The default local deployment starts the complete committee in one process
+using `../utils/p2p` memory transports. Each logged output has matching beacon
+records at every local node. Timeouts abort the run and do not produce skipped
+beacons. `-duration 60s` is a run watchdog, not a consensus timeout.
 
-## Run A Local Cluster
+TCP supports either one local process holding the committee or one process per
+member, with the existing `cluster_ips`, `peers_p2p_port` and `node_key_seed`
+layout:
+
+```sh
+go run ./cmd/asyrand -config configs/local_4.json -transport tcp
+go run ./cmd/asyrand -config configs/aws_8.json -node node0
+```
+
+Use the same public committee, fault bound, session identifier and consumption
+mode at every peer. Choose a fresh common `session_id` for each independent
+run. Production deployments must provision each member's private keys privately;
+the existing JSON templates deliberately contain all deterministic test seeds.
+The current archive is in memory; stopping and restarting with the same session
+requires persistent producer reservations and signed history, which this runner
+does not implement.
+
+## Parameters
+
+All parameters are defined in `config/config.go`:
+
+| JSON field | Meaning |
+| --- | --- |
+| `cluster_index`, `node_key_seed` | Ordered committee and test key material |
+| `f` | Static Byzantine fault bound; requires `n > 3f` |
+| `production_window` | Producer window W; minimum 2, default 8 |
+| `parallel_consumption` | First-f-output overlap variant; JSON default true; explicit false selects standard mode |
+| `session_id` | Common authenticated run context |
+| `round`, `warmup_outputs` | Measured target and excluded warm-up output count |
+| `max_pool` | Crypto workers per member |
+| `transport`, `transport_buffer` | Memory/TCP deployment and inbox capacity |
+| `prefill_ms` | Producer prefill before enabling local consumers |
+| `epoch_timeout_ms`, `linger_ms` | Runner watchdog and final TCP service time |
+| `send_retry_ms`, `recovery_interval_ms` | Channel retries and initial passive recovery polling delay |
+| `aba_future_round_window` | Bounded ABA future-round admission; default 8 |
+| `history_batch_size` | Maximum entries per history pull; default 8 |
+
+The certificate quorum is `n-f`, the reconstruction threshold is `f+1`, and
+RSQ capacity is `f+1`; these are derived parameters. `production_window` is
+separate from the per-round ABA admission window. Genesis randomness is derived
+from the verified first-column record and the public context, rather than a
+fixed configuration seed. The old `aggregation_lookahead` has been replaced by
+`production_window`.
+
+## Protocol and public verification
+
+- Producers reserve a sequence once, sample fresh PVSS objects, and broadcast
+  at most the positions p_i <= k+W-1, using the shared consumption column k. Every ready object has a verified PVSS
+  transcript and an `n-f`-signature RBC READY certificate.
+- Each column uses a certified whole-column ABA. A zero decision enables one
+  object ABA per source. Input zero is gated by `n-f` certified one decisions;
+  the final column retains **all** object decisions, including rejections.
+- The default parallel consumer starts the successor ABA in the background,
+  uniformly omits the next-column hash for its first f outputs, and applies the
+  complete-successor barrier before output f+1's share. Standard mode applies
+  that barrier before the first output.
+- Selection uses sorted eligible sources and a persistent RSQ across columns.
+  Every output verifies f+1 distinct decryption proofs and
+  directly installs the resulting record and witness. Exhausting the accepted
+  set advances k and U in that same transition; no CLOSE record is appended.
+- Full column/history/ABA evidence is retained and served on request. Records
+  and witnesses are assembled locally without an output-vote phase. An early
+  witness receiver still emits its own RECON before installation. Future ABA
+  packets beyond the admission window are recovered
+  from authenticated sender archives; they do not allocate unbounded rounds.
+  A future RECON can trigger one immediate predecessor pull when column
+  prerequisites are missing; a stalled native reconstruction uses periodic
+  recovery. Membership requests cover faulty or unavailable responders.
+  Repeated recovery within an unchanged epoch uses exponential backoff capped
+  at max(4s, the configured base interval); output progress resets the delay.
+  SYNC serves retained core messages without triggering an additional
+  membership-wide certificate query. Timers only retrieve evidence.
+- State updates and signing run on one actor. Expensive crypto callbacks recheck
+  the captured epoch/history/selection before changing state. ABA handlers stay
+  available after decision for entered-round relay and certificate recovery.
+
+`protocol.NewVerifier`, `AddColumn`, `Initialize`, `CheckEntry`, `Apply` and
+`VerifyHistory` need public keys only. Verification replays genesis, decisions,
+RBC delivery, PVSS, selection/RSQ, reconstruction and implicit column advancement. Its
+cache avoids repeating PVSS checks for the same immutable object. Use
+`-history output.json` to export the public transcript; the command verifies it
+after the timed local run.
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Tests cover 4/8 members, both consumption modes, f silent members, delayed
+member recovery, TCP deployment, RBC/ABA certificate forgery, duplicate reconstruction
+holders and transcript/history tampering. The DDH PVSS implementation does not
+supply a formal proof of the paper's additional multi-object secrecy assumption.
+
+## Local comparison
+
+From the repository root:
+
+```sh
+python3 asyrand/benchmarks/local_compare.py --nodes 4 8 --repeats 3 --warmup 128 --intervals 128 --gomaxprocs 8
+```
+
+The current benchmark defaults to parallel AsyRand. Pass `--no-parallel` when
+reproducing the historical standard-mode tables below. Archived run configs
+retain their original consumption mode.
+
+The script builds and runs the current `asyrand`, `grandline` and `spurt`
+modules serially, rotates run order, and stores exact configs, logs, source/binary
+fingerprints, environment metadata and CSV results. It counts a global beacon
+once, rejects skipped/failed runs, and computes throughput from the same
+post-warm-up timestamp interval for all three runners. Startup/setup and
+post-run public verification are outside that interval. AsyRand's verification
+cost during generation remains included.
+
+These are single-host measurements of the repository implementations. They do
+not reproduce published paper experiments or WAN latency. The current Grandline
+runner establishes APVSS/GRand keys during setup and performs only its share /
+verification / recovery path per epoch; its producer interval is unused. The
+current SPURT uses a different pairing-based PVSS and BLS certificate path.
+Benchmark results alone do not establish equal security assumptions or validate
+the baseline implementations.
+
+### Measured local results (2026-10-14)
+
+Historical **version 1** measurements, before the shared-column Consumer
+synchronization below. These values are retained for reproducibility and are
+not measurements of the current version 2 source. Mean ± sample standard
+deviation over three runs, in global beacon/s:
+
+| Implementation | 4 nodes, f=1 | 8 nodes, f=2 |
+| --- | ---: | ---: |
+| AsyRand | 89.21 ± 2.01 | 20.43 ± 3.96 |
+| Grandline | 62.61 ± 3.66 | 24.16 ± 3.13 |
+| SPURT | 8.46 ± 0.01 | 6.32 ± 0.70 |
+
+Apple M4, Go 1.25.4 darwin/amd64, memory transport, GOMAXPROCS=8,
+4 crypto workers/member, W=8, standard consumption mode. Each run discards
+128 outputs and measures the next 128 intervals. All 18 runs succeeded without
+skips; all 1,542 AsyRand outputs passed public history verification. The short
+measurement windows and implementation differences limit statistical and
+protocol-level conclusions. SPURT uses a 50ms polling ticker; its existing PVSS
+also has a public generator-relation secrecy problem described in the report.
+
+See [report and limitations](benchmarks/local_20261014_results/report.txt),
+[per-run measurements](benchmarks/local_20261014_results/results.csv) and
+[summary](benchmarks/local_20261014_results/summary.csv). Exact configs, logs,
+environment and source/binary fingerprints are retained in the same directory.
+Interrupted debugging runs are marked `SUPERSEDED.txt` and excluded.
+
+### Consumer synchronization and verification reuse (version 2)
+
+The shared k replenishes production only when a column is exhausted. The
+runtime and its internal verifier share one consumption state and one immutable
+verified-column cache. RSQ remains across boundaries; the predecessor hash is
+always the previous BEACON or genesis, with no additional CLOSE hash. The
+optional parallel mode derives its position from the remaining accepted set.
+
+The reconstruction context and record template are prepared once per epoch.
+Callbacks still recheck that context before release or commit. Successful PVSS
+checks are reused across RBC and column verification, with the exact transcript
+hash bound to its dealer and sequence, including packets received during an
+in-flight check. External public verifiers perform their own checks. Public
+witnesses contain exactly t shares; ReconTrusted verifies their distinct holders
+and proofs once, so a malformed or duplicate share cannot be skipped in favor
+of additional inputs. Runtime individual share screening remains in place.
+
+ABA decision certificates are cached after first adoption; native help remains
+active independently of that cache. Evidence is copied once on verification
+and once when exported to an external caller. Serving history and core replay
+continues after local progress.
+
+Historical measurements after Consumer synchronization, before the traffic
+and cache optimizations below (three runs):
+
+| Nodes | Global beacon/s, mean ± sample stdev |
+| --- | ---: |
+| 4 | 145.47 ± 1.90 |
+| 8 | 36.35 ± 0.67 |
+
+See [v2 report](benchmarks/consumer_v2_20261014/report.txt) and exact configs/logs
+in that directory. The v1 comparison above is historical, not a simultaneous
+A/B test; v2 also changes column/producer semantics.
+
+### Traffic and bounded verification caches (version 2)
+
+New ABA instances rely on native DECISION messages to assemble their result.
+Certificate requests are issued during recovery, including for instances with
+no local proposal, instead of making every node request and receive full
+certificates on the normal path. Adoption still retains the native core and
+its mandatory next-round help. A future RECON triggers immediate history pull
+when column prerequisites are missing; an existing native reconstruction waits
+for its share checks and uses periodic recovery if it stalls.
+
+PVSS caches successful decryption-share verification under the full share
+encoding and exact transcript ID, after checking the complete transcript
+header. Changing any holder, value, proof, object position or setup misses or
+fails the cache. This avoids repeating DLEQ checks in ReconTrusted for shares
+already screened by the runtime. Generated curve points and local proofs are
+retained by construction. Both point and share caches use bounded FIFO
+replacement (4096 entries each); an evicted share undergoes full verification.
+Retrieved points are cloned, so callers cannot mutate cached values.
+
+An alternating comparison of the saved pre-optimization v2 binary and the
+updated binary uses the same configuration and the same post-warmup window
+for throughput and aggregate sent bytes. Three runs per variant and size:
+
+| Nodes | Before, beacon/s | After, beacon/s | Before, KiB/beacon | After, KiB/beacon |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 146.12 ± 4.71 | 196.57 ± 0.66 | 95.41 ± 3.21 | 58.45 ± 0.45 |
+| 8 | 35.83 ± 0.73 | 49.48 ± 0.74 | 471.87 ± 4.36 | 198.16 ± 2.06 |
+
+Mean ± sample standard deviation. Each run excludes 128 outputs and measures
+128 following intervals (257 verified outputs total). Communication counts
+committee-wide serialized messages including loopback, using sent bytes only;
+it includes pipeline production during that window and excludes setup/prefill.
+The earlier bandwidth estimates used 256 intervals and are not the baseline
+for this comparison. Grandline/SPURT were not rerun here. The command now logs
+exact byte counters and message-type breakdowns; their snapshots can differ
+slightly because traffic continues while counters are collected.
+
+`go test ./...`, `go test -race ./...` and `go vet ./...` pass. Tests cover
+deferred certificate pull without a proposal, stalled native reconstruction
+recovery, cache binding/eviction, and the existing healthy/fault/recovery cases.
+All twelve benchmark histories verify publicly. Wire formats, signature
+statements, PVSS proofs, thresholds and output/history rules remain version 2.
+
+See [comparison report](benchmarks/safe_opt_20261014/report.md),
+[summary](benchmarks/safe_opt_20261014/summary.csv), and
+[exact optimization patch](benchmarks/safe_opt_20261014/optimization.patch).
+Reproduce using built before/after binaries:
+
+```sh
+python3 asyrand/benchmarks/safe_opt_compare.py --before /path/to/asyrand-before --after /path/to/asyrand-after
+```
+
+Add `--no-parallel` to reproduce the standard-mode optimization comparison.
+
+### Parallel default and ABA accounting
+
+JSON loading now defaults `parallel_consumption` to true and all deployment
+templates enable it. An explicit false remains supported. Consumption mode is
+bound into public setup, so all peers and the history verifier must use the
+same mode.
+
+The runner records two byte windows: `final` excludes `warmup_outputs`, while
+`run` counts from the first output through the last. Both retain raw sent and
+received bytes, per-message-type counters and ABA communication breakdowns.
+ABA core means PRE/VOTE/MAIN/FINAL; certificate traffic means DECISION and
+CERT_REQUEST/CERT_RESPONSE; dedicated recovery means SYNC/REPLAY. Combined
+ABA share uses these sent bytes divided by all sent bytes in the same type
+snapshot, including loopback. Mixed HISTORY/REPLY evidence is counted as
+history traffic rather than split into embedded signature categories.
+
+`Node.ABAStatistics()` reports created/proposed/native-decided/certified local
+instances. Union instance IDs across nodes to count logical ABA instances;
+node copies are reported separately. Each verified whole=1 column requires
+one ABA, and whole=0 requires one whole-column plus n object ABAs. Counts for
+fully consumed columns inside the measured window exclude boundary and
+incomplete future columns, which remain visible in the raw CSV.
 
 ```sh
 cd asyrand
-go run ./cmd/asyrand -config path/to/config.json
+go build -o /private/tmp/asyrand-parallel ./cmd/asyrand
+cd ..
+python3 asyrand/benchmarks/parallel_stats.py --binary /private/tmp/asyrand-parallel
 ```
 
-With `transport` set to `memory`, this starts all configured nodes in one process.
+This script measures only current AsyRand and compares retained Grandline/SPURT
+data. For comparison, throughput uses the post-warmup 128 intervals and
+communication uses the full 256 intervals for all protocols. Post-warmup
+AsyRand traffic and ABA counts are additionally preserved. Each current run
+exports and verifies its full public history.
 
-Useful config fields:
-
-- `round`: number of beacon epochs to produce.
-- `f`: Byzantine fault threshold. Use `0` explicitly for no-fault local benchmarks.
-- `queue_len`: maximum pending PVSS commitments per `ComQ[i]`.
-- `producer_interval_ms`: delay between local producer attempts.
-- `prefill_ms`: time to let producers fill queues before epochs start.
-- `epoch_timeout_ms`: timeout per epoch.
-- `report_interval_ms`: periodic metrics interval.
-
-The runner prints:
-
-- config summary
-- per-epoch source, consumed-node count, commitment id, and beacon prefix
-- throughput in beacon/min
-- sent/received message counts and bytes
-- aggregate bandwidth
-- `queue_total` and `queue_max`
-- average timings for PVSS, RBC, BLS verification, and BLS aggregation
-
-Example metric line:
-
-```text
-periodic metrics beacons=70 throughput=839.94beacon/min sent_msgs=38296 recv_msgs=38296 sent=16236.54KB recv=16236.54KB bandwidth=6494.13KB/s queue_total=184 queue_max=3 pvss_share_avg=4.79ms pvss_verify_avg=784us pvss_prerecon_avg=1.40ms pvss_recon_avg=7us rbc_avg=9us bls_verify_avg=3.63ms bls_agg_avg=3.65ms
-```
-
-## Run TCP Nodes
-
-Set `cluster_ips` to IPs reachable by other nodes. Keep `listen_ip` as `0.0.0.0` when each node should listen on all interfaces.
-
-Run one process per node:
-
-```sh
-cd asyrand
-go run ./cmd/asyrand -config path/to/config.json -node node0
-go run ./cmd/asyrand -config path/to/config.json -node node1
-go run ./cmd/asyrand -config path/to/config.json -node node2
-```
-
-Continue for all configured nodes.
-
-You can override transport without editing the config:
-
-```sh
-go run ./cmd/asyrand -config path/to/config.json -transport tcp -node node0
-```
-
-## Configuration Model
-
-The JSON config supports two peer-address styles:
-
-- `cluster_index`, `cluster_ips`, and `peers_p2p_port`
-- explicit `peers` entries with `id` and `addr`
-
-The current demo derives Ed25519, PVSS, and BLS material from deterministic seeds so benchmark runs are reproducible. For production-style deployment, replace seed-derived setup with secure key distribution.
-
-## Current Implementation Notes
-
-- `source` is passive; it is not a BFT proposer. It is the party whose next agreed PVSS commitment is consumed.
-- `ComQ` is implemented as a dictionary array: `ComQ[i][seq]`.
-- Source consumption is direct: nodes consume the selected source head when present, otherwise they remove that source from the candidate set.
-- Consumer messages received before local consumer state exists are buffered and drained after the matching commitment is popped.
-- The implementation is a research prototype and does not yet include adversarial fault injection, persistent key storage, production observability, or online deployment automation.
+The final parallel measurements and actual ABA counts are in
+[parallel report](benchmarks/parallel_20261014/report.md),
+[protocol comparison](benchmarks/parallel_20261014/comparison.csv), and
+[per-column ABA data](benchmarks/parallel_20261014/aba_columns.csv).
+Three-run means: 181.76 / 47.73 beacon/s and 57.69 / 198.20 KiB/beacon
+(4/8 nodes; comparison bytes cover 256 intervals). In the post-warmup window,
+ABA accounts for 23.71% / 13.30% of sent bytes and each fully consumed column
+uses one whole-column ABA. The startup column uses n+1 ABAs.

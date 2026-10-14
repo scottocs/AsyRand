@@ -14,3 +14,12 @@ go-cache/
 build/
 bin/
 *.zip
+
+# AsyRand benchmark harness and reviewable measurement artifacts.
+!asyrand/benchmarks/
+!asyrand/benchmarks/**
+asyrand/benchmarks/**/bin/
+asyrand/benchmarks/local_20261014/
+asyrand/benchmarks/local_20261014_full/
+asyrand/benchmarks/local_20261014_witness/
+asyrand/benchmarks/local_20261014_final/

@@ -1,0 +1,42 @@
+{
+  "name": "local-4",
+  "protocol": "asyrand-v2",
+  "transport": "memory",
+  "f": 1,
+  "round": 3,
+  "listen_ip": "0.0.0.0",
+  "prefill_ms": 3000,
+  "epoch_timeout_ms": 15000,
+  "report_interval_ms": 5000,
+  "linger_ms": 15000,
+  "max_pool": 4,
+  "log_level": 1,
+  "cluster_index": {
+    "node0": 0,
+    "node1": 1,
+    "node2": 2,
+    "node3": 3
+  },
+  "cluster_ips": {
+    "node0": "127.0.0.1",
+    "node1": "127.0.0.1",
+    "node2": "127.0.0.1",
+    "node3": "127.0.0.1"
+  },
+  "peers_p2p_port": {
+    "node0": 9000,
+    "node1": 9001,
+    "node2": 9002,
+    "node3": 9003
+  },
+  "node_key_seed": {
+    "node0": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "node1": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "node2": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "node3": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+  },
+  "production_window": 8,
+  "parallel_consumption": true,
+  "session_id": "asyrand-demo-v1",
+  "warmup_outputs": 0
+}
