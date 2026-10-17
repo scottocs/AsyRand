@@ -304,16 +304,6 @@ func proveBeaconDLEQ(group interface {
 	}
 }
 
-func verifyBeaconDLEQ(group interface {
-	G1() kyber.Group
-}, msg []byte, cm1Hex string, sigma1 kyber.Point, proof BeaconDLEQProof) bool {
-	cm1, err := pointG1FromHex(cm1Hex)
-	if err != nil {
-		return false
-	}
-	return verifyBeaconDLEQWithCM1(group, msg, cm1, sigma1, proof, hashToG1(group, msg))
-}
-
 func verifyBeaconDLEQWithCM1(group interface {
 	G1() kyber.Group
 }, msg []byte, cm1 kyber.Point, sigma1 kyber.Point, proof BeaconDLEQProof, gr kyber.Point, caches ...*verification.Cache) bool {

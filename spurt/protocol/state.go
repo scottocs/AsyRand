@@ -117,16 +117,6 @@ func (s *State) Advance(random []byte) {
 	s.Epoch++
 }
 
-func (s *State) Skip(reason string) (uint64, []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	epoch := s.Epoch
-	random := asig.HashBytes([]byte("Spurt-v1/skip"), epochSeed(s.Seed, epoch), encodeEpoch(epoch), []byte(reason))
-	s.RPrev = append([]byte(nil), random...)
-	s.Epoch++
-	return epoch, append([]byte(nil), random...)
-}
-
 func encodeEpoch(e uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, e)

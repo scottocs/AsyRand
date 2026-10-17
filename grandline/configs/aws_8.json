@@ -4,9 +4,7 @@
   "transport": "tcp",
   "f": 2,
   "round": 10,
-  "queue_len": 8,
   "listen_ip": "0.0.0.0",
-  "producer_interval_ms": 250,
   "prefill_ms": 3000,
   "epoch_timeout_ms": 10000,
   "report_interval_ms": 5000,
@@ -14,7 +12,6 @@
   "batch_size": 1,
   "max_pool": 4,
   "log_level": 1,
-  "seed": "41737952616e642d76312d6177732d382d67656e6573697321000000",
   "cluster_index": {
     "node0": 0,
     "node1": 1,

@@ -1,6 +1,7 @@
 # GRandline (Go Implementation)
 
-This module contains the Go implementation that follows the `grandline` beacon design and reuses the Tyche/SPurt code structure for transport, PVSS, DKG and test scaffolding.
+This module implements the GRandLine beacon and its offline APVSS setup, using
+the shared transport, verification cache and BLS12-381 arithmetic packages.
 
 ## Run
 
@@ -20,13 +21,14 @@ The reporter prints periodic throughput and bandwidth:
 - sent/received message counts
 - sent/received traffic in KB
 - total bandwidth KB/s
-- queue backlog
 - signature, verification, recovery, and PVSS timings
 
 ## Notes
 
-- Legacy queue helpers are outside the steady-state beacon path.
-- The implementation has no special-case “optimistic fast path” toggle; every epoch uses source-driven signing and recovery.
+- Every epoch generates native beacon shares and reconstructs from verified shares.
+- There is no producer queue, source rotation, BN256 coin, Pedersen DKG example,
+  or separate BLS output certificate in this module. Offline setup uses APVSS.
+- Legacy queue/PVSS timing fields remain zero in logs for experiment-parser compatibility.
 
 ## Authenticated-channel baseline
 

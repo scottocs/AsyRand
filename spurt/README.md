@@ -4,13 +4,12 @@ This directory contains a Go port of the steady-state SPURT beacon protocol in
 [`paper/refs/Spurt.pdf`](../paper/refs/Spurt.pdf). The inherited HotStuff view-change
 protocol is not implemented; this is not a complete fault-tolerant reproduction.
 
-The implementation reuses the same transport/crypto/pvss/rbc foundations as the Tyche codebase:
+The implementation uses shared transport, verification and pairing foundations:
 
 - `config`: JSON config loading and key/peer parsing.
 - `../utils/p2p`: shared memory/TCP transport layer with byte/message metrics.
-- `crypto`: native Ed25519 BEACON signatures; legacy BLS helpers are outside the beacon path.
+- `crypto`: native Ed25519 BEACON signatures.
 - `crypto`: pairing-based SPURT PVSS on BLS12-381 with knowledge proofs and reconstruction checks.
-- `protocol/rbc`: legacy helpers outside the SPURT beacon path.
 - `protocol`: Spurt state machine, epoch-local PVSS aggregation, beacon collection, and metrics.
 
 ## Directory Layout

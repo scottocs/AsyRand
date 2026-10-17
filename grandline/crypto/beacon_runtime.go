@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors"
 	"sync"
@@ -192,9 +191,4 @@ func (e *BeaconEpoch) Recover(shares []*VerifiedBeaconShare, threshold int, memb
 		return nil, "", err
 	}
 	return HashBytes(raw), hex.EncodeToString(raw), nil
-}
-
-// Matches makes it possible to reject accidental context reuse at API edges.
-func (e *BeaconEpoch) Matches(epoch uint64, msg []byte) bool {
-	return e != nil && e.epoch == epoch && bytes.Equal(e.msg, msg)
 }

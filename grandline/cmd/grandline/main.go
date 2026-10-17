@@ -26,7 +26,6 @@ type runtimeKeys struct {
 	pubs     map[string]ed25519.PublicKey
 	pvssKeys map[p2p.NodeID]asig.PVSSKeyPair
 	pvssPub  map[p2p.NodeID]kyber.Point
-	seed     []byte
 	grand    asig.GRandResult
 }
 
@@ -126,7 +125,6 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 		if err := node.Start(runCtx); err != nil {
 			return err
 		}
-		node.StartProducer(runCtx, time.Duration(cfg.ProducerMS)*time.Millisecond)
 		nodes = append(nodes, node)
 	}
 
@@ -214,9 +212,8 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 		}
 	}
 
-	queueTotal, queueMax := collectQueue(nodes)
-	runWindow.printLabel("run", nodes, queueTotal, queueMax)
-	finalWindow.print(nodes, queueTotal, queueMax)
+	runWindow.printLabel("run", nodes)
+	finalWindow.print(nodes)
 	return nil
 }
 
@@ -246,7 +243,6 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	}
 	fmt.Printf("node=%s tcp_peers_ready peers=%d\n", cfg.NodeID, len(cfg.PeerMap())-1)
 	node.StartProtocol(runCtx)
-	node.StartProducer(runCtx, time.Duration(cfg.ProducerMS)*time.Millisecond)
 
 	printConfig(cfg, 1, "tcp")
 	stats := &runStats{}
@@ -282,8 +278,7 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		}
 		finalWindow.recordBeacon(nodes)
 	}
-	queueTotal, queueMax := collectQueue(nodes)
-	finalWindow.print(nodes, queueTotal, queueMax)
+	finalWindow.print(nodes)
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -299,10 +294,6 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 		return runtimeKeys{}, fmt.Errorf("config has no cluster members")
 	}
 	keys, pubs, err := cfg.KeyPairs()
-	if err != nil {
-		return runtimeKeys{}, err
-	}
-	seed, err := cfg.SeedBytes()
 	if err != nil {
 		return runtimeKeys{}, err
 	}
@@ -364,7 +355,7 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 		}
 	}
 	return runtimeKeys{
-		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys, pvssPub: pvssPub, seed: seed, grand: grandResult,
+		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys, pvssPub: pvssPub, grand: grandResult,
 	}, nil
 }
 
@@ -375,7 +366,7 @@ func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Tra
 	}
 	nodeCfg := grandline.NodeConfig{
 		BeaconMode: cfg.BeaconMode,
-		ID:         id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed,
+		ID:         id, Members: rt.ids, F: cfg.F,
 		Transport: transport, PVSS: pvssScheme,
 		GRand: rt.grand.ShareFor(id), CryptoWorkers: cfg.MaxPool,
 	}
@@ -415,8 +406,8 @@ func printConfig(cfg config.Config, nodes int, transport string) {
 	if cfg.BeaconMode == "reference" {
 		protocol = grandline.ReferenceProtocol
 	}
-	fmt.Printf("protocol=%s beacon_mode=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=unused epoch_ms=%d report_ms=%d crypto_workers=%d\n",
-		protocol, cfg.BeaconMode, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
+	fmt.Printf("protocol=%s beacon_mode=%s transport=%s nodes=%d f=%d rounds=%d epoch_ms=%d report_ms=%d crypto_workers=%d\n",
+		protocol, cfg.BeaconMode, transport, nodes, cfg.F, cfg.Round, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}
@@ -442,8 +433,7 @@ func startReporter(ctx context.Context, cfg config.Config, nodes []*grandline.No
 				current := collectMetrics(nodes)
 				currentPerf := collectPerf(nodes)
 				currentBeacon := stats.beacons.Load()
-				totalPending, maxPending := collectQueue(nodes)
-				printMetricDelta("periodic", current.sub(last), currentPerf.Sub(lastPerf), totalPending, maxPending, now.Sub(lastAt), currentBeacon-lastBeacon)
+				printMetricDelta("periodic", current.sub(last), currentPerf.Sub(lastPerf), now.Sub(lastAt), currentBeacon-lastBeacon)
 				last, lastAt = current, now
 				lastPerf = currentPerf
 				lastBeacon = currentBeacon
@@ -484,20 +474,6 @@ func collectPerf(nodes []*grandline.Node) grandline.PerfSnapshot {
 	return out
 }
 
-func collectQueue(nodes []*grandline.Node) (total int, max int) {
-	for _, n := range nodes {
-		if n == nil || n.State == nil {
-			continue
-		}
-		t, m := n.State.QueueBacklog()
-		total += t
-		if m > max {
-			max = m
-		}
-	}
-	return total, max
-}
-
 func (w *finalMetricWindow) recordBeacon(nodes []*grandline.Node) {
 	if !w.started {
 		w.started = true
@@ -509,15 +485,15 @@ func (w *finalMetricWindow) recordBeacon(nodes []*grandline.Node) {
 	w.beacons++
 }
 
-func (w *finalMetricWindow) print(nodes []*grandline.Node, queueTotal int, queueMax int) {
-	w.printLabel("final", nodes, queueTotal, queueMax)
+func (w *finalMetricWindow) print(nodes []*grandline.Node) {
+	w.printLabel("final", nodes)
 }
-func (w *finalMetricWindow) printLabel(label string, nodes []*grandline.Node, queueTotal int, queueMax int) {
+func (w *finalMetricWindow) printLabel(label string, nodes []*grandline.Node) {
 	if !w.started {
-		printMetricDelta(label, metricSnapshot{}, grandline.PerfSnapshot{}, queueTotal, queueMax, 0, 0)
+		printMetricDelta(label, metricSnapshot{}, grandline.PerfSnapshot{}, 0, 0)
 		return
 	}
-	printMetricDelta(label, collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
+	printMetricDelta(label, collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), time.Since(w.start), w.beacons)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
@@ -529,16 +505,11 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 	}
 }
 
-func printMetrics(label string, nodes []*grandline.Node, elapsed time.Duration, beacons uint64) {
-	queueTotal, queueMax := collectQueue(nodes)
-	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), queueTotal, queueMax, elapsed, beacons)
-}
-
 func logTimestamp() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
-func printMetricDelta(label string, delta metricSnapshot, perf grandline.PerfSnapshot, queueTotal int, queueMax int, elapsed time.Duration, beacons uint64) {
+func printMetricDelta(label string, delta metricSnapshot, perf grandline.PerfSnapshot, elapsed time.Duration, beacons uint64) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 1
@@ -554,7 +525,7 @@ func printMetricDelta(label string, delta metricSnapshot, perf grandline.PerfSna
 		float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
 		perf.MessageSignCount, perf.MessageVerifyCount,
 		grandline.AvgDuration(perf.MessageSignTotal, perf.MessageSignCount), grandline.AvgDuration(perf.MessageVerifyTotal, perf.MessageVerifyCount),
-		queueTotal, queueMax,
+		0, 0, // Legacy queue log fields remain zero.
 		grandline.AvgDuration(perf.SignTotal, perf.SignCount),
 		grandline.AvgDuration(perf.VerifyTotal, perf.VerifyCount),
 		grandline.AvgDuration(perf.RecoverTotal, perf.RecoverCount),

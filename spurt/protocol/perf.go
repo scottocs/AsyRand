@@ -18,9 +18,6 @@ type PerfMetrics struct {
 	pvssReconNs    atomic.Int64
 	pvssReconCount atomic.Uint64
 
-	rbcHandleNs    atomic.Int64
-	rbcHandleCount atomic.Uint64
-
 	agreementNs    atomic.Int64
 	agreementCount atomic.Uint64
 
@@ -45,8 +42,6 @@ type PerfSnapshot struct {
 	PVSSPreReconTotal  time.Duration
 	PVSSReconCount     uint64
 	PVSSReconTotal     time.Duration
-	RBCHandleCount     uint64
-	RBCHandleTotal     time.Duration
 	AgreementCount     uint64
 	AgreementTotal     time.Duration
 	BeaconSignCount    uint64
@@ -75,11 +70,6 @@ func (p *PerfMetrics) addRecon(d time.Duration) {
 	p.pvssReconCount.Add(1)
 }
 
-func (p *PerfMetrics) addRBCHandle(d time.Duration) {
-	p.rbcHandleNs.Add(d.Nanoseconds())
-	p.rbcHandleCount.Add(1)
-}
-
 func (p *PerfMetrics) addAgreement(d time.Duration) {
 	p.agreementNs.Add(d.Nanoseconds())
 	p.agreementCount.Add(1)
@@ -105,8 +95,6 @@ func (p *PerfMetrics) Snapshot() PerfSnapshot {
 		PVSSPreReconTotal: time.Duration(p.pvssPreReconNs.Load()),
 		PVSSReconCount:    p.pvssReconCount.Load(),
 		PVSSReconTotal:    time.Duration(p.pvssReconNs.Load()),
-		RBCHandleCount:    p.rbcHandleCount.Load(),
-		RBCHandleTotal:    time.Duration(p.rbcHandleNs.Load()),
 		AgreementCount:    p.agreementCount.Load(),
 		AgreementTotal:    time.Duration(p.agreementNs.Load()),
 		BeaconSignCount:   p.beaconSignCount.Load(),
@@ -128,8 +116,6 @@ func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 		PVSSPreReconTotal: s.PVSSPreReconTotal + o.PVSSPreReconTotal,
 		PVSSReconCount:    s.PVSSReconCount + o.PVSSReconCount,
 		PVSSReconTotal:    s.PVSSReconTotal + o.PVSSReconTotal,
-		RBCHandleCount:    s.RBCHandleCount + o.RBCHandleCount,
-		RBCHandleTotal:    s.RBCHandleTotal + o.RBCHandleTotal,
 		AgreementCount:    s.AgreementCount + o.AgreementCount,
 		AgreementTotal:    s.AgreementTotal + o.AgreementTotal,
 		BeaconSignCount:   s.BeaconSignCount + o.BeaconSignCount,
@@ -151,8 +137,6 @@ func (s PerfSnapshot) Sub(o PerfSnapshot) PerfSnapshot {
 		PVSSPreReconTotal: s.PVSSPreReconTotal - o.PVSSPreReconTotal,
 		PVSSReconCount:    s.PVSSReconCount - o.PVSSReconCount,
 		PVSSReconTotal:    s.PVSSReconTotal - o.PVSSReconTotal,
-		RBCHandleCount:    s.RBCHandleCount - o.RBCHandleCount,
-		RBCHandleTotal:    s.RBCHandleTotal - o.RBCHandleTotal,
 		AgreementCount:    s.AgreementCount - o.AgreementCount,
 		AgreementTotal:    s.AgreementTotal - o.AgreementTotal,
 		BeaconSignCount:   s.BeaconSignCount - o.BeaconSignCount,

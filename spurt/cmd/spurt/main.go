@@ -416,11 +416,6 @@ func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
 	}
 }
 
-func printMetrics(label string, nodes []*spurt.Node, elapsed time.Duration, beacons uint64) {
-	cacheTotal, cacheMax := collectCachedCommitments(nodes)
-	printMetricDelta(label, collectMetrics(nodes), collectPerf(nodes), cacheTotal, cacheMax, elapsed, beacons)
-}
-
 func logTimestamp() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }

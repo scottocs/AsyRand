@@ -6,12 +6,6 @@ import (
 )
 
 type PerfMetrics struct {
-	pvssShareNs    atomic.Int64
-	pvssShareCount atomic.Uint64
-
-	pvssVerifyNs    atomic.Int64
-	pvssVerifyCount atomic.Uint64
-
 	shareSignNs    atomic.Int64
 	shareSignCount atomic.Uint64
 
@@ -40,16 +34,6 @@ type PerfSnapshot struct {
 	RecoverTotal       time.Duration
 }
 
-func (p *PerfMetrics) addPvssShare(d time.Duration) {
-	p.pvssShareNs.Add(d.Nanoseconds())
-	p.pvssShareCount.Add(1)
-}
-
-func (p *PerfMetrics) addPvssVerify(d time.Duration) {
-	p.pvssVerifyNs.Add(d.Nanoseconds())
-	p.pvssVerifyCount.Add(1)
-}
-
 func (p *PerfMetrics) addSign(d time.Duration) {
 	p.shareSignNs.Add(d.Nanoseconds())
 	p.shareSignCount.Add(1)
@@ -67,16 +51,12 @@ func (p *PerfMetrics) addRecover(d time.Duration) {
 
 func (p *PerfMetrics) Snapshot() PerfSnapshot {
 	return PerfSnapshot{
-		PVSSShareCount:  p.pvssShareCount.Load(),
-		PVSSShareTotal:  time.Duration(p.pvssShareNs.Load()),
-		PVSSVerifyCount: p.pvssVerifyCount.Load(),
-		PVSSVerifyTotal: time.Duration(p.pvssVerifyNs.Load()),
-		SignCount:       p.shareSignCount.Load(),
-		SignTotal:       time.Duration(p.shareSignNs.Load()),
-		VerifyCount:     p.shareVerifyCount.Load(),
-		VerifyTotal:     time.Duration(p.shareVerifyNs.Load()),
-		RecoverCount:    p.shareRecoverCount.Load(),
-		RecoverTotal:    time.Duration(p.shareRecoverNs.Load()),
+		SignCount:    p.shareSignCount.Load(),
+		SignTotal:    time.Duration(p.shareSignNs.Load()),
+		VerifyCount:  p.shareVerifyCount.Load(),
+		VerifyTotal:  time.Duration(p.shareVerifyNs.Load()),
+		RecoverCount: p.shareRecoverCount.Load(),
+		RecoverTotal: time.Duration(p.shareRecoverNs.Load()),
 	}
 }
 

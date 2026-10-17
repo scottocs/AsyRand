@@ -13,7 +13,6 @@ import (
 	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"Tyche/utils/verification"
-	"go.dedis.ch/kyber/v3"
 )
 
 const Protocol = "grandline/authenticated-v1"
@@ -46,7 +45,6 @@ type Node struct {
 	rounds        map[string]*roundState
 	pendingShares map[string][]shareMessage
 	commitments   map[p2p.NodeID]*asig.VerifiedBeaconCommitment
-	commitAlpha   kyber.Scalar
 	commitSent    bool
 
 	beacons chan *Beacon
@@ -59,8 +57,6 @@ type NodeConfig struct {
 	ID                   p2p.NodeID
 	Members              []p2p.NodeID
 	F                    int
-	QueueLen             int
-	Seed                 []byte
 	Transport            p2p.Transport
 	PVSS                 asig.PVSSScheme
 	GRand                asig.GRandShare
@@ -121,7 +117,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if owner, ok := cfg.PVSS.(interface{ VerificationCache() *verification.Cache }); ok {
 		checks = verification.Select(owner.VerificationCache())
 	}
-	state := NewState(cfg.Members, cfg.F, cfg.QueueLen, cfg.Seed)
+	state := NewState(cfg.Members, cfg.F)
 	n := &Node{checks: checks, reference: cfg.BeaconMode == "reference",
 		ID: cfg.ID, Transport: cfg.Transport, Perf: &PerfMetrics{},
 		State: state, PVSS: cfg.PVSS, GRand: cfg.GRand,
@@ -153,7 +149,6 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		if errSigner != nil {
 			return nil, errSigner
 		}
-		n.commitAlpha = a
 		n.commitSent = true
 	}
 	n.Crypto = cryptoexec.New(cfg.CryptoWorkers)
@@ -171,11 +166,6 @@ func (n *Node) Start(ctx context.Context) error {
 func (n *Node) StartProtocol(ctx context.Context) {
 	n.ctx = ctx
 	go n.dispatch(ctx)
-}
-
-func (n *Node) StartProducer(ctx context.Context, interval time.Duration) {
-	// GRandLine has no per-epoch producer/source queue. The runner still calls
-	// StartProducer because it shares scaffolding with other protocols.
 }
 
 func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, error) {
@@ -215,18 +205,17 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 			if beacon == nil || beacon.Epoch != epoch {
 				continue
 			}
-			n.State.Advance(beacon.Random, "")
+			n.State.Advance()
 			return beacon, nil
 		case <-overall.C:
-			return nil, fmt.Errorf("%w: %s", errEpochTimeout, n.skipDiagnostics(key))
+			return nil, fmt.Errorf("%w: %s", errEpochTimeout, n.epochDiagnostics(key))
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
 }
 
-func (n *Node) skipDiagnostics(key string) string {
-	queueTotal, queueMax := n.State.QueueBacklog()
+func (n *Node) epochDiagnostics(key string) string {
 	n.roundMu.Lock()
 	rounds := len(n.rounds)
 	pendingShares := len(n.pendingShares[key])
@@ -243,8 +232,8 @@ func (n *Node) skipDiagnostics(key string) string {
 	n.roundMu.Unlock()
 	metrics := n.Transport.Metrics()
 	return fmt.Sprintf(
-		"local_epoch=%d rounds=%d commitments=%d commit_sent=%t shares=%d pending_shares=%d delivered=%t recovering=%t queue_total=%d queue_max=%d sent_msgs=%d recv_msgs=%d",
-		n.State.CurrentEpoch(), rounds, commitments, commitSent, shareCount, pendingShares, delivered, recovering, queueTotal, queueMax, metrics.SentMessages, metrics.RecvMessages,
+		"local_epoch=%d rounds=%d commitments=%d commit_sent=%t shares=%d pending_shares=%d delivered=%t recovering=%t sent_msgs=%d recv_msgs=%d",
+		n.State.CurrentEpoch(), rounds, commitments, commitSent, shareCount, pendingShares, delivered, recovering, metrics.SentMessages, metrics.RecvMessages,
 	)
 }
 
@@ -325,7 +314,6 @@ func (n *Node) ensureCommitment(ctx context.Context) error {
 		n.roundMu.Unlock()
 		return err
 	}
-	n.commitAlpha = alpha
 	n.commitSent = true
 	n.roundMu.Unlock()
 	msg, err := n.newMessage("COMMIT", "commitment", commitment)
@@ -512,16 +500,6 @@ func (n *Node) commitmentFor(id p2p.NodeID) (*asig.VerifiedBeaconCommitment, boo
 	defer n.roundMu.Unlock()
 	commitment, ok := n.commitments[id]
 	return commitment, ok
-}
-
-func (n *Node) commitmentSnapshot() map[p2p.NodeID]asig.BeaconCommitment {
-	n.roundMu.Lock()
-	defer n.roundMu.Unlock()
-	out := make(map[p2p.NodeID]asig.BeaconCommitment, len(n.commitments))
-	for id, commitment := range n.commitments {
-		out[id] = commitment.Commitment
-	}
-	return out
 }
 
 func (n *Node) flushPendingShares(key string) {

@@ -550,22 +550,6 @@ func h1Point(group *pairing.Suite) kyber.Point {
 	return independentH1.Clone()
 }
 
-func verifyPublicPolynomial(group kyber.Group, shares []*share.PubShare, threshold int) bool {
-	if threshold <= 0 || len(shares) < threshold {
-		return false
-	}
-	poly, err := share.RecoverPubPoly(group, shares[:threshold], threshold, len(shares))
-	if err != nil {
-		return false
-	}
-	for _, sh := range shares[threshold:] {
-		if !poly.Eval(sh.I).V.Equal(sh.V) {
-			return false
-		}
-	}
-	return true
-}
-
 func normalizeMembers(members []p2p.NodeID) []p2p.NodeID {
 	out := append([]p2p.NodeID(nil), members...)
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })

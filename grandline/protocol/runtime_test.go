@@ -35,7 +35,7 @@ func TestInvalidCandidateDoesNotDisplaceHonestShare(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := &roundState{epoch: 7, crypto: e, shares: map[p2p.NodeID]*asig.VerifiedBeaconShare{}}
-	n := &Node{checks: verification.New(), Crypto: cryptoexec.New(1), State: NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1, 8, nil), commitments: map[p2p.NodeID]*asig.VerifiedBeaconCommitment{"n1": checked}}
+	n := &Node{checks: verification.New(), Crypto: cryptoexec.New(1), State: NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1), commitments: map[p2p.NodeID]*asig.VerifiedBeaconCommitment{"n1": checked}}
 	entered, release, drained := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	n.Crypto.Go(t.Context(), func() { close(entered); <-release })
 	<-entered

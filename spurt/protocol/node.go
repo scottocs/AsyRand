@@ -936,23 +936,6 @@ func (n *Node) validateProposal(epoch uint64, selected []CommitmentRef, digest s
 	return normalized, true, false
 }
 
-func isMissingError(err error) bool {
-	if err == nil {
-		return false
-	}
-	e := err.Error()
-	return contains(e, "missing commitment")
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}
-
 func (n *Node) handleVote(stage string, msg VoteMessage, from p2p.NodeID) {
 	if !n.epochAllowed(msg.Epoch) || !n.State.IsMember(from) || msg.Leader == "" || msg.Digest == "" {
 		return

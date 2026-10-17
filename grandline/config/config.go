@@ -27,14 +27,11 @@ type Config struct {
 	Transport     string                `json:"transport"`
 	F             int                   `json:"f"`
 	Round         int                   `json:"round"`
-	QueueLen      int                   `json:"queue_len"`
 	ListenIP      string                `json:"listen_ip"`
-	ProducerMS    int                   `json:"producer_interval_ms"`
 	PrefillMS     int                   `json:"prefill_ms"`
 	EpochMS       int                   `json:"epoch_timeout_ms"`
 	ReportMS      int                   `json:"report_interval_ms"`
 	LingerMS      int                   `json:"linger_ms"`
-	Seed          string                `json:"seed"`
 	BatchSize     int                   `json:"batch_size"`
 	MaxPool       int                   `json:"max_pool"`
 	LogLevel      int                   `json:"log_level"`
@@ -56,9 +53,6 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
-	if cfg.QueueLen == 0 {
-		cfg.QueueLen = 8
-	}
 	if cfg.Round == 0 {
 		cfg.Round = 1
 	}
@@ -76,9 +70,6 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.ListenIP == "" {
 		cfg.ListenIP = "0.0.0.0"
-	}
-	if cfg.ProducerMS == 0 {
-		cfg.ProducerMS = 250
 	}
 	if cfg.PrefillMS == 0 {
 		cfg.PrefillMS = 1000
@@ -165,13 +156,6 @@ func (c Config) KeyPairs() (map[p2p.NodeID]asig.KeyPair, map[string]ed25519.Publ
 		pubs[string(id)] = pub
 	}
 	return keys, pubs, nil
-}
-
-func (c Config) SeedBytes() ([]byte, error) {
-	if c.Seed == "" {
-		return nil, nil
-	}
-	return hex.DecodeString(c.Seed)
 }
 
 func (c Config) NodeSeedBytes() (map[p2p.NodeID][]byte, error) {

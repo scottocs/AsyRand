@@ -202,8 +202,20 @@ type trafficSnapshot struct {
 }
 
 func snapshotTraffic(nodes []*asyrand.Node) trafficSnapshot {
-	sent, recv, messages := metrics(nodes)
-	return trafficSnapshot{sent, recv, messages, messageMetrics(nodes)}
+	types, complete := messageMetrics(nodes)
+	if !complete {
+		sent, recv, messages := metrics(nodes)
+		return trafficSnapshot{sent, recv, messages, types}
+	}
+	// Derive all counters from the same frozen type snapshots. Reading separate
+	// aggregate atomics while senders run can otherwise disagree with the split.
+	var sent, recv, messages uint64
+	for _, m := range types {
+		sent += m.SentBytes
+		recv += m.RecvBytes
+		messages += m.SentMessages
+	}
+	return trafficSnapshot{sent, recv, messages, types}
 }
 
 func printTraffic(label string, beacons int, elapsed float64, before, after trafficSnapshot) {
@@ -252,8 +264,9 @@ func metrics(nodes []*asyrand.Node) (sent, recv, msg uint64) {
 	return
 }
 
-func messageMetrics(nodes []*asyrand.Node) map[string]p2p.MessageTypeMetrics {
+func messageMetrics(nodes []*asyrand.Node) (map[string]p2p.MessageTypeMetrics, bool) {
 	out := make(map[string]p2p.MessageTypeMetrics)
+	complete := true
 	for _, node := range nodes {
 		if tr, ok := node.Transport.(interface {
 			MessageTypeMetrics() map[string]p2p.MessageTypeMetrics
@@ -266,7 +279,9 @@ func messageMetrics(nodes []*asyrand.Node) map[string]p2p.MessageTypeMetrics {
 				x.RecvBytes += m.RecvBytes
 				out[name] = x
 			}
+		} else {
+			complete = false
 		}
 	}
-	return out
+	return out, complete
 }
