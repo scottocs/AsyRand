@@ -15,6 +15,20 @@ type Message struct {
 	To       NodeID          `json:"to,omitempty"`
 	Payload  json.RawMessage `json:"payload"`
 	SentAt   time.Time       `json:"sent_at"`
+	// Set only by a transport that binds the sender identity. Never serialized.
+	authenticated bool
+}
+
+func (m Message) Authenticated() bool { return m.authenticated }
+
+// AuthenticateReplay preserves origin authentication only for messages replayed
+// by their original sender over an authenticated channel, never by a third party.
+func (m Message) AuthenticateReplay(original Message) (Message, bool) {
+	if !m.authenticated || original.From != m.From {
+		return Message{}, false
+	}
+	original.authenticated = true
+	return original, true
 }
 
 func NewMessage(protocol, typ, instance string, from, to NodeID, payload any) (Message, error) {

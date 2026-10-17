@@ -2,11 +2,43 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 
 	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
+
+func TestPaperImplementationGroupOrientation(t *testing.T) {
+	group := suite()
+	if group.G1().PointLen() != 96 || group.G2().PointLen() != 48 {
+		t.Fatal("Section 5.1 requires physical G2 commitments and G1 encrypted shares")
+	}
+	ids := []p2p.NodeID{"n0", "n1"}
+	keys := make(map[p2p.NodeID]PVSSKeyPair)
+	public := make(map[p2p.NodeID]kyber.Point)
+	for _, id := range ids {
+		keys[id] = PVSSKeyPairFromSeed(HashBytes([]byte(id)))
+		public[id] = keys[id].Public
+	}
+	scheme, err := NewPVSSScheme("n0", 1, keys["n0"].Private, public, testSigningKeys("n0", ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript, _, err := scheme.Share("n0", 1, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, _ := hex.DecodeString(transcript.Commit["n0"])
+	cipher, _ := hex.DecodeString(transcript.Cipher["n0"])
+	sig, _ := hex.DecodeString(transcript.Proof.Signature)
+	if len(commit) != 96 || len(cipher) != 48 || len(sig) != 64 {
+		t.Fatal("incorrect paper implementation encodings")
+	}
+	if !scheme.Verify(transcript) {
+		t.Fatal("valid swapped-group transcript rejected")
+	}
+}
 
 func TestGRandBeaconCommitmentShareAndRecovery(t *testing.T) {
 	ids := []p2p.NodeID{"n0", "n1", "n2", "n3", "n4"}
@@ -19,7 +51,7 @@ func TestGRandBeaconCommitmentShareAndRecovery(t *testing.T) {
 	}
 	schemes := make(map[p2p.NodeID]*PVSSPairingFreeScheme)
 	for _, id := range ids {
-		scheme, err := NewPVSSScheme(id, threshold, keys[id].Private, public)
+		scheme, err := NewPVSSScheme(id, threshold, keys[id].Private, public, testSigningKeys(id, ids))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -81,7 +113,7 @@ func TestBeaconShareRejectsTamperedDLEQ(t *testing.T) {
 	}
 	schemes := make(map[p2p.NodeID]*PVSSPairingFreeScheme)
 	for _, id := range ids {
-		scheme, err := NewPVSSScheme(id, threshold, keys[id].Private, public)
+		scheme, err := NewPVSSScheme(id, threshold, keys[id].Private, public, testSigningKeys(id, ids))
 		if err != nil {
 			t.Fatal(err)
 		}

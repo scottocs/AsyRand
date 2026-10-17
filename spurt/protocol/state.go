@@ -15,16 +15,15 @@ type CommitmentRef struct {
 }
 
 type Beacon struct {
-	Epoch      uint64                     `json:"epoch"`
-	Random     []byte                     `json:"random"`
-	Digest     string                     `json:"digest"`
-	Selected   []CommitmentRef            `json:"selected"`
-	Signature  asig.BLSAggregateSignature `json:"signature"`
-	Committeds int                        `json:"committeds"`
-	Skipped    bool                       `json:"skipped,omitempty"`
-	SkipStage  string                     `json:"skip_stage,omitempty"`
-	SkipReason string                     `json:"skip_reason,omitempty"`
-	SkipDiag   string                     `json:"skip_diag,omitempty"`
+	Epoch      uint64          `json:"epoch"`
+	Random     []byte          `json:"random"`
+	Digest     string          `json:"digest"`
+	Selected   []CommitmentRef `json:"selected"`
+	Committeds int             `json:"committeds"`
+	Skipped    bool            `json:"skipped,omitempty"`
+	SkipStage  string          `json:"skip_stage,omitempty"`
+	SkipReason string          `json:"skip_reason,omitempty"`
+	SkipDiag   string          `json:"skip_diag,omitempty"`
 }
 
 type State struct {
@@ -77,6 +76,14 @@ func (s *State) Threshold() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.F + 1
+}
+
+// Quorum is 2f+1 at the paper's tight n=3f+1 configuration. For larger
+// committees n-f preserves an honest intersection: 2(n-f)-n > f.
+func (s *State) Quorum() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.N - s.F
 }
 
 func (s *State) MembersSnapshot() []p2p.NodeID {

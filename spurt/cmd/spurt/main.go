@@ -26,8 +26,6 @@ type runtimeKeys struct {
 	pubs       map[string]ed25519.PublicKey
 	pvssKeys   map[p2p.NodeID]asig.PVSSKeyPair
 	pvssPublic map[p2p.NodeID]kyber.Point
-	blsKeys    map[p2p.NodeID]asig.BLSKeyPair
-	blsPublic  map[string]kyber.Point
 	seed       []byte
 }
 
@@ -59,6 +57,9 @@ func main() {
 	}
 	if *nodeID != "" {
 		cfg.NodeID = p2p.NodeID(*nodeID)
+	}
+	if cfg.Transport != "memory" {
+		log.Fatal("SPURT currently requires authenticated memory transport; raw TCP is not authenticated")
 	}
 	runDuration := parseDuration(*duration)
 
@@ -98,51 +99,78 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	stopReport := startReporter(runCtx, cfg, nodes, stats)
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
-	var finalWindow finalMetricWindow
+	var finalWindow, runWindow finalMetricWindow
 
-	for epoch := uint64(0); epoch < uint64(cfg.Round); epoch++ {
-		result := make(chan *spurt.Beacon, len(nodes))
-		errCh := make(chan error, len(nodes))
-		for _, node := range nodes {
-			go func(n *spurt.Node) {
-				b, err := n.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
-				if err != nil {
-					errCh <- err
-					result <- nil
+	type localResult struct {
+		node      int
+		beacon    *spurt.Beacon
+		err       error
+		completed time.Time
+	}
+	results := make(chan localResult, len(nodes)*4)
+	for index, node := range nodes {
+		go func(index int, node *spurt.Node) {
+			for count := uint64(0); count < uint64(cfg.Round); count++ {
+				beacon, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
+				select {
+				case results <- localResult{index, beacon, err, time.Now()}:
+				case <-runCtx.Done():
 					return
 				}
-				result <- b
-				errCh <- nil
-			}(node)
-		}
-		var sample *spurt.Beacon
-		for i := 0; i < len(nodes); i++ {
-			b := <-result
-			if err := <-errCh; err != nil {
-				return err
+				if err != nil {
+					return
+				}
 			}
-			if sample == nil {
-				sample = b
-				continue
-			}
-			if b == nil || b.Epoch != sample.Epoch || b.Digest != sample.Digest || fmt.Sprintf("%x", b.Random) != fmt.Sprintf("%x", sample.Random) {
-				return fmt.Errorf("epoch %d inconsistent beacon: sample_digest=%s got_digest=%v", epoch, sample.Digest, b)
-			}
-		}
-		if sample == nil {
-			return fmt.Errorf("epoch %d produced no beacon", epoch)
-		}
-		if sample.Skipped {
-			fmt.Printf("ts=%s epoch=%d leader=%s skipped stage=%s reason=%s random=%x diag=\"%s\"\n",
-				logTimestamp(), sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
-			continue
-		}
-		stats.beacons.Add(1)
-		fmt.Printf("ts=%s epoch=%d leader=%s digest=%s selected=%d random=%x\n",
-			logTimestamp(), sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.Digest, sample.Committeds, sample.Random[:8])
-		finalWindow.recordBeacon(nodes)
+		}(index, node)
 	}
+	pending := make(map[uint64]map[int]localResult)
+	for epoch := uint64(0); epoch < uint64(cfg.Round); {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				return result.err
+			}
+			if result.beacon == nil || result.beacon.Skipped {
+				return fmt.Errorf("node %d returned invalid output", result.node)
+			}
+			e := result.beacon.Epoch
+			if e < epoch {
+				return fmt.Errorf("duplicate completed epoch %d", e)
+			}
+			if pending[e] == nil {
+				pending[e] = make(map[int]localResult)
+			}
+			if _, duplicate := pending[e][result.node]; duplicate {
+				return fmt.Errorf("duplicate node output")
+			}
+			pending[e][result.node] = result
+		case <-runCtx.Done():
+			return runCtx.Err()
+		}
+		for len(pending[epoch]) == len(nodes) {
+			sample := pending[epoch][0].beacon
+			completed := pending[epoch][0].completed
+			for _, r := range pending[epoch] {
+				if string(r.beacon.Random) != string(sample.Random) {
+					return fmt.Errorf("epoch %d inconsistent beacon", epoch)
+				}
+				if r.completed.After(completed) {
+					completed = r.completed
+				}
+			}
+			stats.beacons.Add(1)
+			fmt.Printf("ts=%s epoch=%d leader=%s digest=%s selected=%d random=%x\n", completed.UTC().Format(time.RFC3339Nano), sample.Epoch, nodes[0].State.Leader(sample.Epoch), sample.Digest, sample.Committeds, sample.Random[:8])
+			runWindow.recordBeacon(nodes)
+			if epoch >= uint64(cfg.WarmupOutputs) {
+				finalWindow.recordBeacon(nodes)
+			}
+			delete(pending, epoch)
+			epoch++
+		}
+	}
+
 	cacheTotal, cacheMax := collectCachedCommitments(nodes)
+	runWindow.printLabel("run", nodes, cacheTotal, cacheMax)
 	finalWindow.print(nodes, cacheTotal, cacheMax)
 	return nil
 }
@@ -229,19 +257,14 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 	}
 	pvssKeys := make(map[p2p.NodeID]asig.PVSSKeyPair, len(ids))
 	pvssPublic := make(map[p2p.NodeID]kyber.Point, len(ids))
-	blsKeys := make(map[p2p.NodeID]asig.BLSKeyPair, len(ids))
-	blsPublic := make(map[string]kyber.Point, len(ids))
 	for _, id := range ids {
 		pk := asig.PVSSKeyPairFromSeed(pvssSeeds[id])
 		pvssKeys[id] = pk
 		pvssPublic[id] = pk.Public
-		bk := asig.NewBLSKeyPairFromSeed(pvssSeeds[id])
-		blsKeys[id] = bk
-		blsPublic[string(id)] = bk.Public
 	}
 	return runtimeKeys{
 		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys, pvssPublic: pvssPublic,
-		blsKeys: blsKeys, blsPublic: blsPublic, seed: seed,
+		seed: seed,
 	}, nil
 }
 
@@ -252,7 +275,7 @@ func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Tra
 	}
 	return spurt.NewNode(spurt.NodeConfig{
 		ID: id, Members: rt.ids, F: cfg.F, Seed: rt.seed, Keys: rt.keys[id],
-		Public: rt.pubs, BLS: rt.blsKeys[id], BLSPublic: rt.blsPublic,
+		Public:    rt.pubs,
 		Transport: transport, PVSS: pvssScheme, CryptoWorkers: cfg.MaxPool, Lookahead: cfg.Lookahead,
 	})
 }
@@ -280,7 +303,7 @@ func parseDuration(raw string) time.Duration {
 
 func printConfig(cfg config.Config, nodes int, transport string) {
 	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d lookahead=%d epoch_ms=%d report_ms=%d crypto_workers=%d\n",
-		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.Lookahead, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
+		spurt.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.Lookahead, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}
@@ -374,11 +397,14 @@ func (w *finalMetricWindow) recordBeacon(nodes []*spurt.Node) {
 }
 
 func (w *finalMetricWindow) print(nodes []*spurt.Node, cacheTotal int, cacheMax int) {
+	w.printLabel("final", nodes, cacheTotal, cacheMax)
+}
+func (w *finalMetricWindow) printLabel(label string, nodes []*spurt.Node, cacheTotal int, cacheMax int) {
 	if !w.started {
-		printMetricDelta("final", metricSnapshot{}, spurt.PerfSnapshot{}, cacheTotal, cacheMax, 0, 0)
+		printMetricDelta(label, metricSnapshot{}, spurt.PerfSnapshot{}, cacheTotal, cacheMax, 0, 0)
 		return
 	}
-	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), cacheTotal, cacheMax, time.Since(w.start), w.beacons)
+	printMetricDelta(label, collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), cacheTotal, cacheMax, time.Since(w.start), w.beacons)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
@@ -404,16 +430,18 @@ func printMetricDelta(label string, delta metricSnapshot, perf spurt.PerfSnapsho
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s cached_total=%d cached_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s spurt_vote_avg=%s bls_sign_avg=%s bls_verify_avg=%s bls_agg_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent_bytes=%d recv_bytes=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s message_signs=%d message_verifies=%d message_sign_avg=%s message_verify_avg=%s cached_total=%d cached_max=%d pvss_share_avg=%s pvss_verify_avg=%s pvss_prerecon_avg=%s pvss_recon_avg=%s spurt_vote_avg=%s beacon_sign_avg=%s beacon_verify_avg=%s\n",
 		label, beacons, elapsed.Seconds(), float64(beacons)*60/seconds,
-		delta.sentMessages, delta.recvMessages, float64(delta.sentBytes)/1024,
+		delta.sentMessages, delta.recvMessages, delta.sentBytes, delta.recvBytes, float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024, float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
+		perf.MessageSignCount, perf.MessageVerifyCount,
+		spurt.AvgDuration(perf.MessageSignTotal, perf.MessageSignCount), spurt.AvgDuration(perf.MessageVerifyTotal, perf.MessageVerifyCount),
 		cacheTotal, cacheMax,
 		spurt.AvgDuration(perf.PVSSShareTotal, perf.PVSSShareCount), spurt.AvgDuration(perf.PVSSVerifyTotal, perf.PVSSVerifyCount),
 		spurt.AvgDuration(perf.PVSSPreReconTotal, perf.PVSSPreReconCount), spurt.AvgDuration(perf.PVSSReconTotal, perf.PVSSReconCount),
 		spurt.AvgDuration(perf.AgreementTotal, perf.AgreementCount),
-		spurt.AvgDuration(perf.BLSSignTotal, perf.BLSSignCount),
-		spurt.AvgDuration(perf.BLSVerifyTotal, perf.BLSVerifyCount), spurt.AvgDuration(perf.BLSAggregateTotal, perf.BLSAggregateCount),
+		spurt.AvgDuration(perf.BeaconSignTotal, perf.BeaconSignCount),
+		spurt.AvgDuration(perf.BeaconVerifyTotal, perf.BeaconVerifyCount),
 	)
 }
 

@@ -23,16 +23,21 @@ type PerfMetrics struct {
 }
 
 type PerfSnapshot struct {
-	PVSSShareCount  uint64
-	PVSSShareTotal  time.Duration
-	PVSSVerifyCount uint64
-	PVSSVerifyTotal time.Duration
-	SignCount       uint64
-	SignTotal       time.Duration
-	VerifyCount     uint64
-	VerifyTotal     time.Duration
-	RecoverCount    uint64
-	RecoverTotal    time.Duration
+	// Legacy output fields remain zero: ordinary messages have no outer signatures.
+	MessageSignCount   uint64
+	MessageSignTotal   time.Duration
+	MessageVerifyCount uint64
+	MessageVerifyTotal time.Duration
+	PVSSShareCount     uint64
+	PVSSShareTotal     time.Duration
+	PVSSVerifyCount    uint64
+	PVSSVerifyTotal    time.Duration
+	SignCount          uint64
+	SignTotal          time.Duration
+	VerifyCount        uint64
+	VerifyTotal        time.Duration
+	RecoverCount       uint64
+	RecoverTotal       time.Duration
 }
 
 func (p *PerfMetrics) addPvssShare(d time.Duration) {
@@ -77,6 +82,8 @@ func (p *PerfMetrics) Snapshot() PerfSnapshot {
 
 func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 	return PerfSnapshot{
+		MessageSignCount: s.MessageSignCount + o.MessageSignCount, MessageSignTotal: s.MessageSignTotal + o.MessageSignTotal,
+		MessageVerifyCount: s.MessageVerifyCount + o.MessageVerifyCount, MessageVerifyTotal: s.MessageVerifyTotal + o.MessageVerifyTotal,
 		PVSSShareCount:  s.PVSSShareCount + o.PVSSShareCount,
 		PVSSShareTotal:  s.PVSSShareTotal + o.PVSSShareTotal,
 		PVSSVerifyCount: s.PVSSVerifyCount + o.PVSSVerifyCount,
@@ -92,6 +99,8 @@ func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 
 func (s PerfSnapshot) Sub(o PerfSnapshot) PerfSnapshot {
 	return PerfSnapshot{
+		MessageSignCount: s.MessageSignCount - o.MessageSignCount, MessageSignTotal: s.MessageSignTotal - o.MessageSignTotal,
+		MessageVerifyCount: s.MessageVerifyCount - o.MessageVerifyCount, MessageVerifyTotal: s.MessageVerifyTotal - o.MessageVerifyTotal,
 		PVSSShareCount:  s.PVSSShareCount - o.PVSSShareCount,
 		PVSSShareTotal:  s.PVSSShareTotal - o.PVSSShareTotal,
 		PVSSVerifyCount: s.PVSSVerifyCount - o.PVSSVerifyCount,

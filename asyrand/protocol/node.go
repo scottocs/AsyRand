@@ -6,6 +6,7 @@ import (
 	"Tyche/asyrand/protocol/aba"
 	"Tyche/asyrand/protocol/rbc"
 	"Tyche/utils/p2p"
+	"Tyche/utils/verification"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -92,6 +93,7 @@ func (s *sender) pop() (p2p.Message, bool) {
 // captured-state completions to that actor; they never sign or install history.
 // Archives remain available for passive pull while old ABA relay handlers live.
 type Node struct {
+	checks            *verification.Cache
 	ID                p2p.NodeID
 	Config            config.Config
 	Transport         p2p.Transport
@@ -151,17 +153,18 @@ func New(cfg config.Config, id p2p.NodeID, t p2p.Transport) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	checks := verification.New()
 	pvkp := crypto.PVSSKeyPairFromSeed(seeds[id])
-	pv, err := crypto.NewPVSSScheme(id, cfg.Threshold(), pvkp.Private, setup.PVSS)
+	pv, err := crypto.NewALBATROSSPVSSScheme(id, cfg.Threshold(), pvkp.Private, setup.PVSS, checks)
 	if err != nil {
 		return nil, err
 	}
-	v, err := NewVerifier(setup)
+	v, err := NewVerifier(setup, checks)
 	if err != nil {
 		return nil, err
 	}
-	n := &Node{ID: id, Config: cfg, Transport: t, Public: setup, private: kp.Private, pvss: pv, verifier: v, events: make(chan func(), cfg.TransportBuffer), jobs: make(chan func(), cfg.TransportBuffer), senders: make(map[p2p.NodeID]*sender), ready: make(map[uint64]map[p2p.NodeID]Object), tasks: make(map[uint64]*columnTask), instances: make(map[string]*aba.Instance), coreArchive: make(map[string]map[uint64][]p2p.Message), validationPending: make(map[string][]p2p.Message), begun: make(map[uint64]bool), columns: v.columns, nextSeq: 1, history: make(map[uint64]Entry), columnArchive: make(map[uint64]Column), notify: make(chan struct{}), earlyShares: make(map[uint64]map[p2p.NodeID]reconPacket), witnesses: make(map[uint64]Entry)}
-	n.rbc = rbc.New(rbc.Config{ID: id, F: cfg.F, Members: setup.Members, Context: setup.Context, Private: kp.Private, Public: setup.Signing})
+	n := &Node{checks: checks, ID: id, Config: cfg, Transport: t, Public: setup, private: kp.Private, pvss: pv, verifier: v, events: make(chan func(), cfg.TransportBuffer), jobs: make(chan func(), cfg.TransportBuffer), senders: make(map[p2p.NodeID]*sender), ready: make(map[uint64]map[p2p.NodeID]Object), tasks: make(map[uint64]*columnTask), instances: make(map[string]*aba.Instance), coreArchive: make(map[string]map[uint64][]p2p.Message), validationPending: make(map[string][]p2p.Message), begun: make(map[uint64]bool), columns: v.columns, nextSeq: 1, history: make(map[uint64]Entry), columnArchive: make(map[uint64]Column), notify: make(chan struct{}), earlyShares: make(map[uint64]map[p2p.NodeID]reconPacket), witnesses: make(map[uint64]Entry)}
+	n.rbc = rbc.New(rbc.Config{Verification: checks, ID: id, F: cfg.F, Members: setup.Members, Context: setup.Context, Private: kp.Private, Public: setup.Signing, Authenticated: p2p.AuthenticatedDelivery(t)})
 	return n, nil
 }
 func (n *Node) Start(ctx context.Context) error {
@@ -365,7 +368,9 @@ func (n *Node) newABA(id string) *aba.Instance {
 	if a := n.instances[id]; a != nil {
 		return a
 	}
-	a, err := aba.New(aba.Config{PublicConfig: n.Public.ABA(), ID: n.ID, Instance: id, Private: n.private})
+	acfg := n.Public.ABA()
+	acfg.Verification = n.checks
+	a, err := aba.New(aba.Config{PublicConfig: acfg, ID: n.ID, Instance: id, Private: n.private, Authenticated: p2p.AuthenticatedDelivery(n.Transport)})
 	if err != nil {
 		n.fail(err)
 		return nil
@@ -468,7 +473,7 @@ func (n *Node) handle(m p2p.Message) {
 	}
 }
 func (n *Node) handleRBC(m p2p.Message) {
-	p, ok := rbc.Authenticate(n.Public.Context, n.Public.Signing, m)
+	p, ok := rbc.Authenticate(n.Public.Context, n.Public.Signing, m, n.checks)
 	if !ok {
 		n.Perf.Invalid.Add(1)
 		return
@@ -862,7 +867,10 @@ func envelopeStatement(context, typ string, from p2p.NodeID, body json.RawMessag
 }
 func (n *Node) send(typ string, to p2p.NodeID, body any) {
 	raw := json.RawMessage(encode(body))
-	p := envelope{n.Public.Context, raw, hex.EncodeToString(ed25519.Sign(n.private, envelopeStatement(n.Public.Context, typ, n.ID, raw)))}
+	p := envelope{Context: n.Public.Context, Body: raw}
+	if !p2p.AuthenticatedDelivery(n.Transport) {
+		p.Signature = hex.EncodeToString(ed25519.Sign(n.private, envelopeStatement(n.Public.Context, typ, n.ID, raw)))
+	}
 	m, _ := p2p.NewMessage(Protocol, typ, n.Public.Context, n.ID, to, p)
 	n.emit([]p2p.Message{m})
 }
@@ -870,7 +878,7 @@ func (n *Node) handleBeacon(m p2p.Message) {
 	p, err := p2p.DecodePayload[envelope](m)
 	pub := n.Public.Signing[string(m.From)]
 	sig, err2 := hex.DecodeString(p.Signature)
-	if err != nil || err2 != nil || len(pub) != 32 || p.Context != n.Public.Context || m.Instance != n.Public.Context || !ed25519.Verify(pub, envelopeStatement(p.Context, m.Type, m.From, p.Body), sig) {
+	if err != nil || err2 != nil || len(pub) != 32 || p.Context != n.Public.Context || m.Instance != n.Public.Context || !(p.Signature == "" && m.Authenticated() || p.Signature != "" && n.checks.Ed25519(pub, envelopeStatement(p.Context, m.Type, m.From, p.Body), sig)) {
 		n.Perf.Invalid.Add(1)
 		return
 	}
@@ -959,6 +967,15 @@ func (n *Node) handleBeacon(m p2p.Message) {
 			return
 		}
 		for _, core := range x.Core {
+			if core.Type != aba.PRE && core.Type != aba.VOTE && core.Type != aba.MAIN && core.Type != aba.FINAL {
+				continue
+			}
+			if core.From != m.From {
+				continue
+			}
+			if trusted, ok := m.AuthenticateReplay(core); ok {
+				core = trusted
+			}
 			n.routeABA(core)
 		}
 	case "REPLY":

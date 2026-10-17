@@ -2,7 +2,6 @@ package grandline
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,10 +12,15 @@ import (
 	asig "Tyche/grandline/crypto"
 	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
+	"Tyche/utils/verification"
 	"go.dedis.ch/kyber/v3"
 )
 
-const Protocol = "grandline"
+const Protocol = "grandline/authenticated-v1"
+const ReferenceProtocol = "grandline/reference-v1"
+
+// Keep the mathematical epoch input stable across the transport-format change.
+const beaconEpochDomain = "grandline/paper-v3/epoch"
 
 const (
 	defaultEpochTimeout = 20 * time.Second
@@ -25,9 +29,11 @@ const (
 var errEpochTimeout = errors.New("epoch timeout")
 
 type Node struct {
+	reference bool
+	signer    *asig.BeaconSigner
+	ctx       context.Context
+	checks    *verification.Cache
 	ID        p2p.NodeID
-	Keys      asig.KeyPair
-	Public    map[string]ed25519.PublicKey
 	Transport p2p.Transport
 	Perf      *PerfMetrics
 	State     *State
@@ -47,17 +53,18 @@ type Node struct {
 }
 
 type NodeConfig struct {
-	ID            p2p.NodeID
-	Members       []p2p.NodeID
-	F             int
-	QueueLen      int
-	Seed          []byte
-	Keys          asig.KeyPair
-	Public        map[string]ed25519.PublicKey
-	Transport     p2p.Transport
-	PVSS          asig.PVSSScheme
-	GRand         asig.GRandShare
-	CryptoWorkers int
+	BeaconMode           string
+	ReferenceCommitments map[p2p.NodeID]asig.BeaconCommitment
+	ReferenceAlpha       string
+	ID                   p2p.NodeID
+	Members              []p2p.NodeID
+	F                    int
+	QueueLen             int
+	Seed                 []byte
+	Transport            p2p.Transport
+	PVSS                 asig.PVSSScheme
+	GRand                asig.GRandShare
+	CryptoWorkers        int
 }
 
 type shareMessage struct {
@@ -66,19 +73,40 @@ type shareMessage struct {
 }
 
 type roundState struct {
+	crypto     *asig.BeaconEpoch
 	epoch      uint64
 	msg        []byte
-	shares     map[p2p.NodeID]asig.BeaconShare
+	shares     map[p2p.NodeID]*asig.VerifiedBeaconShare
+	verifying  map[p2p.NodeID]verification.Key
+	candidates map[p2p.NodeID][]shareCandidate
 	delivered  bool
 	recovering bool
 }
 
+type shareCandidate struct {
+	payload shareMessage
+	key     verification.Key
+}
+
 func NewNode(cfg NodeConfig) (*Node, error) {
+	// "signed" is a legacy configuration alias; it no longer enables signing.
+	if cfg.BeaconMode == "signed" {
+		cfg.BeaconMode = "standard"
+	}
+	if cfg.BeaconMode != "" && cfg.BeaconMode != "standard" && cfg.BeaconMode != "reference" {
+		return nil, errors.New("unknown beacon mode")
+	}
 	if cfg.ID == "" {
 		return nil, errors.New("node id is required")
 	}
 	if cfg.Transport == nil {
 		return nil, errors.New("transport is required")
+	}
+	if !p2p.AuthenticatedDelivery(cfg.Transport) {
+		return nil, errors.New("GRandLine requires authenticated delivery without outer message signatures")
+	}
+	if cfg.Transport.ID() != cfg.ID {
+		return nil, errors.New("transport identity does not match node id")
 	}
 	if cfg.PVSS == nil {
 		return nil, errors.New("pvss scheme is required")
@@ -89,14 +117,47 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if len(cfg.Members) < 2*cfg.F+1 {
 		return nil, errors.New("must satisfy n >= 2f + 1")
 	}
+	checks := verification.New()
+	if owner, ok := cfg.PVSS.(interface{ VerificationCache() *verification.Cache }); ok {
+		checks = verification.Select(owner.VerificationCache())
+	}
 	state := NewState(cfg.Members, cfg.F, cfg.QueueLen, cfg.Seed)
-	return &Node{
-		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public, Transport: cfg.Transport, Perf: &PerfMetrics{},
-		State: state, PVSS: cfg.PVSS, Crypto: cryptoexec.New(cfg.CryptoWorkers), GRand: cfg.GRand,
+	n := &Node{checks: checks, reference: cfg.BeaconMode == "reference",
+		ID: cfg.ID, Transport: cfg.Transport, Perf: &PerfMetrics{},
+		State: state, PVSS: cfg.PVSS, GRand: cfg.GRand,
 		rounds: make(map[string]*roundState), pendingShares: make(map[string][]shareMessage),
 		commitments: make(map[p2p.NodeID]*asig.VerifiedBeaconCommitment),
 		beacons:     make(chan *Beacon, state.N*4),
-	}, nil
+	}
+	if n.reference {
+		if len(cfg.ReferenceCommitments) != len(cfg.Members) {
+			return nil, errors.New("missing fixed reference commitments")
+		}
+		for _, id := range cfg.Members {
+			c, ok := cfg.ReferenceCommitments[id]
+			if !ok || c.Signer != id || cfg.GRand.PublicShares[id] == "" {
+				return nil, errors.New("reference commitment identity mismatch")
+			}
+			checked, ok := asig.DecodeAndVerifyBeaconCommitment(cfg.GRand.PublicShares[id], c, checks)
+			if !ok {
+				return nil, errors.New("invalid fixed reference commitment")
+			}
+			n.commitments[id] = checked
+		}
+		a, err := asig.DecodeReferenceAlpha(cfg.ReferenceAlpha)
+		if err != nil {
+			return nil, err
+		}
+		var errSigner error
+		n.signer, errSigner = asig.NewBeaconSigner(n.ID, n.GRand.SecretShare, a, n.commitments[n.ID])
+		if errSigner != nil {
+			return nil, errSigner
+		}
+		n.commitAlpha = a
+		n.commitSent = true
+	}
+	n.Crypto = cryptoexec.New(cfg.CryptoWorkers)
+	return n, nil
 }
 
 func (n *Node) Start(ctx context.Context) error {
@@ -108,6 +169,7 @@ func (n *Node) Start(ctx context.Context) error {
 }
 
 func (n *Node) StartProtocol(ctx context.Context) {
+	n.ctx = ctx
 	go n.dispatch(ctx)
 }
 
@@ -132,19 +194,15 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 	st := n.ensureRoundState(key, epoch, msg)
 
 	signStart := time.Now()
-	commitment, ok := n.commitmentFor(n.ID)
-	if !ok {
-		return nil, errors.New("local beacon commitment is not available")
-	}
-	share, err := asig.NewBeaconShareWithCommitment(epoch, msg, n.ID, n.GRand.SecretShare, n.commitAlpha, commitment.CM1)
+	share, verified, err := n.signer.Share(st.crypto)
 	if err != nil {
 		return nil, err
 	}
 	if n.Perf != nil {
 		n.Perf.addSign(time.Since(signStart))
 	}
-	n.recordLocalShare(st, share)
-	out, err := p2p.NewMessage(Protocol, "SHARE", key, n.ID, "", shareMessage{Epoch: epoch, Share: share})
+	n.storeVerifiedShare(st, shareMessage{Epoch: epoch, Share: share}, verified)
+	out, err := n.newMessage("SHARE", key, shareMessage{Epoch: epoch, Share: share})
 	if err != nil {
 		return nil, err
 	}
@@ -160,26 +218,11 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 			n.State.Advance(beacon.Random, "")
 			return beacon, nil
 		case <-overall.C:
-			return n.SkipCurrentEpochAt("beacon_wait", "timeout"), nil
+			return nil, fmt.Errorf("%w: %s", errEpochTimeout, n.skipDiagnostics(key))
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-}
-
-func (n *Node) SkipCurrentEpoch(reason string) *Beacon {
-	return n.SkipCurrentEpochAt(reason, reason)
-}
-
-func (n *Node) SkipCurrentEpochAt(stage string, reason string) *Beacon {
-	epoch, random := n.State.Skip(reason)
-	key := roundKey(epoch)
-	diag := n.skipDiagnostics(key)
-	n.roundMu.Lock()
-	delete(n.rounds, key)
-	delete(n.pendingShares, key)
-	n.roundMu.Unlock()
-	return &Beacon{Epoch: epoch, Random: random, Commit: reason, Skipped: true, SkipStage: stage, SkipReason: reason, SkipDiag: diag}
 }
 
 func (n *Node) skipDiagnostics(key string) string {
@@ -212,18 +255,25 @@ func (n *Node) dispatch(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if msg.Protocol != Protocol {
-				continue
-			}
-			switch msg.Type {
-			case "COMMIT":
-				_ = n.handleCommitment(msg)
-			case "SHARE":
-				_ = n.handleShare(msg)
-			}
+			n.dispatchMessage(msg)
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+func (n *Node) dispatchMessage(msg p2p.Message) {
+	if msg.Protocol != n.wireProtocol() || !msg.Authenticated() || n.GRand.PublicShares[msg.From] == "" {
+		return
+	}
+	if n.reference && msg.Type != "SHARE" {
+		return
+	}
+	switch msg.Type {
+	case "COMMIT":
+		_ = n.handleCommitment(msg)
+	case "SHARE":
+		_ = n.handleShare(msg)
 	}
 }
 
@@ -235,11 +285,14 @@ func (n *Node) handleShare(msg p2p.Message) error {
 		return err
 	}
 	key := roundKey(payload.Epoch)
-	if payload.Share.Signer == "" {
-		payload.Share.Signer = msg.From
+	if payload.Share.Signer != msg.From || n.GRand.PublicShares[msg.From] == "" || payload.Share.Epoch != payload.Epoch || msg.Instance != key {
+		return nil
 	}
 	st := n.getRound(key)
 	if st == nil {
+		if n.State != nil && payload.Epoch < n.State.CurrentEpoch() {
+			return nil
+		}
 		n.roundMu.Lock()
 		n.pendingShares[key] = append(n.pendingShares[key], payload)
 		n.roundMu.Unlock()
@@ -261,16 +314,21 @@ func (n *Node) ensureCommitment(ctx context.Context) error {
 		return err
 	}
 	publicShare := n.GRand.PublicShares[n.ID]
-	verified, ok := asig.DecodeAndVerifyBeaconCommitment(publicShare, commitment)
+	verified, ok := asig.DecodeAndVerifyBeaconCommitment(publicShare, commitment, n.checks)
 	if !ok {
 		n.roundMu.Unlock()
 		return errors.New("generated invalid beacon commitment")
 	}
 	n.commitments[n.ID] = verified
+	n.signer, err = asig.NewBeaconSigner(n.ID, n.GRand.SecretShare, alpha, verified)
+	if err != nil {
+		n.roundMu.Unlock()
+		return err
+	}
 	n.commitAlpha = alpha
 	n.commitSent = true
 	n.roundMu.Unlock()
-	msg, err := p2p.NewMessage(Protocol, "COMMIT", "commitment", n.ID, "", commitment)
+	msg, err := n.newMessage("COMMIT", "commitment", commitment)
 	if err != nil {
 		return err
 	}
@@ -282,11 +340,11 @@ func (n *Node) handleCommitment(msg p2p.Message) error {
 	if err != nil {
 		return err
 	}
-	if commitment.Signer == "" {
-		commitment.Signer = msg.From
+	if commitment.Signer != msg.From || n.GRand.PublicShares[msg.From] == "" || msg.Instance != "commitment" {
+		return nil
 	}
 	publicShare := n.GRand.PublicShares[commitment.Signer]
-	verified, ok := asig.DecodeAndVerifyBeaconCommitment(publicShare, commitment)
+	verified, ok := asig.DecodeAndVerifyBeaconCommitment(publicShare, commitment, n.checks)
 	if publicShare == "" || !ok {
 		return nil
 	}
@@ -305,16 +363,12 @@ func (n *Node) handleCommitment(msg p2p.Message) error {
 	return nil
 }
 
-func (n *Node) recordLocalShare(st *roundState, share asig.BeaconShare) {
-	n.recordShare(st, shareMessage{Epoch: st.epoch, Share: share})
-}
-
 func (n *Node) recordShare(st *roundState, payload shareMessage) {
 	if payload.Share.Signer == "" || payload.Share.Sigma1 == "" || payload.Share.Sigma2 == "" {
 		return
 	}
 	n.roundMu.Lock()
-	if st.delivered || st.recovering {
+	if st.delivered || st.recovering || st.shares[payload.Share.Signer] != nil {
 		n.roundMu.Unlock()
 		return
 	}
@@ -328,40 +382,81 @@ func (n *Node) recordShare(st *roundState, payload shareMessage) {
 		n.roundMu.Unlock()
 		return
 	}
-	msg := append([]byte(nil), st.msg...)
-	n.Crypto.Go(context.Background(), func() {
-		n.verifyAndRecordShare(st, payload, commitment, msg)
+	n.roundMu.Lock()
+	if st.verifying == nil {
+		st.verifying = make(map[p2p.NodeID]verification.Key)
+	}
+	if st.delivered || st.recovering || st.shares[payload.Share.Signer] != nil {
+		n.roundMu.Unlock()
+		return
+	}
+	key := verification.JSONKey("grandline/candidate", payload)
+	if active, ok := st.verifying[payload.Share.Signer]; ok {
+		if active != key {
+			if st.candidates == nil {
+				st.candidates = make(map[p2p.NodeID][]shareCandidate)
+			}
+			pending := st.candidates[payload.Share.Signer]
+			duplicate := false
+			for _, old := range pending {
+				if old.key == key {
+					duplicate = true
+					break
+				}
+			}
+			// Authenticated peers cannot occupy another identity's slots. Bound
+			// equivocation by faulty senders without dropping the next candidate.
+			if !duplicate && len(pending) < 32 {
+				st.candidates[payload.Share.Signer] = append(pending, shareCandidate{payload, key})
+			}
+		}
+		n.roundMu.Unlock()
+		return
+	}
+	st.verifying[payload.Share.Signer] = key
+	n.roundMu.Unlock()
+	n.Crypto.GoPriority(n.workContext(), func() {
+		n.verifyAndRecordShare(st, payload, commitment, key)
 	})
 }
 
-func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commitment *asig.VerifiedBeaconCommitment, msg []byte) {
+func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commitment *asig.VerifiedBeaconCommitment, key verification.Key) {
+	defer n.finishCandidate(st, payload.Share.Signer, key)
 	n.roundMu.Lock()
-	if st.delivered || st.recovering {
+	if st.delivered || st.recovering || st.shares[payload.Share.Signer] != nil {
 		n.roundMu.Unlock()
 		return
 	}
 	n.roundMu.Unlock()
 	acceptStart := time.Now()
-	if !asig.VerifyBeaconShareWithCommitment(msg, commitment, payload.Share) {
+	verified, ok := st.crypto.VerifyShare(commitment, payload.Share, n.checks)
+	if !ok {
 		return
 	}
 	if n.Perf != nil {
 		n.Perf.addVerify(time.Since(acceptStart))
 	}
+	n.storeVerifiedShare(st, payload, verified)
+}
+func (n *Node) storeVerifiedShare(st *roundState, payload shareMessage, verified *asig.VerifiedBeaconShare) {
+	if payload.Epoch != st.epoch || !st.crypto.Accepts(verified, payload.Share.Signer) {
+		return
+	}
 	n.roundMu.Lock()
+	delete(st.candidates, payload.Share.Signer)
 	if st.delivered {
 		n.roundMu.Unlock()
 		return
 	}
 	if st.shares == nil {
-		st.shares = make(map[p2p.NodeID]asig.BeaconShare)
+		st.shares = make(map[p2p.NodeID]*asig.VerifiedBeaconShare)
 	}
 	if _, exists := st.shares[payload.Share.Signer]; exists {
 		n.roundMu.Unlock()
 		return
 	}
-	parts := make([]asig.BeaconShare, 0, len(st.shares)+1)
-	st.shares[payload.Share.Signer] = payload.Share
+	parts := make([]*asig.VerifiedBeaconShare, 0, len(st.shares)+1)
+	st.shares[payload.Share.Signer] = verified
 	for _, share := range st.shares {
 		parts = append(parts, share)
 	}
@@ -379,7 +474,7 @@ func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commit
 		return
 	}
 	recoverStart := time.Now()
-	random, signature, err := asig.RecoverBeacon(msg, parts, threshold, n.State.MembersSnapshot())
+	random, signature, err := st.crypto.Recover(parts, threshold, n.State.MembersSnapshot())
 	if n.Perf != nil {
 		n.Perf.addRecover(time.Since(recoverStart))
 	}
@@ -402,7 +497,7 @@ func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commit
 	beacon := &Beacon{
 		Epoch:  epoch,
 		Random: random,
-		Commit: hex.EncodeToString(msg),
+		Commit: hex.EncodeToString(st.msg),
 		SigHex: signature,
 		Shares: sharesCount,
 	}
@@ -451,7 +546,8 @@ func (n *Node) ensureRoundState(key string, epoch uint64, msg []byte) *roundStat
 		st = &roundState{
 			epoch:  epoch,
 			msg:    msg,
-			shares: make(map[p2p.NodeID]asig.BeaconShare),
+			shares: make(map[p2p.NodeID]*asig.VerifiedBeaconShare),
+			crypto: asig.NewBeaconEpoch(epoch, msg),
 		}
 		n.rounds[key] = st
 		pending = append(pending, n.pendingShares[key]...)
@@ -471,15 +567,57 @@ func (n *Node) getRound(key string) *roundState {
 }
 
 func (n *Node) beaconMsg(epoch uint64) []byte {
-	payload := struct {
-		Protocol string `json:"protocol"`
-		Epoch    uint64 `json:"epoch"`
-		RPrev    string `json:"rprev"`
-	}{
-		Protocol: Protocol,
-		Epoch:    epoch,
-		RPrev:    hex.EncodeToString(n.State.RPrevBytes()),
+	return encodeBeaconEpoch(n.GRand.PublicKey, epoch)
+}
+func encodeBeaconEpoch(publicKey string, epoch uint64) []byte {
+	raw, _ := json.Marshal(struct {
+		Domain, PublicKey string
+		Epoch             uint64
+	}{beaconEpochDomain, publicKey, epoch})
+	return raw
+}
+
+func (n *Node) newMessage(typ, instance string, payload any) (p2p.Message, error) {
+	if !p2p.AuthenticatedDelivery(n.Transport) || (n.reference && typ != "SHARE") {
+		return p2p.Message{}, errors.New("message requires authenticated delivery and an allowed type")
 	}
-	raw, _ := json.Marshal(payload)
-	return asig.HashBytes(raw)
+	return p2p.NewMessage(n.wireProtocol(), typ, instance, n.ID, "", payload)
+}
+
+func (n *Node) wireProtocol() string {
+	if n.reference {
+		return ReferenceProtocol
+	}
+	return Protocol
+}
+func (n *Node) workContext() context.Context {
+	if n.ctx != nil {
+		return n.ctx
+	}
+	return context.Background()
+}
+
+func (n *Node) finishCandidate(st *roundState, id p2p.NodeID, key verification.Key) {
+	n.roundMu.Lock()
+	if active, ok := st.verifying[id]; !ok || active != key {
+		n.roundMu.Unlock()
+		return
+	}
+	delete(st.verifying, id)
+	pending := st.candidates[id]
+	if st.delivered || st.recovering || st.shares[id] != nil {
+		delete(st.candidates, id)
+		n.roundMu.Unlock()
+		return
+	}
+	var next *shareCandidate
+	if len(pending) > 0 {
+		copy := pending[0]
+		next = &copy
+		st.candidates[id] = pending[1:]
+	}
+	n.roundMu.Unlock()
+	if next != nil {
+		n.recordShare(st, next.payload)
+	}
 }

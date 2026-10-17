@@ -45,7 +45,7 @@ func Setup(cfg config.Config) (PublicSetup, error) {
 	for _, id := range s.Members {
 		s.PVSS[id] = crypto.PVSSKeyPairFromSeed(seeds[id]).Public
 	}
-	pv, err := crypto.NewPVSSVerifier(s.F+1, s.PVSS)
+	pv, err := crypto.NewALBATROSSPVSSVerifier(s.F+1, s.PVSS)
 	if err != nil {
 		return s, err
 	}

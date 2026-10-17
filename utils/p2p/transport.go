@@ -25,3 +25,10 @@ type Transport interface {
 	Metrics() Metrics
 	Close() error
 }
+
+// AuthenticatedDelivery is an explicit capability, not a deployment setting.
+// Unauthenticated transports continue to require application signatures.
+func AuthenticatedDelivery(t Transport) bool {
+	x, ok := t.(interface{ AuthenticatedDelivery() bool })
+	return ok && x.AuthenticatedDelivery()
+}

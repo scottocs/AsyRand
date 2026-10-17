@@ -5,6 +5,7 @@ import (
 	"Tyche/asyrand/protocol/aba"
 	"Tyche/asyrand/protocol/rbc"
 	"Tyche/utils/p2p"
+	"Tyche/utils/verification"
 	"errors"
 	"fmt"
 )
@@ -12,6 +13,7 @@ import (
 // Verifier checks public transcripts without any shareholder private key.
 // It is sequential; callers serialize AddColumn and Apply.
 type Verifier struct {
+	checks  *verification.Cache
 	setup   PublicSetup
 	pvss    *crypto.PVSSPairingFreeScheme
 	aba     *aba.Verifier
@@ -27,16 +29,19 @@ type verifiedPVSS struct {
 	seq    uint64
 }
 
-func NewVerifier(s PublicSetup) (*Verifier, error) {
-	pv, err := crypto.NewPVSSVerifier(s.F+1, s.PVSS)
+func NewVerifier(s PublicSetup, caches ...*verification.Cache) (*Verifier, error) {
+	checks := verification.Select(caches...)
+	pv, err := crypto.NewALBATROSSPVSSVerifier(s.F+1, s.PVSS, checks)
 	if err != nil {
 		return nil, err
 	}
-	av, err := aba.NewVerifier(s.ABA())
+	acfg := s.ABA()
+	acfg.Verification = checks
+	av, err := aba.NewVerifier(acfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Verifier{setup: s, pvss: pv, aba: av, columns: make(map[uint64]Column), objects: make(map[string]verifiedPVSS)}, nil
+	return &Verifier{checks: checks, setup: s, pvss: pv, aba: av, columns: make(map[uint64]Column), objects: make(map[string]verifiedPVSS)}, nil
 }
 func (v *Verifier) AddColumn(c Column) error {
 	if old, ok := v.columns[c.Record.Column]; ok {
@@ -86,7 +91,7 @@ func (v *Verifier) AddColumn(c Column) error {
 			a := r.Accepted[accepted]
 			o := c.Objects[accepted]
 			h := rbc.Hash(encode(o.Transcript))
-			if a.Source != id || o.Transcript.Dealer != id || o.Transcript.Seq != r.Column || a.Hash != h || o.Delivery.Hash != h || o.Delivery.Dealer != id || o.Delivery.Seq != r.Column || !rbc.VerifyCertificate(v.setup.Context, v.setup.Signing, v.setup.F, o.Delivery) {
+			if a.Source != id || o.Transcript.Dealer != id || o.Transcript.Seq != r.Column || a.Hash != h || o.Delivery.Hash != h || o.Delivery.Dealer != id || o.Delivery.Seq != r.Column || !rbc.VerifyCertificate(v.setup.Context, v.setup.Signing, v.setup.F, o.Delivery, v.checks) {
 				return errors.New("invalid object binding or delivery certificate")
 			}
 			if _, verified := v.objects[h]; !verified {

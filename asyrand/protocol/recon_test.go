@@ -86,12 +86,19 @@ func TestProtocolAndPublicHistory(t *testing.T) {
 					}
 				}
 				h := nodes[0].Export(outputs)
+				for _, object := range h.Genesis.Objects {
+					if object.Transcript.Version != "AsyRand-v1/ALBATROSS-DDH/edwards25519" || len(object.Transcript.Proof.Coefficients) != nodes[0].Config.Threshold() {
+						t.Fatal("protocol did not use ALBATROSS PVSS")
+					}
+				}
 				if err := VerifyHistory(nodes[0].Public, h); err != nil {
 					t.Fatal(err)
 				}
 				for _, mutate := range []func(*History){func(x *History) { x.Entries[0].Record.Random = string(make([]byte, 64)) }, func(x *History) { x.Entries[0].Record.NextColumnHash = "bad" }, func(x *History) { x.Entries[0].Shares = append(x.Entries[0].Shares, x.Entries[0].Shares[0]) }, func(x *History) { x.Genesis.Objects[0].Delivery.Signatures[0].Signature = "00" }, func(x *History) { x.Genesis.Record.Accepted[0].Hash = "bad" }, func(x *History) { x.Entries[0].Shares = x.Entries[0].Shares[:1] },
 					func(x *History) { x.Entries[0].Shares[1] = x.Entries[0].Shares[0] },
 					func(x *History) { x.Entries[0].Shares[0].Proof.R = "00" },
+					func(x *History) { x.Entries[0].Shares[0].Proof.A = "" },
+					func(x *History) { x.Entries[0].Shares[0].Proof.B = "" },
 					func(x *History) { x.Entries[0].Shares[0].Holder = "unknown" }} {
 					bad := clone(h)
 					mutate(&bad)
@@ -873,7 +880,7 @@ func TestPVSSCacheCannotRebindRBCPosition(t *testing.T) {
 			seeds, _ := cfg.NodeSeedBytes()
 			dealer := p2p.NodeID("node1")
 			kp := crypto.PVSSKeyPairFromSeed(seeds[dealer])
-			scheme, err := crypto.NewPVSSScheme(dealer, cfg.Threshold(), kp.Private, node.Public.PVSS)
+			scheme, err := crypto.NewALBATROSSPVSSScheme(dealer, cfg.Threshold(), kp.Private, node.Public.PVSS)
 			if err != nil {
 				t.Fatal(err)
 			}

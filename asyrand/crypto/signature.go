@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"Tyche/utils/verification"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -28,9 +29,14 @@ func Sign(priv ed25519.PrivateKey, msg []byte) []byte {
 	return ed25519.Sign(priv, digest[:])
 }
 
-func Verify(pub ed25519.PublicKey, msg, sig []byte) bool {
+func Verify(pub ed25519.PublicKey, msg, sig []byte, caches ...*verification.Cache) bool {
+	valid, _ := VerifyOnce(pub, msg, sig, verification.Optional(caches...))
+	return valid
+}
+
+func VerifyOnce(pub ed25519.PublicKey, msg, sig []byte, cache *verification.Cache) (bool, bool) {
 	digest := sha256.Sum256(msg)
-	return ed25519.Verify(pub, digest[:], sig)
+	return cache.Ed25519Once(pub, digest[:], sig)
 }
 
 type SignatureShare struct {

@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -37,6 +38,25 @@ def fields(data, prefix):
     if not match:
         raise RuntimeError("missing log record: " + prefix)
     return dict(item.split("=", 1) for item in match[1].split())
+
+
+def window_timing(data, warmup, intervals):
+    """Use the runner's Go monotonic duration; UTC is diagnostic/percentile only."""
+    packets = re.findall(r"^ts=(\S+) epoch=(\d+) .*?random=", data, re.M)
+    times = [stamp(ts) for ts, _ in packets][warmup:]
+    final = fields(data, "final metrics")
+    if int(final["beacons"]) != intervals or len(times) != intervals+1:
+        raise RuntimeError("monotonic/UTC measurement windows differ")
+    elapsed = float(final["elapsed_s"])
+    if elapsed <= 0:
+        raise RuntimeError("invalid monotonic duration")
+    utc_elapsed = (times[-1]-times[0])/1e9
+    gaps = sorted((b-a)/1e6 for a, b in zip(times, times[1:]))
+    suspect = abs(utc_elapsed-elapsed) > max(.02, .01*elapsed) or gaps[0] <= 0
+    return dict(elapsed_s=elapsed, beacon_s=intervals/elapsed,
+                wallclock_elapsed_s=utc_elapsed, wallclock_timing_suspect=suspect,
+                p50_interval_ms="" if suspect else statistics.median(gaps),
+                p95_interval_ms="" if suspect else gaps[math.ceil(.95*len(gaps))-1])
 
 
 def source_hash():

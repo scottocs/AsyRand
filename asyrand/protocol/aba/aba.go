@@ -33,6 +33,7 @@ var (
 )
 
 type Config struct {
+	Authenticated bool
 	PublicConfig
 	ID       p2p.NodeID
 	Instance string
@@ -46,18 +47,18 @@ type CoreMessage struct {
 	CommitteeID string `json:"committee_id"`
 	Round       uint64 `json:"round"`
 	Value       Value  `json:"value"`
-	SigHex      string `json:"sig_hex"`
+	SigHex      string `json:"sig_hex,omitempty"`
 }
 
 type DecisionVote struct {
 	CommitteeID string `json:"committee_id"`
 	Bit         Value  `json:"bit"`
-	SigHex      string `json:"sig_hex"`
+	SigHex      string `json:"sig_hex,omitempty"`
 }
 
 type CertificateRequest struct {
 	CommitteeID string `json:"committee_id"`
-	SigHex      string `json:"sig_hex"`
+	SigHex      string `json:"sig_hex,omitempty"`
 }
 
 type candidate struct {
@@ -111,6 +112,7 @@ type Status struct {
 // stop the core or its required next-round FINAL transmission. Entered-round
 // relay/validation handlers remain available even after the core stops.
 type Instance struct {
+	authenticated   bool
 	mu              sync.Mutex
 	verifier        *Verifier
 	id              p2p.NodeID
@@ -145,7 +147,7 @@ func New(cfg Config) (*Instance, error) {
 		coin = rand.Reader
 	}
 	return &Instance{
-		verifier: verifier, id: cfg.ID, instance: cfg.Instance, private: append(ed25519.PrivateKey(nil), cfg.Private...), coin: coin,
+		authenticated: cfg.Authenticated, verifier: verifier, id: cfg.ID, instance: cfg.Instance, private: append(ed25519.PrivateKey(nil), cfg.Private...), coin: coin,
 		rounds: make(map[uint64]*roundState), dirty: make(map[uint64]bool), votes: [2]map[p2p.NodeID]string{make(map[p2p.NodeID]string), make(map[p2p.NodeID]string)},
 		waiters: make(map[p2p.NodeID]bool), done: make(chan struct{}),
 	}, nil
@@ -164,7 +166,7 @@ func (a *Instance) VerifyCoreMessage(msg p2p.Message) bool {
 	}
 	body, err := p2p.DecodePayload[CoreMessage](msg)
 	return err == nil && body.CommitteeID == a.verifier.committeeID && validValue(msg.Type, body.Value) &&
-		a.verifier.verifySignature(msg.From, a.coreStatement(msg.From, msg.Type, body.Round, body.Value), body.SigHex)
+		(body.SigHex == "" && msg.Authenticated() || body.SigHex != "" && a.verifier.verifySignature(msg.From, a.coreStatement(msg.From, msg.Type, body.Round, body.Value), body.SigHex))
 }
 
 func (a *Instance) Propose(bit Value) ([]p2p.Message, error) {
@@ -211,7 +213,7 @@ func (a *Instance) Handle(msg p2p.Message) ([]p2p.Message, error) {
 	case PRE, VOTE, MAIN, FINAL:
 		body, err := p2p.DecodePayload[CoreMessage](msg)
 		if err != nil || body.CommitteeID != a.verifier.committeeID || !validValue(msg.Type, body.Value) ||
-			!a.verifier.verifySignature(msg.From, a.coreStatement(msg.From, msg.Type, body.Round, body.Value), body.SigHex) {
+			!(body.SigHex == "" && msg.Authenticated() || body.SigHex != "" && a.verifier.verifySignature(msg.From, a.coreStatement(msg.From, msg.Type, body.Round, body.Value), body.SigHex)) {
 			return nil, ErrInvalidMessage
 		}
 		a.observeCore(msg.From, msg.Type, body.Round, body.Value)
@@ -226,7 +228,7 @@ func (a *Instance) Handle(msg p2p.Message) ([]p2p.Message, error) {
 		}
 	case REQUEST:
 		body, err := p2p.DecodePayload[CertificateRequest](msg)
-		if err != nil || body.CommitteeID != a.verifier.committeeID || !a.verifier.verifySignature(msg.From, a.requestStatement(msg.From), body.SigHex) {
+		if err != nil || body.CommitteeID != a.verifier.committeeID || !(body.SigHex == "" && msg.Authenticated() || body.SigHex != "" && a.verifier.verifySignature(msg.From, a.requestStatement(msg.From), body.SigHex)) {
 			return nil, ErrInvalidMessage
 		}
 		if a.certificate != nil {
@@ -258,7 +260,10 @@ func (a *Instance) RequestCertificate() []p2p.Message {
 	if a.certificate != nil {
 		return nil
 	}
-	payload := CertificateRequest{CommitteeID: a.verifier.committeeID, SigHex: hex.EncodeToString(asig.Sign(a.private, a.requestStatement(a.id)))}
+	payload := CertificateRequest{CommitteeID: a.verifier.committeeID}
+	if !a.authenticated {
+		payload.SigHex = hex.EncodeToString(asig.Sign(a.private, a.requestStatement(a.id)))
+	}
 	return []p2p.Message{a.message(REQUEST, "", payload)}
 }
 
@@ -339,7 +344,10 @@ func (a *Instance) message(phase string, to p2p.NodeID, payload any) p2p.Message
 	return msg
 }
 func (a *Instance) sendCore(phase string, round uint64, value Value, out *[]p2p.Message) {
-	body := CoreMessage{CommitteeID: a.verifier.committeeID, Round: round, Value: value, SigHex: hex.EncodeToString(asig.Sign(a.private, a.coreStatement(a.id, phase, round, value)))}
+	body := CoreMessage{CommitteeID: a.verifier.committeeID, Round: round, Value: value}
+	if !a.authenticated {
+		body.SigHex = hex.EncodeToString(asig.Sign(a.private, a.coreStatement(a.id, phase, round, value)))
+	}
 	*out = append(*out, a.message(phase, "", body))
 	a.observeCore(a.id, phase, round, value)
 }

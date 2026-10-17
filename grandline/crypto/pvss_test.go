@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"testing"
 
 	"Tyche/utils/p2p"
@@ -16,7 +17,7 @@ func TestPVSSVerifyPreReconAndRecon(t *testing.T) {
 		keys[id] = PVSSKeyPairFromSeed(HashBytes([]byte(id)))
 		public[id] = keys[id].Public
 	}
-	dealer, err := NewPVSSScheme("n0", 2, keys["n0"].Private, public)
+	dealer, err := NewPVSSScheme("n0", 2, keys["n0"].Private, public, testSigningKeys("n0", ids))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +38,7 @@ func TestPVSSVerifyPreReconAndRecon(t *testing.T) {
 
 	shares := make([]PVSSDecryptedShare, 0, 2)
 	for _, id := range ids[:2] {
-		scheme, err := NewPVSSScheme(id, 2, keys[id].Private, public)
+		scheme, err := NewPVSSScheme(id, 2, keys[id].Private, public, testSigningKeys(id, ids))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -71,7 +72,7 @@ func TestAPVSSAggregateRecon(t *testing.T) {
 	transcripts := make([]PVSSCommitment, 0, 2)
 	secrets := make([][]byte, 0, 2)
 	for i, id := range ids[:2] {
-		scheme, err := NewPVSSScheme(id, 2, keys[id].Private, public)
+		scheme, err := NewPVSSScheme(id, 2, keys[id].Private, public, testSigningKeys(id, ids))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +84,7 @@ func TestAPVSSAggregateRecon(t *testing.T) {
 		secrets = append(secrets, secret)
 	}
 
-	leader, err := NewPVSSScheme("n0", 2, keys["n0"].Private, public)
+	leader, err := NewPVSSScheme("n0", 2, keys["n0"].Private, public, testSigningKeys("n0", ids))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +98,7 @@ func TestAPVSSAggregateRecon(t *testing.T) {
 
 	shares := make([]PVSSDecryptedShare, 0, 2)
 	for _, id := range ids[:2] {
-		scheme, err := NewPVSSScheme(id, 2, keys[id].Private, public)
+		scheme, err := NewPVSSScheme(id, 2, keys[id].Private, public, testSigningKeys(id, ids))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -142,4 +143,16 @@ func copyStringMap(in map[p2p.NodeID]string) map[p2p.NodeID]string {
 		out[k] = v
 	}
 	return out
+}
+
+func testSigningKeys(id p2p.NodeID, ids []p2p.NodeID) PVSSSigningKeys {
+	keys := PVSSSigningKeys{Public: make(map[p2p.NodeID]ed25519.PublicKey)}
+	for _, member := range ids {
+		private := ed25519.NewKeyFromSeed(HashBytes([]byte("test/signing/" + string(member))))
+		keys.Public[member] = private.Public().(ed25519.PublicKey)
+		if member == id {
+			keys.Private = private
+		}
+	}
+	return keys
 }

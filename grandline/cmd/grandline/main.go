@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -41,6 +43,9 @@ type finalMetricWindow struct {
 }
 
 func main() {
+	beaconMode := flag.String("beacon-mode", "", "beacon mode: standard (default, online commitments) or reference (fixed commitments); both omit outer signatures")
+	setupFile := flag.String("setup-file", "", "common precomputed GRand setup snapshot")
+	writeSetup := flag.String("write-setup", "", "write a fresh benchmark setup snapshot and exit")
 	configPath := flag.String("config", "configs/local_8.json", "cluster configuration file")
 	nodeID := flag.String("node", "", "node id for single-process TCP deployment; empty starts an in-memory cluster")
 	transport := flag.String("transport", "", "override transport: memory or tcp")
@@ -57,8 +62,40 @@ func main() {
 	if *nodeID != "" {
 		cfg.NodeID = p2p.NodeID(*nodeID)
 	}
+	if *beaconMode != "" {
+		cfg.BeaconMode = *beaconMode
+	}
+	if cfg.BeaconMode == "signed" {
+		cfg.BeaconMode = "standard"
+	}
+	if cfg.BeaconMode != "standard" && cfg.BeaconMode != "reference" {
+		log.Fatal("beacon-mode must be standard or reference")
+	}
+	if *writeSetup == "" && cfg.Transport != "memory" {
+		log.Fatal("GRandLine currently requires authenticated memory transport; raw TCP is not authenticated")
+	}
 	runDuration := parseDuration(*duration)
 
+	if *setupFile != "" {
+		cfg.SetupFile = *setupFile
+	}
+	if *writeSetup != "" {
+		cfg.Transport = "memory"
+		cfg.NodeID = ""
+		cfg.SetupFile = ""
+		rt, err := prepareRuntime(cfg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		raw, err := json.Marshal(rt.grand)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := os.WriteFile(*writeSetup, raw, 0600); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if cfg.Transport == "tcp" && cfg.NodeID != "" {
 		if err := runSingleNode(cfg, runDuration); err != nil {
 			log.Fatal(err)
@@ -99,54 +136,86 @@ func runLocalCluster(cfg config.Config, duration time.Duration) error {
 	defer stopReport()
 	time.Sleep(time.Duration(cfg.PrefillMS) * time.Millisecond)
 	runStart := time.Now()
-	var finalWindow finalMetricWindow
+	var finalWindow, runWindow finalMetricWindow
 
 	limit := uint64(cfg.Round)
 	if duration > 0 {
 		limit = ^uint64(0)
 	}
-	for epoch := uint64(0); epoch < limit; epoch++ {
-		results := make(chan *grandline.Beacon, len(nodes))
-		for _, node := range nodes {
-			go func(node *grandline.Node) {
-				b, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
-				if err != nil {
-					log.Printf("node %s epoch %d: %v", node.ID, epoch, err)
-					results <- nil
+	type localResult struct {
+		node      int
+		beacon    *grandline.Beacon
+		err       error
+		completed time.Time
+	}
+	results := make(chan localResult, len(nodes)*4)
+	for index, node := range nodes {
+		go func(index int, node *grandline.Node) {
+			for count := uint64(0); count < limit; count++ {
+				beacon, err := node.RunEpoch(runCtx, time.Duration(cfg.EpochMS)*time.Millisecond)
+				select {
+				case results <- localResult{index, beacon, err, time.Now()}:
+				case <-runCtx.Done():
 					return
 				}
-				results <- b
-			}(node)
-		}
-
-		var sample *grandline.Beacon
-		for i := 0; i < len(nodes); i++ {
-			b := <-results
-			if b == nil {
-				return fmt.Errorf("epoch %d failed to complete", epoch)
+				if err != nil {
+					return
+				}
 			}
-			if sample == nil {
-				sample = b
-			} else if sample.Epoch != b.Epoch || string(sample.Random) != string(b.Random) || sample.Skipped != b.Skipped {
-				return fmt.Errorf("epoch %d inconsistent beacon: sample_epoch=%d sample_skipped=%t got_epoch=%d got_skipped=%t",
-					epoch, sample.Epoch, sample.Skipped, b.Epoch, b.Skipped)
+		}(index, node)
+	}
+	pending := make(map[uint64]map[int]localResult)
+	for epoch := uint64(0); epoch < limit; {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				return result.err
 			}
+			if result.beacon == nil || result.beacon.Skipped {
+				return fmt.Errorf("node %d returned invalid output", result.node)
+			}
+			e := result.beacon.Epoch
+			if e < epoch {
+				return fmt.Errorf("duplicate completed epoch %d", e)
+			}
+			if pending[e] == nil {
+				pending[e] = make(map[int]localResult)
+			}
+			if _, duplicate := pending[e][result.node]; duplicate {
+				return fmt.Errorf("duplicate node output")
+			}
+			pending[e][result.node] = result
+		case <-runCtx.Done():
+			return runCtx.Err()
 		}
-		if sample != nil && sample.Skipped {
-			fmt.Printf("ts=%s epoch=%d skipped stage=%s reason=%s random=%x diag=\"%s\"\n", logTimestamp(), sample.Epoch, sample.SkipStage, sample.SkipReason, sample.Random[:8], sample.SkipDiag)
-			continue
-		}
-		stats.beacons.Add(1)
-		if sample != nil {
-			fmt.Printf("ts=%s epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n",
-				logTimestamp(), sample.Epoch, sample.Commit, sample.Shares, sample.SigHex[:16], sample.Random[:8])
-		}
-		finalWindow.recordBeacon(nodes)
-		if duration > 0 && time.Since(runStart) >= duration {
-			break
+		for len(pending[epoch]) == len(nodes) {
+			sample := pending[epoch][0].beacon
+			completed := pending[epoch][0].completed
+			for _, r := range pending[epoch] {
+				if string(r.beacon.Random) != string(sample.Random) {
+					return fmt.Errorf("epoch %d inconsistent beacon", epoch)
+				}
+				if r.completed.After(completed) {
+					completed = r.completed
+				}
+			}
+			stats.beacons.Add(1)
+			fmt.Printf("ts=%s epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n", completed.UTC().Format(time.RFC3339Nano), sample.Epoch, sample.Commit, sample.Shares, sample.SigHex[:16], sample.Random[:8])
+			runWindow.recordBeacon(nodes)
+			if epoch >= uint64(cfg.WarmupOutputs) {
+				finalWindow.recordBeacon(nodes)
+			}
+			delete(pending, epoch)
+			epoch++
+			if duration > 0 && time.Since(runStart) >= duration {
+				epoch = limit
+				break
+			}
 		}
 	}
+
 	queueTotal, queueMax := collectQueue(nodes)
+	runWindow.printLabel("run", nodes, queueTotal, queueMax)
 	finalWindow.print(nodes, queueTotal, queueMax)
 	return nil
 }
@@ -222,6 +291,9 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 }
 
 func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
+	if cfg.Transport != "memory" {
+		return runtimeKeys{}, fmt.Errorf("GRandLine currently requires authenticated memory transport")
+	}
 	ids := cfg.Members()
 	if len(ids) == 0 {
 		return runtimeKeys{}, fmt.Errorf("config has no cluster members")
@@ -245,17 +317,51 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 		pvssKeys[id] = pk
 		pvssPub[id] = pk.Public
 	}
+	signingPublic := make(map[p2p.NodeID]ed25519.PublicKey, len(ids))
+	for _, id := range ids {
+		signingPublic[id] = pubs[string(id)]
+	}
 	pvssSchemes := make(map[p2p.NodeID]*asig.PVSSPairingFreeScheme, len(ids))
 	for _, id := range ids {
-		scheme, err := asig.NewPVSSScheme(id, cfg.F+1, pvssKeys[id].Private, pvssPub)
+		scheme, err := asig.NewPVSSScheme(id, cfg.F+1, pvssKeys[id].Private, pvssPub, asig.PVSSSigningKeys{Private: keys[id].Private, Public: signingPublic})
 		if err != nil {
 			return runtimeKeys{}, err
 		}
 		pvssSchemes[id] = scheme
 	}
-	grandResult, err := asig.SetupGRandFromAPVSS(ids, pvssSchemes, cfg.F+1)
-	if err != nil {
-		return runtimeKeys{}, err
+	var grandResult asig.GRandResult
+	if cfg.SetupFile != "" {
+		raw, err := os.ReadFile(cfg.SetupFile)
+		if err != nil {
+			return runtimeKeys{}, err
+		}
+		if err := json.Unmarshal(raw, &grandResult); err != nil {
+			return runtimeKeys{}, err
+		}
+		if err := asig.ValidateGRandSetup(grandResult, ids, pvssSchemes, cfg.F+1); err != nil {
+			return runtimeKeys{}, err
+		}
+	} else {
+		if cfg.Transport == "tcp" && cfg.NodeID != "" {
+			return runtimeKeys{}, fmt.Errorf("independent nodes require a common -setup-file; generate one once with -write-setup for this benchmark")
+		}
+		var err error
+		grandResult, err = asig.SetupGRandFromAPVSS(ids, pvssSchemes, cfg.F+1)
+		if err != nil {
+			return runtimeKeys{}, err
+		}
+	}
+	if cfg.BeaconMode == "reference" {
+		if cfg.Transport != "memory" {
+			return runtimeKeys{}, fmt.Errorf("reference mode requires authenticated memory transport")
+		}
+		if cfg.SetupFile == "" {
+			if err := asig.PrepareReferenceCommitments(&grandResult, ids); err != nil {
+				return runtimeKeys{}, err
+			}
+		} else if err := asig.ValidateReferenceCommitments(grandResult, ids); err != nil {
+			return runtimeKeys{}, err
+		}
 	}
 	return runtimeKeys{
 		ids: ids, keys: keys, pubs: pubs, pvssKeys: pvssKeys, pvssPub: pvssPub, seed: seed, grand: grandResult,
@@ -263,15 +369,24 @@ func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
 }
 
 func newNode(cfg config.Config, rt runtimeKeys, id p2p.NodeID, transport p2p.Transport) (*grandline.Node, error) {
-	pvssScheme, err := asig.NewPVSSScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPub)
+	pvssScheme, err := asig.NewPVSSScheme(id, cfg.F+1, rt.pvssKeys[id].Private, rt.pvssPub, pvssSigningKeys(rt, id))
 	if err != nil {
 		return nil, err
 	}
-	return grandline.NewNode(grandline.NodeConfig{
-		ID: id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed, Keys: rt.keys[id],
-		Public: rt.pubs, Transport: transport, PVSS: pvssScheme,
+	nodeCfg := grandline.NodeConfig{
+		BeaconMode: cfg.BeaconMode,
+		ID:         id, Members: rt.ids, F: cfg.F, QueueLen: cfg.QueueLen, Seed: rt.seed,
+		Transport: transport, PVSS: pvssScheme,
 		GRand: rt.grand.ShareFor(id), CryptoWorkers: cfg.MaxPool,
-	})
+	}
+	if cfg.BeaconMode == "reference" {
+		if rt.grand.Reference == nil {
+			return nil, fmt.Errorf("reference setup missing")
+		}
+		nodeCfg.ReferenceCommitments = rt.grand.Reference.Commitments
+		nodeCfg.ReferenceAlpha = rt.grand.Reference.Alphas[id]
+	}
+	return grandline.NewNode(nodeCfg)
 }
 
 func runtimeContext(cfg config.Config, duration time.Duration) (context.Context, context.CancelFunc) {
@@ -296,8 +411,12 @@ func parseDuration(raw string) time.Duration {
 }
 
 func printConfig(cfg config.Config, nodes int, transport string) {
-	fmt.Printf("protocol=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=unused epoch_ms=%d report_ms=%d crypto_workers=%d\n",
-		cfg.Protocol, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
+	protocol := grandline.Protocol
+	if cfg.BeaconMode == "reference" {
+		protocol = grandline.ReferenceProtocol
+	}
+	fmt.Printf("protocol=%s beacon_mode=%s transport=%s nodes=%d f=%d rounds=%d queue_len=%d producer_ms=unused epoch_ms=%d report_ms=%d crypto_workers=%d\n",
+		protocol, cfg.BeaconMode, transport, nodes, cfg.F, cfg.Round, cfg.QueueLen, cfg.EpochMS, cfg.ReportMS, cfg.MaxPool)
 	if transport == "tcp" {
 		fmt.Printf("tcp node=%s listen=%s peers=%v\n", cfg.NodeID, cfg.ListenAddr(cfg.NodeID), cfg.PeerMap())
 	}
@@ -391,11 +510,14 @@ func (w *finalMetricWindow) recordBeacon(nodes []*grandline.Node) {
 }
 
 func (w *finalMetricWindow) print(nodes []*grandline.Node, queueTotal int, queueMax int) {
+	w.printLabel("final", nodes, queueTotal, queueMax)
+}
+func (w *finalMetricWindow) printLabel(label string, nodes []*grandline.Node, queueTotal int, queueMax int) {
 	if !w.started {
-		printMetricDelta("final", metricSnapshot{}, grandline.PerfSnapshot{}, queueTotal, queueMax, 0, 0)
+		printMetricDelta(label, metricSnapshot{}, grandline.PerfSnapshot{}, queueTotal, queueMax, 0, 0)
 		return
 	}
-	printMetricDelta("final", collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
+	printMetricDelta(label, collectMetrics(nodes).sub(w.metrics), collectPerf(nodes).Sub(w.perf), queueTotal, queueMax, time.Since(w.start), w.beacons)
 }
 
 func (m metricSnapshot) sub(prev metricSnapshot) metricSnapshot {
@@ -421,15 +543,17 @@ func printMetricDelta(label string, delta metricSnapshot, perf grandline.PerfSna
 	if seconds <= 0 {
 		seconds = 1
 	}
-	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s queue_total=%d queue_max=%d sign_avg=%s verify_avg=%s recover_avg=%s pvss_share_avg=%s pvss_verify_avg=%s\n",
+	fmt.Printf("%s metrics beacons=%d elapsed_s=%.3f throughput=%.2fbeacon/min sent_msgs=%d recv_msgs=%d sent_bytes=%d recv_bytes=%d sent=%.2fKB recv=%.2fKB bandwidth=%.2fKB/s message_signs=%d message_verifies=%d message_sign_avg=%s message_verify_avg=%s queue_total=%d queue_max=%d sign_avg=%s verify_avg=%s recover_avg=%s pvss_share_avg=%s pvss_verify_avg=%s\n",
 		label,
 		beacons,
 		elapsed.Seconds(),
 		float64(beacons)*60/seconds,
-		delta.sentMessages, delta.recvMessages,
+		delta.sentMessages, delta.recvMessages, delta.sentBytes, delta.recvBytes,
 		float64(delta.sentBytes)/1024,
 		float64(delta.recvBytes)/1024,
 		float64(delta.sentBytes+delta.recvBytes)/1024/seconds,
+		perf.MessageSignCount, perf.MessageVerifyCount,
+		grandline.AvgDuration(perf.MessageSignTotal, perf.MessageSignCount), grandline.AvgDuration(perf.MessageVerifyTotal, perf.MessageVerifyCount),
 		queueTotal, queueMax,
 		grandline.AvgDuration(perf.SignTotal, perf.SignCount),
 		grandline.AvgDuration(perf.VerifyTotal, perf.VerifyCount),
@@ -497,4 +621,12 @@ func allPeersReachable(ctx context.Context, self p2p.NodeID, peers map[p2p.NodeI
 		}
 	}
 	return true
+}
+
+func pvssSigningKeys(rt runtimeKeys, id p2p.NodeID) asig.PVSSSigningKeys {
+	public := make(map[p2p.NodeID]ed25519.PublicKey, len(rt.ids))
+	for _, member := range rt.ids {
+		public[member] = rt.pubs[string(member)]
+	}
+	return asig.PVSSSigningKeys{Private: rt.keys[id].Private, Public: public}
 }

@@ -2,15 +2,18 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 
 	"Tyche/utils/p2p"
+	"Tyche/utils/pairing"
+	"Tyche/utils/verification"
 	"go.dedis.ch/kyber/v3"
-	"go.dedis.ch/kyber/v3/pairing/bn256"
 	"go.dedis.ch/kyber/v3/share"
+	"go.dedis.ch/kyber/v3/util/random"
 )
 
 type PVSSKeyPair struct {
@@ -69,14 +72,22 @@ type PVSSScheme interface {
 	ReconTrusted(PVSSCommitment, []PVSSDecryptedShare, int) ([]byte, error)
 }
 
-type PVSSPairingFreeScheme struct {
-	id        p2p.NodeID
-	threshold int
-	private   kyber.Scalar
-	public    map[p2p.NodeID]kyber.Point
+type PVSSSigningKeys struct {
+	Private ed25519.PrivateKey
+	Public  map[p2p.NodeID]ed25519.PublicKey
 }
 
-func NewPVSSScheme(id p2p.NodeID, threshold int, private kyber.Scalar, public map[p2p.NodeID]kyber.Point) (*PVSSPairingFreeScheme, error) {
+type PVSSPairingFreeScheme struct {
+	checks            *verification.Cache
+	verificationSetup verification.Key
+	signing           PVSSSigningKeys
+	id                p2p.NodeID
+	threshold         int
+	private           kyber.Scalar
+	public            map[p2p.NodeID]kyber.Point
+}
+
+func NewPVSSScheme(id p2p.NodeID, threshold int, private kyber.Scalar, public map[p2p.NodeID]kyber.Point, signing PVSSSigningKeys, caches ...*verification.Cache) (*PVSSPairingFreeScheme, error) {
 	if id == "" {
 		return nil, errors.New("pvss node id is required")
 	}
@@ -89,16 +100,56 @@ func NewPVSSScheme(id p2p.NodeID, threshold int, private kyber.Scalar, public ma
 	if len(public) == 0 {
 		return nil, errors.New("pvss public keys are required")
 	}
+	if threshold > len(public) {
+		return nil, errors.New("threshold exceeds committee")
+	}
+	raw, err := private.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	secret := suite().G1().Scalar()
+	if err := secret.UnmarshalBinary(raw); err != nil || secret.Equal(suite().G1().Scalar().Zero()) {
+		return nil, errors.New("invalid private scalar")
+	}
 	cp := make(map[p2p.NodeID]kyber.Point, len(public))
 	for id, pub := range public {
-		cp[id] = pub.Clone()
+		if id == "" || pub == nil {
+			return nil, errors.New("invalid shareholder identity or key")
+		}
+		raw, err := pub.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		point := suite().G2().Point()
+		if err := point.UnmarshalBinary(raw); err != nil || point.Equal(suite().G2().Point().Null()) {
+			return nil, errors.New("invalid shareholder subgroup point")
+		}
+		cp[id] = point
 	}
-	return &PVSSPairingFreeScheme{id: id, threshold: threshold, private: private.Clone(), public: cp}, nil
+	if cp[id] == nil || !suite().G2().Point().Mul(secret, hPoint(suite())).Equal(cp[id]) {
+		return nil, errors.New("private key does not match shareholder key")
+	}
+	if len(signing.Private) != ed25519.PrivateKeySize || !signing.Private.Public().(ed25519.PublicKey).Equal(signing.Public[id]) {
+		return nil, errors.New("invalid APVSS signing key")
+	}
+	signingPublic := make(map[p2p.NodeID]ed25519.PublicKey, len(cp))
+	for member := range cp {
+		if len(signing.Public[member]) != ed25519.PublicKeySize {
+			return nil, errors.New("missing APVSS verification key")
+		}
+		signingPublic[member] = append(ed25519.PublicKey(nil), signing.Public[member]...)
+	}
+	encodedPublic := make(map[p2p.NodeID]string, len(cp))
+	for member, point := range cp {
+		encodedPublic[member] = mustPointHex(point)
+	}
+	return &PVSSPairingFreeScheme{checks: verification.Select(caches...), verificationSetup: verification.JSONKey("grandline/pvss-setup", threshold, encodedPublic, signing.Public), id: id, threshold: threshold, private: secret.Clone(), public: cp,
+		signing: PVSSSigningKeys{append(ed25519.PrivateKey(nil), signing.Private...), signingPublic}}, nil
 }
 
 func PVSSKeyPairFromSeed(seed []byte) PVSSKeyPair {
 	group := suite()
-	sk := group.G2().Scalar().SetBytes(HashBytes([]byte("GRandLine-v1/APVSS/key"), seed))
+	sk := group.G2().Scalar().SetBytes(HashBytes([]byte("GRandLine-v3/APVSS/key"), seed))
 	if sk.Equal(group.G2().Scalar().Zero()) {
 		sk = group.G2().Scalar().One()
 	}
@@ -116,11 +167,11 @@ func (s *PVSSPairingFreeScheme) Share(dealer p2p.NodeID, seq uint64, members []p
 	group := suite()
 	// GRandLine Figure 1 Dist: sample f, publish commitments C_i=g^{f(i)}
 	// in G1 and encrypted shares E_i=pk_i^{f(i)} in G2.
-	secret := deterministicG1Scalar(group, "GRandLine-v1/APVSS/share-secret", s.private, dealer, seq, members, 0)
+	secret := group.G1().Scalar().Pick(group.RandomStream())
 	coeffs := make([]kyber.Scalar, s.threshold)
 	coeffs[0] = secret
 	for i := 1; i < s.threshold; i++ {
-		coeffs[i] = deterministicG1Scalar(group, "GRandLine-v1/APVSS/share-coeff", s.private, dealer, seq, members, i)
+		coeffs[i] = group.G1().Scalar().Pick(group.RandomStream())
 	}
 	poly := share.CoefficientsToPriPoly(group.G1(), coeffs)
 	shares := poly.Shares(len(members))
@@ -134,7 +185,7 @@ func (s *PVSSPairingFreeScheme) Share(dealer p2p.NodeID, seq uint64, members []p
 		commit[member] = mustPointHex(group.G1().Point().Mul(shares[i].V, gPoint(group)))
 		cipher[member] = mustPointHex(group.G2().Point().Mul(shares[i].V, pk))
 	}
-	proof := schnorrProve(group, dealer, seq, secret, s.private)
+	proof := schnorrProve(group, dealer, seq, secret, s.signing.Private)
 	out := PVSSCommitment{
 		Dealer: dealer, Seq: seq, Threshold: s.threshold, Members: members,
 		Commit: commit, Cipher: cipher, Proof: proof,
@@ -145,7 +196,21 @@ func (s *PVSSPairingFreeScheme) Share(dealer p2p.NodeID, seq uint64, members []p
 	return out, mustPointBytes(secretPoint), nil
 }
 
+func (s *PVSSPairingFreeScheme) VerificationCache() *verification.Cache { return s.checks }
 func (s *PVSSPairingFreeScheme) Verify(c PVSSCommitment) bool {
+	return s.checks.Check(verification.JSONKey("grandline/pvss-sharing", s.verificationSetup, c), func() bool { return s.verifySharingUncached(c) })
+}
+func (s *PVSSPairingFreeScheme) verifySharingUncached(c PVSSCommitment) bool {
+	if c.Threshold != s.threshold || len(c.Members) != len(s.public) {
+		return false
+	}
+	membersSeen := make(map[p2p.NodeID]bool, len(c.Members))
+	for _, id := range c.Members {
+		if s.public[id] == nil || membersSeen[id] {
+			return false
+		}
+		membersSeen[id] = true
+	}
 	if c.Dealer == "" || c.SecretID == "" || c.Threshold <= 0 || len(c.Members) < c.Threshold {
 		return false
 	}
@@ -178,7 +243,7 @@ func (s *PVSSPairingFreeScheme) Verify(c PVSSCommitment) bool {
 	if !verifyRSDualCodeG1(group, c, members) {
 		return false
 	}
-	c0, err := share.RecoverCommit(group.G1(), commitShares, c.Threshold, len(members))
+	c0, err := pairing.RecoverCommit(group.G1(), commitShares, c.Threshold, len(members))
 	if err != nil {
 		return false
 	}
@@ -189,8 +254,8 @@ func (s *PVSSPairingFreeScheme) Verify(c PVSSCommitment) bool {
 	}
 	for _, contribution := range contributions {
 		zeta, err := pointG1FromHex(contribution.Proof.Zeta)
-		pk := s.public[contribution.Dealer]
-		if err != nil || pk == nil || !schnorrVerify(group, contribution.Dealer, contribution.Seq, contribution.Proof, pk) {
+		pk := s.signing.Public[contribution.Dealer]
+		if err != nil || len(pk) != ed25519.PublicKeySize || !schnorrVerify(group, contribution.Dealer, contribution.Seq, contribution.Proof, pk, s.checks) {
 			return false
 		}
 		zetaProduct.Add(zetaProduct, zeta)
@@ -282,6 +347,9 @@ func (s *PVSSPairingFreeScheme) PreReconTrusted(c PVSSCommitment, holder p2p.Nod
 }
 
 func (s *PVSSPairingFreeScheme) VerifyShare(c PVSSCommitment, sh PVSSDecryptedShare) bool {
+	return s.checks.Check(verification.JSONKey("grandline/pvss-share", s.verificationSetup, c, sh), func() bool { return s.verifyShareUncached(c, sh) })
+}
+func (s *PVSSPairingFreeScheme) verifyShareUncached(c PVSSCommitment, sh PVSSDecryptedShare) bool {
 	if sh.CommitmentID != c.SecretID {
 		return false
 	}
@@ -338,7 +406,7 @@ func (s *PVSSPairingFreeScheme) ReconTrusted(c PVSSCommitment, shares []PVSSDecr
 	}
 	// GRandLine Figure 1 Rec reconstructs the APVSS secret S=h^{f(0)} in G2
 	// by Lagrange interpolation in the exponent from valid decrypted shares.
-	secret, err := share.RecoverCommit(group.G2(), pubShares, threshold, len(c.Members))
+	secret, err := pairing.RecoverCommit(group.G2(), pubShares, threshold, len(c.Members))
 	if err != nil {
 		return nil, err
 	}
@@ -349,78 +417,32 @@ func CommitmentID(c PVSSCommitment) string {
 	return c.SecretID
 }
 
-func suite() *bn256.Suite {
-	return bn256.NewSuite()
-}
-
-func gPoint(group *bn256.Suite) kyber.Point {
+func gPoint(group *grandSuite) kyber.Point {
 	return group.G1().Point().Base()
 }
 
-func hPoint(group *bn256.Suite) kyber.Point {
+func hPoint(group *grandSuite) kyber.Point {
 	return group.G2().Point().Base()
 }
 
-func schnorrProve(group *bn256.Suite, dealer p2p.NodeID, seq uint64, secret, signingKey kyber.Scalar) PVSSProof {
+func schnorrProve(group *grandSuite, dealer p2p.NodeID, seq uint64, secret kyber.Scalar, signingKey ed25519.PrivateKey) PVSSProof {
 	// Figure 1 writes pi=<zeta,theta>_L: zeta=g^alpha, theta is the
 	// Fiat-Shamir Schnorr proof of alpha, and Signature binds the proof to L.
-	nonce := deterministicSchnorrNonce(group, dealer, seq, secret, signingKey)
+	nonce := group.G1().Scalar().Pick(group.RandomStream())
 	zeta := group.G1().Point().Mul(secret, gPoint(group))
 	a := group.G1().Point().Mul(nonce, gPoint(group))
 	challenge := schnorrChallenge(group, dealer, seq, zeta, a)
 	response := group.G1().Scalar().Sub(nonce, group.G1().Scalar().Mul(challenge, secret))
 	proof := PVSSProof{Zeta: mustPointHex(zeta), A: mustPointHex(a), Challenge: mustScalarHex(challenge), Response: mustScalarHex(response)}
-	proof.Signature = mustPointHex(group.G1().Point().Mul(signingKey, proofSignatureBase(group, dealer, seq, proof)))
+	proof.Signature = hex.EncodeToString(ed25519.Sign(signingKey, proofSignatureMessage(dealer, seq, proof)))
 	return proof
 }
 
-func deterministicG1Scalar(group *bn256.Suite, label string, private kyber.Scalar, dealer p2p.NodeID, seq uint64, members []p2p.NodeID, index int) kyber.Scalar {
-	buf := bytes.Buffer{}
-	buf.WriteString(label)
-	buf.WriteByte('/')
-	buf.WriteString(string(dealer))
-	buf.WriteByte('/')
-	buf.WriteString(fmt.Sprintf("%d/%d", seq, index))
-	if private != nil {
-		if raw, err := private.MarshalBinary(); err == nil {
-			buf.Write(raw)
-		}
-	}
-	for _, member := range normalizeMembers(members) {
-		buf.WriteByte('/')
-		buf.WriteString(string(member))
-	}
-	scalar := group.G1().Scalar().SetBytes(HashBytes(buf.Bytes()))
-	if scalar.Equal(group.G1().Scalar().Zero()) {
-		scalar = group.G1().Scalar().One()
-	}
-	return scalar
+func schnorrVerify(group *grandSuite, dealer p2p.NodeID, seq uint64, proof PVSSProof, publicKey ed25519.PublicKey, caches ...*verification.Cache) bool {
+	cache := verification.Optional(caches...)
+	return cache.Check(verification.JSONKey("grandline/signed-schnorr-proof", publicKey, dealer, seq, proof), func() bool { return schnorrVerifyUncached(group, dealer, seq, proof, publicKey, cache) })
 }
-
-func deterministicSchnorrNonce(group *bn256.Suite, dealer p2p.NodeID, seq uint64, secret, signingKey kyber.Scalar) kyber.Scalar {
-	buf := bytes.Buffer{}
-	buf.WriteString("GRandLine-v1/APVSS/schnorr-nonce/")
-	buf.WriteString(string(dealer))
-	buf.WriteByte('/')
-	buf.WriteString(fmt.Sprintf("%d", seq))
-	if secret != nil {
-		if raw, err := secret.MarshalBinary(); err == nil {
-			buf.Write(raw)
-		}
-	}
-	if signingKey != nil {
-		if raw, err := signingKey.MarshalBinary(); err == nil {
-			buf.Write(raw)
-		}
-	}
-	scalar := group.G1().Scalar().SetBytes(HashBytes(buf.Bytes()))
-	if scalar.Equal(group.G1().Scalar().Zero()) {
-		scalar = group.G1().Scalar().One()
-	}
-	return scalar
-}
-
-func schnorrVerify(group *bn256.Suite, dealer p2p.NodeID, seq uint64, proof PVSSProof, publicKey kyber.Point) bool {
+func schnorrVerifyUncached(group *grandSuite, dealer p2p.NodeID, seq uint64, proof PVSSProof, publicKey ed25519.PublicKey, cache *verification.Cache) bool {
 	zeta, err := pointG1FromHex(proof.Zeta)
 	if err != nil {
 		return false
@@ -444,25 +466,13 @@ func schnorrVerify(group *bn256.Suite, dealer p2p.NodeID, seq uint64, proof PVSS
 	if !a.Equal(right) {
 		return false
 	}
-	signature, err := pointG1FromHex(proof.Signature)
-	if err != nil {
-		return false
-	}
-	return group.Pair(signature, hPoint(group)).Equal(group.Pair(proofSignatureBase(group, dealer, seq, proof), publicKey))
-}
-
-func proofSignatureBase(group *bn256.Suite, dealer p2p.NodeID, seq uint64, proof PVSSProof) kyber.Point {
-	msg := proofSignatureMessage(dealer, seq, proof)
-	scalar := group.G1().Scalar().SetBytes(HashBytes(msg))
-	if scalar.Equal(group.G1().Scalar().Zero()) {
-		scalar = group.G1().Scalar().One()
-	}
-	return group.G1().Point().Mul(scalar, gPoint(group))
+	signature, err := hex.DecodeString(proof.Signature)
+	return err == nil && len(publicKey) == ed25519.PublicKeySize && cache.Ed25519(publicKey, proofSignatureMessage(dealer, seq, proof), signature)
 }
 
 func proofSignatureMessage(dealer p2p.NodeID, seq uint64, proof PVSSProof) []byte {
 	buf := bytes.Buffer{}
-	buf.WriteString("GRandLine-v1/APVSS/contribution-signature/")
+	buf.WriteString("GRandLine-v3/APVSS/contribution-signature/")
 	buf.WriteString(string(dealer))
 	buf.WriteByte('/')
 	buf.WriteString(fmt.Sprintf("%d", seq))
@@ -477,15 +487,15 @@ func proofSignatureMessage(dealer p2p.NodeID, seq uint64, proof PVSSProof) []byt
 	return buf.Bytes()
 }
 
-func schnorrChallenge(group *bn256.Suite, dealer p2p.NodeID, seq uint64, zeta, a kyber.Point) kyber.Scalar {
+func schnorrChallenge(group *grandSuite, dealer p2p.NodeID, seq uint64, zeta, a kyber.Point) kyber.Scalar {
 	zetaBytes, _ := zeta.MarshalBinary()
 	aBytes, _ := a.MarshalBinary()
-	return group.G1().Scalar().SetBytes(HashBytes([]byte("GRandLine-v1/APVSS/schnorr"), []byte(dealer), []byte(fmt.Sprintf("/%d", seq)), zetaBytes, aBytes))
+	return group.G1().Scalar().SetBytes(HashBytes([]byte("GRandLine-v3/APVSS/schnorr"), []byte(dealer), []byte(fmt.Sprintf("/%d", seq)), zetaBytes, aBytes))
 }
 
-func verifyRSDualCodeG1(group *bn256.Suite, c PVSSCommitment, members []p2p.NodeID) bool {
+func verifyRSDualCodeG1(group *grandSuite, c PVSSCommitment, members []p2p.NodeID) bool {
 	// Figure 1 samples a vector from LC^\perp and checks prod_i C_i^{nu_i}=1.
-	// We derive the sample from the transcript for deterministic verification.
+	// The verifier independently samples the dual-code vector as in Figure 1.
 	weights, err := dualCodeWord(group.G1(), c, members)
 	if err != nil {
 		return false
@@ -507,9 +517,12 @@ func dualCodeWord(group kyber.Group, c PVSSCommitment, members []p2p.NodeID) ([]
 	}
 	degree := len(members) - c.Threshold - 1
 	coeffs := make([]kyber.Scalar, max(1, degree+1))
-	seed := dualCodeSeed(c, members)
+	stream := random.New()
 	for i := range coeffs {
-		coeffs[i] = group.Scalar().SetBytes(HashBytes(seed, []byte(fmt.Sprintf("/%d", i))))
+		coeffs[i] = group.Scalar().Pick(stream)
+	}
+	if degree < 0 {
+		coeffs[0].Zero()
 	}
 	out := make([]kyber.Scalar, len(members))
 	for i := range members {
@@ -517,19 +530,6 @@ func dualCodeWord(group kyber.Group, c PVSSCommitment, members []p2p.NodeID) ([]
 		out[i] = group.Scalar().Mul(evalScalarPoly(group, coeffs, xi), dualMultiplier(group, i, len(members)))
 	}
 	return out, nil
-}
-
-func dualCodeSeed(c PVSSCommitment, members []p2p.NodeID) []byte {
-	buf := bytes.Buffer{}
-	buf.WriteString("GRandLine-v1/APVSS/rs-dual/")
-	buf.WriteString(c.SecretID)
-	for _, member := range members {
-		buf.WriteByte('/')
-		buf.WriteString(string(member))
-		buf.WriteByte(':')
-		buf.WriteString(c.Commit[member])
-	}
-	return HashBytes(buf.Bytes())
 }
 
 func evalScalarPoly(group kyber.Group, coeffs []kyber.Scalar, x kyber.Scalar) kyber.Scalar {
@@ -572,7 +572,7 @@ func memberIndex(members []p2p.NodeID) map[p2p.NodeID]int {
 func commitmentID(c PVSSCommitment) string {
 	members := normalizeMembers(c.Members)
 	buf := bytes.Buffer{}
-	buf.WriteString("GRandLine-v1/APVSS/transcript/")
+	buf.WriteString("GRandLine-v3/APVSS/transcript/")
 	buf.WriteString(string(c.Dealer))
 	buf.WriteByte('/')
 	buf.WriteString(fmt.Sprintf("%d/%d", c.Seq, c.Threshold))

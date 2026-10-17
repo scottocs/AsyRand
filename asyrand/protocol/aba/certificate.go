@@ -14,6 +14,7 @@ import (
 
 	asig "Tyche/asyrand/crypto"
 	"Tyche/utils/p2p"
+	"Tyche/utils/verification"
 )
 
 const Protocol = "asyrand/quadratic-aba/v1"
@@ -51,13 +52,15 @@ type Decision struct {
 // SetupID is the canonical SHA-256 fingerprint of the beacon's public PVSS
 // parameters and shareholder keys (e.g. PVSSCommitment.SetupID).
 type PublicConfig struct {
-	SetupID string
-	Members []p2p.NodeID
-	F       int
-	Public  map[string]ed25519.PublicKey
+	Verification *verification.Cache `json:"-"`
+	SetupID      string
+	Members      []p2p.NodeID
+	F            int
+	Public       map[string]ed25519.PublicKey
 }
 
 type Verifier struct {
+	verification                     *verification.Cache
 	committeeID                      string
 	members                          []p2p.NodeID
 	public                           map[p2p.NodeID]ed25519.PublicKey
@@ -69,7 +72,7 @@ func NewVerifier(cfg PublicConfig) (*Verifier, error) {
 	if n == 0 || cfg.F < 0 || cfg.F > (n-1)/3 || len(cfg.Public) != n || !canonicalHex(cfg.SetupID, 32) {
 		return nil, errors.New("ABA requires n>3f, the exact member keys and a canonical public setup fingerprint")
 	}
-	v := &Verifier{members: append([]p2p.NodeID(nil), cfg.Members...), public: make(map[p2p.NodeID]ed25519.PublicKey, n), f: cfg.F, coreQuorum: (n+cfg.F)/2 + 1, certificateQuorum: n - cfg.F}
+	v := &Verifier{verification: verification.Select(cfg.Verification), members: append([]p2p.NodeID(nil), cfg.Members...), public: make(map[p2p.NodeID]ed25519.PublicKey, n), f: cfg.F, coreQuorum: (n+cfg.F)/2 + 1, certificateQuorum: n - cfg.F}
 	sort.Slice(v.members, func(i, j int) bool { return v.members[i] < v.members[j] })
 	type memberKey struct {
 		ID  p2p.NodeID
@@ -111,7 +114,7 @@ func (v *Verifier) verifySignature(from p2p.NodeID, statement []byte, sigHex str
 		return false
 	}
 	sig, _ := hex.DecodeString(sigHex)
-	return asig.Verify(pub, statement, sig)
+	return asig.Verify(pub, statement, sig, v.verification)
 }
 
 // VerifyCertificate verifies ALL listed signatures from distinct members.

@@ -40,6 +40,7 @@ type MemoryTransport struct {
 }
 
 func (t *MemoryTransport) ID() NodeID                  { return t.id }
+func (t *MemoryTransport) AuthenticatedDelivery() bool { return true }
 func (t *MemoryTransport) Inbox() <-chan Message       { return t.inbox }
 func (t *MemoryTransport) Start(context.Context) error { return nil }
 
@@ -48,6 +49,12 @@ func (t *MemoryTransport) InboxStats() (int, int) {
 }
 
 func (t *MemoryTransport) Send(ctx context.Context, to NodeID, msg Message) error {
+	if msg.From != t.id {
+		return errors.New("memory channel: forged sender identity")
+	}
+	// Copy the wire payload so callers cannot mutate an already delivered packet.
+	msg.Payload = append(json.RawMessage(nil), msg.Payload...)
+	msg.authenticated = true
 	t.net.mu.RLock()
 	peer := t.net.peers[to]
 	t.net.mu.RUnlock()

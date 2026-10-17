@@ -13,21 +13,20 @@ import (
 	asig "Tyche/spurt/crypto"
 	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
-	"go.dedis.ch/kyber/v3"
+	"Tyche/utils/verification"
 )
 
-const Protocol = "spurt"
+const Protocol = "spurt/authenticated-v1"
 
 var errEpochTimeout = errors.New("epoch timeout")
 
 const sendTimeout = 20 * time.Second
 
 type Node struct {
+	checks    *verification.Cache
 	ID        p2p.NodeID
 	Keys      asig.KeyPair
 	Public    map[string]ed25519.PublicKey
-	BLS       asig.BLSKeyPair
-	BLSPublic map[string]kyber.Point
 	Transport p2p.Transport
 	Perf      *PerfMetrics
 	State     *State
@@ -40,10 +39,13 @@ type Node struct {
 	produced  map[uint64]struct{}
 	lookahead uint64
 
-	mu      sync.Mutex
-	epochs  map[uint64]*epochState
-	beacons chan *Beacon
-	pending map[uint64]*Beacon
+	progressMu      sync.Mutex
+	progressing     bool
+	progressPending map[uint64]bool
+	mu              sync.Mutex
+	epochs          map[uint64]*epochState
+	beacons         chan *Beacon
+	pending         map[uint64]*Beacon
 }
 
 type NodeConfig struct {
@@ -53,8 +55,6 @@ type NodeConfig struct {
 	Seed          []byte
 	Keys          asig.KeyPair
 	Public        map[string]ed25519.PublicKey
-	BLS           asig.BLSKeyPair
-	BLSPublic     map[string]kyber.Point
 	Transport     p2p.Transport
 	PVSS          asig.PVSSScheme
 	CryptoWorkers int
@@ -109,12 +109,12 @@ type pendingBeaconMessage struct {
 }
 
 type BeaconMessage struct {
-	Epoch      uint64                 `json:"epoch"`
-	Leader     p2p.NodeID             `json:"leader"`
-	Digest     string                 `json:"digest"`
-	Random     []byte                 `json:"random"`
-	RandomHash string                 `json:"random_hash"`
-	Signature  asig.BLSSignatureShare `json:"signature"`
+	Epoch      uint64              `json:"epoch"`
+	Leader     p2p.NodeID          `json:"leader"`
+	Digest     string              `json:"digest"`
+	Random     []byte              `json:"random"`
+	RandomHash string              `json:"random_hash"`
+	Signature  asig.SignatureShare `json:"signature"`
 }
 
 type epochState struct {
@@ -122,7 +122,7 @@ type epochState struct {
 
 	leaderProposal    *AgreementMessage
 	proposalBroadcast bool
-	proposalGossiped  bool
+	privateDataSent   bool
 	proposing         bool
 	decided           bool
 
@@ -164,10 +164,8 @@ type epochState struct {
 	randomHash     string
 	beaconSent     bool
 	pendingBeacon  []pendingBeaconMessage
-	beaconVotes    map[string]map[p2p.NodeID]asig.BLSSignatureShare
-	certificate    asig.BLSAggregateSignature
-	certificateSet bool
-	assemblingCert bool
+	beaconVotes    map[string]map[p2p.NodeID]asig.SignatureShare
+	outputSent     bool
 	reconstructing bool
 
 	selectedSet bool
@@ -180,11 +178,22 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.Transport == nil {
 		return nil, errors.New("transport is required")
 	}
+	if !p2p.AuthenticatedDelivery(cfg.Transport) {
+		return nil, errors.New("SPURT requires authenticated delivery without outer message signatures")
+	}
+	if cfg.Transport.ID() != cfg.ID {
+		return nil, errors.New("transport identity does not match node id")
+	}
 	if cfg.PVSS == nil {
 		return nil, errors.New("real pvss scheme is required")
 	}
-	if cfg.BLS.Private == nil || len(cfg.BLSPublic) == 0 {
-		return nil, errors.New("bls keys are required")
+	if len(cfg.Keys.Private) != ed25519.PrivateKeySize || len(cfg.Public[string(cfg.ID)]) != ed25519.PublicKeySize || !cfg.Keys.Private.Public().(ed25519.PublicKey).Equal(cfg.Public[string(cfg.ID)]) {
+		return nil, errors.New("signing keys are required for native BEACON notifications")
+	}
+	for _, member := range cfg.Members {
+		if len(cfg.Public[string(member)]) != ed25519.PublicKeySize {
+			return nil, errors.New("missing member verification key")
+		}
 	}
 	if len(cfg.Members) < 3*cfg.F+1 {
 		return nil, errors.New("must satisfy n >= 3f+1")
@@ -193,9 +202,13 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if lookahead <= 0 {
 		lookahead = len(cfg.Members)
 	}
+	checks := verification.New()
+	if owner, ok := cfg.PVSS.(interface{ VerificationCache() *verification.Cache }); ok {
+		checks = verification.Select(owner.VerificationCache())
+	}
 	state := NewState(cfg.Members, cfg.F, cfg.Seed)
-	return &Node{
-		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public, BLS: cfg.BLS, BLSPublic: cfg.BLSPublic,
+	return &Node{checks: checks,
+		ID: cfg.ID, Keys: cfg.Keys, Public: cfg.Public,
 		Transport: cfg.Transport, Perf: &PerfMetrics{}, State: state, PVSS: cfg.PVSS,
 		Crypto:    cryptoexec.New(cfg.CryptoWorkers),
 		produced:  make(map[uint64]struct{}),
@@ -266,7 +279,7 @@ func (n *Node) sharePVSS(ctx context.Context, seq uint64) (asig.PVSSCommitment, 
 
 func (n *Node) sendPVSS(ctx context.Context, epoch uint64, commit asig.PVSSCommitment) error {
 	leader := n.State.Leader(epoch)
-	msg, err := p2p.NewMessage(Protocol, "PVSS", epochInstance(epoch), n.ID, leader, commit)
+	msg, err := n.newMessage(Protocol, "PVSS", epoch, leader, commit)
 	if err != nil {
 		return err
 	}
@@ -285,8 +298,6 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 		timeout = 20 * time.Second
 	}
 
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
@@ -296,8 +307,6 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 			return b, nil
 		}
 		select {
-		case <-ticker.C:
-			n.tick(epoch)
 		case b := <-n.beacons:
 			if b != nil && b.Epoch == epoch {
 				n.State.Advance(b.Random)
@@ -307,24 +316,11 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 				n.pending[b.Epoch] = b
 			}
 		case <-deadline.C:
-			return n.SkipCurrentEpochAt("beacon_wait", "timeout"), nil
+			return nil, fmt.Errorf("%w: %s", errEpochTimeout, n.skipDiagnostics(epoch))
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-}
-
-func (n *Node) SkipCurrentEpoch(reason string) *Beacon {
-	return n.SkipCurrentEpochAt(reason, reason)
-}
-
-func (n *Node) SkipCurrentEpochAt(stage string, reason string) *Beacon {
-	epoch, random := n.State.Skip(reason)
-	diag := n.skipDiagnostics(epoch)
-	n.mu.Lock()
-	delete(n.epochs, epoch)
-	n.mu.Unlock()
-	return &Beacon{Epoch: epoch, Random: random, Digest: reason, Skipped: true, SkipStage: stage, SkipReason: reason, SkipDiag: diag}
 }
 
 func (n *Node) skipDiagnostics(epoch uint64) string {
@@ -444,6 +440,9 @@ func (n *Node) dispatch(ctx context.Context) {
 }
 
 func (n *Node) dispatchSpurt(msg p2p.Message) {
+	if msg.Protocol != Protocol || !msg.Authenticated() || !n.State.IsMember(msg.From) {
+		return
+	}
 	switch msg.Type {
 	case "PVSS":
 		body, err := p2p.DecodePayload[asig.PVSSCommitment](msg)
@@ -451,13 +450,13 @@ func (n *Node) dispatchSpurt(msg p2p.Message) {
 			return
 		}
 		epoch, ok := parseEpochInstance(msg.Instance)
-		if !ok {
+		if !ok || body.Dealer != msg.From {
 			return
 		}
 		n.Crypto.Go(context.Background(), func() { n.handleCommit(epoch, body) })
 	case "PROPOSAL":
 		body, err := p2p.DecodePayload[AgreementMessage](msg)
-		if err != nil {
+		if err != nil || body.Leader != msg.From {
 			return
 		}
 		n.Crypto.Go(context.Background(), func() { n.handleProposal(body) })
@@ -517,6 +516,31 @@ func (n *Node) handleCommit(epoch uint64, commit asig.PVSSCommitment) {
 }
 
 func (n *Node) tick(epoch uint64) {
+	n.progressMu.Lock()
+	if n.progressPending == nil {
+		n.progressPending = make(map[uint64]bool)
+	}
+	n.progressPending[epoch] = true
+	if n.progressing {
+		n.progressMu.Unlock()
+		return
+	}
+	n.progressing = true
+	for len(n.progressPending) > 0 {
+		var next uint64
+		for e := range n.progressPending {
+			next = e
+			break
+		}
+		delete(n.progressPending, next)
+		n.progressMu.Unlock()
+		n.progressEpoch(next)
+		n.progressMu.Lock()
+	}
+	n.progressing = false
+	n.progressMu.Unlock()
+}
+func (n *Node) progressEpoch(epoch uint64) {
 	es := n.stateAt(epoch)
 	if es == nil {
 		return
@@ -594,7 +618,13 @@ func (n *Node) finishPreAggregate(es *epochState, epoch uint64, t int, commitmen
 		es.commits = nil
 	}
 	es.preAggregating = false
+	selected = append([]CommitmentRef(nil), es.selected...)
+	aggregate = *es.aggregate
+	columns = cloneColumnsByMember(es.selectedColumns)
+	digest := computeAgreementDigest(nil, epoch, n.ID, selected, aggregate)
+	es.privateDataSent = true
 	n.mu.Unlock()
+	n.sendPrivateColumns(epoch, n.ID, digest, selected, aggregate, columns)
 	n.tick(epoch)
 }
 
@@ -610,7 +640,6 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 	es.proposing = true
 	selected := append([]CommitmentRef(nil), es.selected...)
 	aggregate := *es.aggregate
-	columns := cloneColumnsByMember(es.selectedColumns)
 	n.mu.Unlock()
 
 	clearProposing := func() {
@@ -618,7 +647,7 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 		es.proposing = false
 		n.mu.Unlock()
 	}
-	digest := computeAgreementDigest(n.State.RPrevBytes(), es.epoch, n.ID, selected, aggregate)
+	digest := computeAgreementDigest(nil, es.epoch, n.ID, selected, aggregate)
 	if digest == "" {
 		clearProposing()
 		return
@@ -645,10 +674,8 @@ func (n *Node) tryLeaderProposal(es *epochState) {
 	es.precommitSent = false
 	es.commitSent = false
 	es.finalizeSent = false
-	es.privateVerified = false
 	es.proposing = false
 	n.mu.Unlock()
-	n.sendPrivateColumns(es.epoch, n.ID, digest, selected, aggregate, columns)
 	// Broadcast the public proposal after private sends are queued. Correctness
 	// does not depend on ordering: receivers buffer private columns if they
 	// arrive before this proposal.
@@ -659,7 +686,7 @@ func (n *Node) maybeSendPrepare(es *epochState) {
 	n.mu.Lock()
 	// PREPARE is delayed until privateVerified is true: each node must validate
 	// the digest-bound aggregate and its private vbar/cbar/pi_bar data first.
-	if es.leaderProposal == nil || es.aggregate == nil || !es.privateVerified || es.prepareSent {
+	if es.epoch != n.State.CurrentEpoch() || es.leaderProposal == nil || es.leaderProposal.Digest != es.digest || es.aggregate == nil || !es.privateVerified || es.prepareSent {
 		n.mu.Unlock()
 		return
 	}
@@ -670,25 +697,26 @@ func (n *Node) maybeSendPrepare(es *epochState) {
 
 func (n *Node) progressVotes(es *epochState) {
 	n.mu.Lock()
-	if es.leaderProposal == nil {
+	if es.epoch != n.State.CurrentEpoch() || es.leaderProposal == nil {
 		n.mu.Unlock()
 		return
 	}
-	twoF1 := 2*n.State.F + 1
+	quorum := n.State.Quorum()
 	var precommit, commit, finalize bool
-	if !es.precommitSent && len(es.prepare) >= twoF1 {
+	if !es.precommitSent && len(es.prepare) >= quorum {
 		es.precommitSent = true
 		precommit = true
 	}
-	if !es.commitSent && len(es.precommit) >= twoF1 {
+	if !es.commitSent && len(es.precommit) >= quorum {
 		es.commitSent = true
 		commit = true
 	}
-	if !es.finalizeSent && len(es.commit) >= twoF1 {
+	// Section V-C's Bracha amplification also relays f+1 FINALIZEs.
+	if !es.finalizeSent && (len(es.commit) >= quorum || len(es.finalize) >= n.State.Threshold()) {
 		es.finalizeSent = true
 		finalize = true
 	}
-	if len(es.finalize) >= twoF1 {
+	if len(es.finalize) >= quorum {
 		es.decided = true
 	}
 	n.mu.Unlock()
@@ -732,10 +760,12 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 		n.mu.Unlock()
 		return
 	}
+	if es.privateVerified && es.digest != msg.Digest {
+		n.mu.Unlock()
+		return
+	}
 	if es.leaderProposal != nil {
 		if es.leaderProposal.Digest == msg.Digest {
-			shouldGossip := !es.proposalGossiped
-			es.proposalGossiped = true
 			pendingPrivate := append([]pendingPrivateData(nil), es.pendingPrivate...)
 			es.pendingPrivate = nil
 			pendingVotes := append([]pendingVote(nil), es.pendingVotes...)
@@ -745,9 +775,6 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 			pendingBeacon := append([]pendingBeaconMessage(nil), es.pendingBeacon...)
 			es.pendingBeacon = nil
 			n.mu.Unlock()
-			if shouldGossip {
-				n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
-			}
 			for _, pending := range pendingPrivate {
 				n.handlePrivateData(pending.msg, pending.from)
 			}
@@ -772,8 +799,6 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	es.digest = msg.Digest
 	es.selectedSet = true
 	es.pendingProposal = nil
-	shouldGossip := !es.proposalGossiped
-	es.proposalGossiped = true
 	pendingPrivate := append([]pendingPrivateData(nil), es.pendingPrivate...)
 	es.pendingPrivate = nil
 	pendingVotes := append([]pendingVote(nil), es.pendingVotes...)
@@ -783,9 +808,6 @@ func (n *Node) handleProposal(msg AgreementMessage) {
 	pendingBeacon := append([]pendingBeaconMessage(nil), es.pendingBeacon...)
 	es.pendingBeacon = nil
 	n.mu.Unlock()
-	if shouldGossip {
-		n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
-	}
 	// Re-play buffered private messages after the digest proposal is installed.
 	// handlePrivateData will still verify digest, selected inputs, aggregate
 	// membership, and column DLEQ proofs before setting privateVerified.
@@ -805,6 +827,10 @@ func (n *Node) tryPendingProposal(es *epochState) {
 		return
 	}
 	msg := *es.pendingProposal
+	if es.privateVerified && es.digest != msg.Digest {
+		n.mu.Unlock()
+		return
+	}
 	selected, ok, pending := n.validateProposal(msg.Epoch, msg.Selected, msg.Digest)
 	if !ok {
 		if !pending {
@@ -818,8 +844,6 @@ func (n *Node) tryPendingProposal(es *epochState) {
 	es.digest = msg.Digest
 	es.selectedSet = true
 	es.pendingProposal = nil
-	shouldGossip := !es.proposalGossiped
-	es.proposalGossiped = true
 	pendingPrivate := append([]pendingPrivateData(nil), es.pendingPrivate...)
 	es.pendingPrivate = nil
 	pendingVotes := append([]pendingVote(nil), es.pendingVotes...)
@@ -829,9 +853,6 @@ func (n *Node) tryPendingProposal(es *epochState) {
 	pendingBeacon := append([]pendingBeaconMessage(nil), es.pendingBeacon...)
 	es.pendingBeacon = nil
 	n.mu.Unlock()
-	if shouldGossip {
-		n.broadcastAsync(Protocol, "PROPOSAL", msg.Epoch, msg)
-	}
 	for _, pending := range pendingPrivate {
 		n.handlePrivateData(pending.msg, pending.from)
 	}
@@ -857,14 +878,6 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 		n.mu.Unlock()
 		return
 	}
-	if es.leaderProposal == nil {
-		// Private PVSS_DATA is recipient-specific and may race ahead of the
-		// public proposal. Store it rather than rejecting it; it will be checked
-		// once the digest-bound proposal is available.
-		es.pendingPrivate = append(es.pendingPrivate, pendingPrivateData{msg: msg, from: from})
-		n.mu.Unlock()
-		return
-	}
 	if es.digest != "" && es.digest != msg.Digest {
 		n.mu.Unlock()
 		return
@@ -875,7 +888,7 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 	if !n.PVSS.Verify(msg.Aggregate) {
 		return
 	}
-	if !sameRefs(selected, proposalSelected) {
+	if len(proposalSelected) > 0 && !sameRefs(selected, proposalSelected) {
 		return
 	}
 	aggregate := msg.Aggregate
@@ -887,13 +900,13 @@ func (n *Node) handlePrivateData(msg PrivateDataMessage, from p2p.NodeID) {
 	if !n.PVSS.VerifyAggregationColumn(n.ID, aggregate, msg.Columns) {
 		return
 	}
-	expected := computeAgreementDigest(n.State.RPrevBytes(), msg.Epoch, msg.Leader, selected, aggregate)
+	expected := computeAgreementDigest(nil, msg.Epoch, msg.Leader, selected, aggregate)
 	if expected == "" || expected != msg.Digest {
 		return
 	}
 	n.mu.Lock()
 	es = n.stateAtLocked(msg.Epoch)
-	if es == nil || es.leaderProposal == nil {
+	if es == nil {
 		n.mu.Unlock()
 		return
 	}
@@ -941,7 +954,7 @@ func contains(s, sub string) bool {
 }
 
 func (n *Node) handleVote(stage string, msg VoteMessage, from p2p.NodeID) {
-	if !n.epochAllowed(msg.Epoch) || msg.Leader == "" || msg.Digest == "" {
+	if !n.epochAllowed(msg.Epoch) || !n.State.IsMember(from) || msg.Leader == "" || msg.Digest == "" {
 		return
 	}
 	start := time.Now()
@@ -974,7 +987,7 @@ func (n *Node) handleVote(stage string, msg VoteMessage, from p2p.NodeID) {
 	if n.Perf != nil {
 		n.Perf.addAgreement(time.Since(start))
 	}
-	n.progressVotes(es)
+	n.tick(msg.Epoch)
 }
 
 func (n *Node) replayPendingVotes(votes []pendingVote, digest string) {
@@ -1005,7 +1018,7 @@ func (n *Node) replayPendingBeacon(messages []pendingBeaconMessage, digest strin
 }
 
 func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
-	if !n.epochAllowed(msg.Epoch) || msg.Digest == "" || from == "" {
+	if !n.epochAllowed(msg.Epoch) || msg.Digest == "" || !n.State.IsMember(from) || msg.Share.Holder != from {
 		return
 	}
 	n.mu.Lock()
@@ -1063,6 +1076,7 @@ func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
 		}
 		n.mu.Unlock()
 	}
+	n.tick(msg.Epoch)
 }
 
 func (n *Node) tryReconstruct(es *epochState) {
@@ -1126,13 +1140,9 @@ func (n *Node) tryReconstruct(es *epochState) {
 		return
 	}
 	secret := append([]byte(nil), es.secret...)
-	digest := es.digest
-	epoch := es.epoch
 	n.mu.Unlock()
 
-	parts := [][]byte{n.State.RPrevBytes(), encodeEpoch(epoch)}
-	parts = append(parts, []byte(digest), secret)
-	random := asig.HashBytes(parts...)
+	random := secret
 	hash := randomHash(random)
 
 	n.mu.Lock()
@@ -1159,184 +1169,77 @@ func (n *Node) broadcastRecon(epoch uint64, digest string, c asig.PVSSCommitment
 	})
 }
 
+// A locally reconstructed output is delivered before collecting BEACON
+// acknowledgements. Signed BEACONs remain the paper's fallback for a node
+// without sufficient private reconstruction data, not an output voting phase.
 func (n *Node) tryBroadcastBeacon(es *epochState) {
-	if es.random == nil || es.randomHash == "" || es.beaconSent {
+	n.mu.Lock()
+	if es.random == nil || es.beaconSent {
+		n.mu.Unlock()
 		return
 	}
 	es.beaconSent = true
-	randomHashValue := randomHash(es.random)
-	msg := &Beacon{
-		Epoch:    es.epoch,
-		Random:   append([]byte(nil), es.random...),
-		Digest:   es.digest,
-		Selected: es.selected,
+	epoch, digest := es.epoch, es.digest
+	random := append([]byte(nil), es.random...)
+	rh := randomHash(random)
+	n.mu.Unlock()
+	start := time.Now()
+	sig := asig.SignatureShare{Signer: string(n.ID), SigHex: hex.EncodeToString(asig.Sign(n.Keys.Private, beaconVoteBytes(epoch, digest, rh)))}
+	if n.Perf != nil {
+		n.Perf.addBeaconSign(time.Since(start))
+	}
+	n.broadcastAsync(Protocol, "BEACON", epoch, BeaconMessage{Epoch: epoch, Leader: n.State.Leader(epoch), Digest: digest, Random: random, RandomHash: rh, Signature: sig})
+	n.publishBeacon(es)
+	n.addBeaconVote(Beacon{Epoch: epoch, Digest: digest, Random: random}, sig, n.ID)
+}
+func (n *Node) publishBeacon(es *epochState) {
+	n.mu.Lock()
+	if es.outputSent || es.random == nil {
+		n.mu.Unlock()
+		return
+	}
+	es.outputSent = true
+	beacon := &Beacon{Epoch: es.epoch, Random: append([]byte(nil), es.random...), Digest: es.digest, Selected: append([]CommitmentRef(nil), es.selected...), Committeds: len(es.selected)}
+	n.mu.Unlock()
+	n.beacons <- beacon
+}
+func (n *Node) handleBeacon(msg BeaconMessage, from p2p.NodeID) {
+	if !n.epochAllowed(msg.Epoch) || !n.State.IsMember(from) || msg.Signature.Signer != string(from) || msg.Leader != n.State.Leader(msg.Epoch) || msg.Digest == "" || len(msg.Random) == 0 || randomHash(msg.Random) != msg.RandomHash {
+		return
 	}
 	start := time.Now()
-	sig, err := asig.SignBLS(string(n.ID), n.BLS.Private, beaconVoteBytes(es.epoch, es.digest, randomHashValue))
-	if n.Perf != nil {
-		n.Perf.addBLSSign(time.Since(start))
-	}
+	sig, err := hex.DecodeString(msg.Signature.SigHex)
 	if err != nil {
 		return
 	}
-	_ = n.broadcast(Protocol, "BEACON", es.epoch, BeaconMessage{
-		Epoch:      msg.Epoch,
-		Leader:     n.State.Leader(es.epoch),
-		Digest:     msg.Digest,
-		Random:     msg.Random,
-		RandomHash: randomHashValue,
-		Signature:  sig,
-	})
-	n.addBeaconVote(*msg, sig, n.ID)
+	valid, executed := asig.VerifyOnce(n.Public[string(from)], beaconVoteBytes(msg.Epoch, msg.Digest, msg.RandomHash), sig, n.checks)
+	if n.Perf != nil && executed {
+		n.Perf.addBeaconVerify(time.Since(start))
+	}
+	if !valid {
+		return
+	}
+	n.addBeaconVote(Beacon{Epoch: msg.Epoch, Digest: msg.Digest, Random: msg.Random}, msg.Signature, from)
+	n.tick(msg.Epoch)
 }
-
-func (n *Node) handleBeacon(msg BeaconMessage, from p2p.NodeID) {
-	if !n.epochAllowed(msg.Epoch) || msg.Leader == "" || msg.Digest == "" || msg.RandomHash == "" || from == "" {
-		return
-	}
-	if msg.Leader != n.State.Leader(msg.Epoch) {
-		return
-	}
+func (n *Node) addBeaconVote(beacon Beacon, sig asig.SignatureShare, from p2p.NodeID) {
 	n.mu.Lock()
-	es := n.stateAtLocked(msg.Epoch)
-	if es == nil || es.leaderProposal == nil || es.leaderProposal.Digest != msg.Digest {
-		if es != nil && es.leaderProposal == nil {
-			es.pendingBeacon = append(es.pendingBeacon, pendingBeaconMessage{msg: msg, from: from})
-		}
-		n.mu.Unlock()
-		return
-	}
-	n.mu.Unlock()
-
-	d := randomHash(msg.Random)
-	if d != msg.RandomHash {
-		return
-	}
-	if len(msg.Random) == 0 {
-		return
-	}
-	n.mu.Lock()
-	es = n.stateAtLocked(msg.Epoch)
-	if es == nil {
-		n.mu.Unlock()
-		return
-	}
-	if existing := es.beaconVotes[msg.RandomHash]; existing != nil {
-		if _, dup := existing[from]; dup {
-			n.mu.Unlock()
-			return
-		}
-	}
-	n.mu.Unlock()
-	start := time.Now()
-	ok := asig.VerifyBLSShare(msg.Signature, n.BLSPublic, beaconVoteBytes(msg.Epoch, msg.Digest, msg.RandomHash))
-	if n.Perf != nil {
-		n.Perf.addBLSVerify(time.Since(start))
-	}
-	if !ok {
-		return
-	}
-	n.mu.Lock()
-	es = n.stateAtLocked(msg.Epoch)
-	if es == nil {
-		n.mu.Unlock()
-		return
-	}
-	n.mu.Unlock()
-	msgObj := Beacon{Epoch: msg.Epoch, Random: msg.Random, Digest: msg.Digest, Selected: []CommitmentRef{}}
-	n.addBeaconVote(msgObj, msg.Signature, from)
-}
-
-func (n *Node) addBeaconVote(beacon Beacon, sig asig.BLSSignatureShare, from p2p.NodeID) {
-	n.mu.Lock()
+	defer n.mu.Unlock()
 	es := n.stateAtLocked(beacon.Epoch)
-	if es == nil || es.leaderProposal == nil || es.leaderProposal.Digest != beacon.Digest {
-		n.mu.Unlock()
+	if es == nil || sig.Signer != string(from) || !n.State.IsMember(from) {
 		return
-	}
-	if es.beaconVotes == nil {
-		es.beaconVotes = make(map[string]map[p2p.NodeID]asig.BLSSignatureShare)
 	}
 	rh := randomHash(beacon.Random)
-	if rh == "" {
-		n.mu.Unlock()
-		return
+	key := beacon.Digest + "/" + rh
+	if es.beaconVotes[key] == nil {
+		es.beaconVotes[key] = make(map[p2p.NodeID]asig.SignatureShare)
 	}
-	votes := es.beaconVotes[rh]
-	if votes == nil {
-		votes = make(map[p2p.NodeID]asig.BLSSignatureShare)
-		es.beaconVotes[rh] = votes
-	}
-	votes[from] = sig
-	if es.random == nil {
+	es.beaconVotes[key][from] = sig
+	// One sender's advertised random value must never poison local reconstruction.
+	if es.random == nil && len(es.beaconVotes[key]) >= n.State.Threshold() {
 		es.random = append([]byte(nil), beacon.Random...)
-	}
-	es.beaconVotes[rh] = votes
-	es.randomHash = rh
-	n.mu.Unlock()
-	n.tryAssembleBeacon(es)
-}
-
-func (n *Node) tryAssembleBeacon(es *epochState) {
-	n.mu.Lock()
-	if es.certificateSet || es.assemblingCert {
-		n.mu.Unlock()
-		return
-	}
-	msgHash := es.randomHash
-	randomHashVotes := es.beaconVotes[msgHash]
-	if len(randomHashVotes) < n.State.Threshold() || len(es.selected) == 0 {
-		n.mu.Unlock()
-		return
-	}
-	votes := make([]asig.BLSSignatureShare, 0, len(randomHashVotes))
-	for _, v := range randomHashVotes {
-		votes = append(votes, v)
-	}
-	epoch := es.epoch
-	digest := es.digest
-	threshold := n.State.Threshold()
-	es.assemblingCert = true
-	n.mu.Unlock()
-
-	n.Crypto.Go(context.Background(), func() {
-		start := time.Now()
-		agg, err := asig.AggregateBLSTrusted(votes, n.BLSPublic, beaconVoteBytes(epoch, digest, msgHash), threshold)
-		if n.Perf != nil {
-			n.Perf.addBLSAggregate(time.Since(start))
-		}
-		if err != nil {
-			n.mu.Lock()
-			es.assemblingCert = false
-			n.mu.Unlock()
-			return
-		}
-		n.finishAssembleBeacon(es, agg)
-	})
-}
-
-func (n *Node) finishAssembleBeacon(es *epochState, agg asig.BLSAggregateSignature) {
-	n.mu.Lock()
-	if es.certificateSet {
-		es.assemblingCert = false
-		n.mu.Unlock()
-		return
-	}
-	es.certificate = agg
-	es.certificateSet = true
-	es.assemblingCert = false
-	epoch := es.epoch
-	random := append([]byte(nil), es.random...)
-	digest := es.digest
-	selected := append([]CommitmentRef(nil), es.selected...)
-	n.mu.Unlock()
-	n.beacons <- &Beacon{
-		Epoch:      epoch,
-		Random:     random,
-		Digest:     digest,
-		Selected:   selected,
-		Signature:  agg,
-		Committeds: len(selected),
+		es.randomHash = rh
+		es.digest = beacon.Digest
 	}
 }
 
@@ -1347,7 +1250,7 @@ func (n *Node) sendVote(stage string, es *epochState) error {
 }
 
 func (n *Node) broadcast(protocol, typ string, epoch uint64, payload any) error {
-	msg, err := p2p.NewMessage(protocol, typ, epochInstance(epoch), n.ID, "", payload)
+	msg, err := n.newMessage(protocol, typ, epoch, "", payload)
 	if err != nil {
 		return err
 	}
@@ -1355,7 +1258,7 @@ func (n *Node) broadcast(protocol, typ string, epoch uint64, payload any) error 
 }
 
 func (n *Node) send(protocol, typ string, epoch uint64, payload any) error {
-	msg, err := p2p.NewMessage(protocol, typ, epochInstance(epoch), n.ID, "", payload)
+	msg, err := n.newMessage(protocol, typ, epoch, "", payload)
 	if err != nil {
 		return err
 	}
@@ -1373,7 +1276,7 @@ func (n *Node) sendPrivateColumns(epoch uint64, leader p2p.NodeID, digest string
 			Aggregate: aggregate,
 			Columns:   cloneColumns(memberColumns),
 		}
-		msg, err := p2p.NewMessage(Protocol, "PVSS_DATA", epochInstance(epoch), n.ID, member, payload)
+		msg, err := n.newMessage(Protocol, "PVSS_DATA", epoch, member, payload)
 		if err != nil {
 			continue
 		}
@@ -1381,13 +1284,22 @@ func (n *Node) sendPrivateColumns(epoch uint64, leader p2p.NodeID, digest string
 	}
 }
 
+func (n *Node) newMessage(protocol, typ string, epoch uint64, to p2p.NodeID, payload any) (p2p.Message, error) {
+	if !p2p.AuthenticatedDelivery(n.Transport) {
+		return p2p.Message{}, errors.New("message requires authenticated delivery")
+	}
+	return p2p.NewMessage(protocol, typ, epochInstance(epoch), n.ID, to, payload)
+}
+
 func (n *Node) broadcastAsync(protocol, typ string, epoch uint64, payload any) {
+	msg, err := n.newMessage(protocol, typ, epoch, "", payload)
+	if err != nil {
+		return
+	}
 	for _, member := range n.State.MembersSnapshot() {
-		msg, err := p2p.NewMessage(protocol, typ, epochInstance(epoch), n.ID, member, payload)
-		if err != nil {
-			continue
-		}
-		n.sendAsync(member, msg)
+		packet := msg
+		packet.To = member
+		n.sendAsync(member, packet)
 	}
 }
 
@@ -1460,7 +1372,7 @@ func (n *Node) stateAtLocked(epoch uint64) *epochState {
 		finalize:     make(map[p2p.NodeID]struct{}),
 		commits:      make(map[p2p.NodeID]asig.PVSSCommitment),
 		reconShares:  make(map[p2p.NodeID]asig.PVSSDecryptedShare),
-		beaconVotes:  make(map[string]map[p2p.NodeID]asig.BLSSignatureShare),
+		beaconVotes:  make(map[string]map[p2p.NodeID]asig.SignatureShare),
 		pendingRecon: make([]ReconMessage, 0),
 		pendingVotes: make([]pendingVote, 0),
 	}
@@ -1509,7 +1421,7 @@ func (n *Node) CachedCommitments() (total int, max int) {
 	return total, max
 }
 
-func computeAgreementDigest(rprev []byte, epoch uint64, leader p2p.NodeID, refs []CommitmentRef, aggregate asig.PVSSCommitment) string {
+func computeAgreementDigest(_ []byte, epoch uint64, leader p2p.NodeID, refs []CommitmentRef, aggregate asig.PVSSCommitment) string {
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].Dealer == refs[j].Dealer {
 			return refs[i].Seq < refs[j].Seq
@@ -1517,10 +1429,9 @@ func computeAgreementDigest(rprev []byte, epoch uint64, leader p2p.NodeID, refs 
 		return refs[i].Dealer < refs[j].Dealer
 	})
 	parts := [][]byte{
-		[]byte("Spurt-v1/AGREEMENT"),
+		[]byte("Spurt-v3/AGREEMENT"),
 		encodeEpoch(epoch),
 		[]byte(leader),
-		rprev,
 		[]byte(aggregate.SecretID),
 	}
 	for _, ref := range refs {
@@ -1605,5 +1516,5 @@ func randomHash(random []byte) string {
 }
 
 func beaconVoteBytes(epoch uint64, digest string, randomHash string) []byte {
-	return asig.HashBytes([]byte("Spurt-v1/BEACON"), encodeEpoch(epoch), []byte(digest), []byte(randomHash))
+	return asig.HashBytes([]byte("Spurt-v3/BEACON"), encodeEpoch(epoch), []byte(digest), []byte(randomHash))
 }

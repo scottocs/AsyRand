@@ -4,7 +4,7 @@ This module implements the individual-object AsyRand construction in
 `paper/Asyrand.tex`. The previous copied SPURT command/state machine has been
 replaced. The current wire/config version is `asyrand-v2`: it follows the
 shared-column Producer and BEACON-only Consumer history. Version 1 archives
-and mixed-version peers cannot be reused under this version. It uses contextual DDH SCRAPE PVSS and local-coin Quadratic-ABA;
+and mixed-version peers cannot be reused under this version. It uses contextual single-secret ALBATROSS PVSS and local-coin Quadratic-ABA;
 beacon generation has no external common-coin service.
 
 ## Run
@@ -111,8 +111,26 @@ go vet ./...
 
 Tests cover 4/8 members, both consumption modes, f silent members, delayed
 member recovery, TCP deployment, RBC/ABA certificate forgery, duplicate reconstruction
-holders and transcript/history tampering. The DDH PVSS implementation does not
-supply a formal proof of the paper's additional multi-object secrecy assumption.
+holders and transcript/history tampering. ALBATROSS sharing uses LDEI with
+exactly t response coefficients. Decryption publishes the paper's (d,a,b,z)
+DLEQ transcript and recomputes its challenge during verification. The node,
+setup fingerprint and public verifier all select ALBATROSS; old SCRAPE histories
+have a different setup context and are not accepted by this verifier. See
+[PVSS interfaces and encodings](crypto/PVSS.md).
+
+## ALBATROSS migration (2026-10-17)
+
+The running protocol and public history verifier now use ALBATROSS, including
+the paper's expanded reconstruction proofs. SCRAPE remains available in the
+crypto package for controlled comparisons. The setup fingerprint separates
+the two schemes, so old SCRAPE archives require the saved SCRAPE verifier.
+
+Matched n=4/8 experiments cover both consumption modes, fresh Grandline/SPURT
+baselines, throughput, output intervals, traffic, message types and actual ABA
+instances. Each group repeats three times with 128 warm-up outputs and 128
+measured intervals. See the [complete comparison](benchmarks/albatross_e2e_20261017/README.md)
+for results, source snapshots, exact configurations and public histories.
+The older tables below are historical SCRAPE measurements.
 
 ## Local comparison
 
@@ -138,7 +156,8 @@ These are single-host measurements of the repository implementations. They do
 not reproduce published paper experiments or WAN latency. The current Grandline
 runner establishes APVSS/GRand keys during setup and performs only its share /
 verification / recovery path per epoch; its producer interval is unused. The
-current SPURT uses a different pairing-based PVSS and BLS certificate path.
+SPURT runner used by the archived tables had a pairing-based PVSS and BLS
+certificate path. The corrected runner uses the output conditions described below.
 Benchmark results alone do not establish equal security assumptions or validate
 the baseline implementations.
 
@@ -301,3 +320,35 @@ Three-run means: 181.76 / 47.73 beacon/s and 57.69 / 198.20 KiB/beacon
 (4/8 nodes; comparison bytes cover 256 intervals). In the post-warmup window,
 ABA accounts for 23.71% / 13.30% of sent bytes and each fully consumed column
 uses one whole-column ABA. The startup column uses n+1 ABAs.
+
+## Authenticated-channel comparison mode
+
+The memory transport binds each packet to the sending transport identity and
+supplies non-serializable authentication provenance. Ordinary RECON/history
+packets, ABA core/requests, and non-READY RBC packets omit redundant message
+signatures only on this authenticated transport. Other transports retain the
+application signatures. RBC READY and ABA DECISION always remain signed;
+exported history verification still checks their complete certificates.
+Replay inherits authentication only when served by the original sender. A
+serialized packet cannot manufacture channel authentication.
+
+The pairing baselines now use BLS12-381 and their original output conditions.
+Earlier baseline numbers are historical, not results for the corrected code.
+Normal output has no additional beacon voting certificate. Code changes do not
+change the paper or its stated security assumptions.
+
+## Verification reuse within a node
+
+Each node owns one `utils/verification.Cache`, shared by RBC reception and
+certificate checks, ABA reception and decision certificates, the runtime PVSS
+scheme and its history verifier. A successful signature/proof check is retained
+for that owner's lifetime; concurrent copies join the same in-flight check.
+Signature keys bind public key, complete signed statement and signature bytes.
+PVSS keys bind the immutable setup and complete transcript/share/proof, not just
+an object identifier. Quorum, membership, context and state-transition checks
+still run on every use. Invalid inputs are not retained as successful results.
+
+Caches are not shared between committee members. A new independent public
+history verifier starts with an empty cache and performs its own checks. The
+success cache grows with retained evidence and is released with its node/verifier;
+it is not the bounded point-decoding memo. Signature requirements are unchanged.

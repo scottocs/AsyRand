@@ -9,9 +9,11 @@ import (
 	"sync"
 
 	"Tyche/utils/p2p"
+	"Tyche/utils/pairing"
+	"Tyche/utils/verification"
 	"go.dedis.ch/kyber/v3"
-	"go.dedis.ch/kyber/v3/pairing/bn256"
 	"go.dedis.ch/kyber/v3/share"
+	"go.dedis.ch/kyber/v3/util/random"
 )
 
 type PVSSKeyPair struct {
@@ -88,10 +90,12 @@ type PVSSScheme interface {
 }
 
 type PVSSPairingFreeScheme struct {
-	id        p2p.NodeID
-	threshold int
-	private   kyber.Scalar
-	public    map[p2p.NodeID]kyber.Point
+	checks            *verification.Cache
+	verificationSetup verification.Key
+	id                p2p.NodeID
+	threshold         int
+	private           kyber.Scalar
+	public            map[p2p.NodeID]kyber.Point
 
 	// The protocol messages keep points and scalars as hex strings so they can
 	// be serialized in JSON. Verification paths repeatedly touch the same
@@ -99,13 +103,14 @@ type PVSSPairingFreeScheme struct {
 	// kyber objects here. Each caller receives a Clone, which avoids accidental
 	// mutation of cached points while removing repeated hex decode/unmarshal
 	// work from the hot path.
-	cacheMu     sync.RWMutex
-	g1PointMemo map[string]kyber.Point
-	g2PointMemo map[string]kyber.Point
-	scalarMemo  map[string]kyber.Scalar
+	cacheMu        sync.RWMutex
+	g1PointMemo    map[string]kyber.Point
+	g2PointMemo    map[string]kyber.Point
+	scalarMemo     map[string]kyber.Scalar
+	verifiedShares map[string]struct{}
 }
 
-func NewPVSSScheme(id p2p.NodeID, threshold int, private kyber.Scalar, public map[p2p.NodeID]kyber.Point) (*PVSSPairingFreeScheme, error) {
+func NewPVSSScheme(id p2p.NodeID, threshold int, private kyber.Scalar, public map[p2p.NodeID]kyber.Point, caches ...*verification.Cache) (*PVSSPairingFreeScheme, error) {
 	if id == "" {
 		return nil, errors.New("pvss node id is required")
 	}
@@ -118,24 +123,55 @@ func NewPVSSScheme(id p2p.NodeID, threshold int, private kyber.Scalar, public ma
 	if len(public) == 0 {
 		return nil, errors.New("pvss public keys are required")
 	}
+	if threshold > len(public) {
+		return nil, errors.New("threshold exceeds committee")
+	}
+	raw, err := private.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	secret := suite().G1().Scalar()
+	if err := secret.UnmarshalBinary(raw); err != nil || secret.Equal(suite().G1().Scalar().Zero()) {
+		return nil, errors.New("invalid private scalar")
+	}
 	cp := make(map[p2p.NodeID]kyber.Point, len(public))
 	for id, pub := range public {
-		cp[id] = pub.Clone()
+		if id == "" || pub == nil {
+			return nil, errors.New("invalid shareholder identity or key")
+		}
+		raw, err := pub.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		point := suite().G1().Point()
+		if err := point.UnmarshalBinary(raw); err != nil || point.Equal(suite().G1().Point().Null()) {
+			return nil, errors.New("invalid shareholder subgroup point")
+		}
+		cp[id] = point
 	}
-	return &PVSSPairingFreeScheme{
-		id:          id,
-		threshold:   threshold,
-		private:     private.Clone(),
-		public:      cp,
-		g1PointMemo: make(map[string]kyber.Point),
-		g2PointMemo: make(map[string]kyber.Point),
-		scalarMemo:  make(map[string]kyber.Scalar),
+	if cp[id] == nil || !suite().G1().Point().Mul(secret, h0Point(suite())).Equal(cp[id]) {
+		return nil, errors.New("private key does not match shareholder key")
+	}
+	private = secret
+	encodedPublic := make(map[p2p.NodeID]string, len(cp))
+	for member, point := range cp {
+		encodedPublic[member] = mustPointHex(point)
+	}
+	return &PVSSPairingFreeScheme{checks: verification.Select(caches...), verificationSetup: verification.JSONKey("spurt/pvss-setup", threshold, encodedPublic),
+		id:             id,
+		threshold:      threshold,
+		private:        private.Clone(),
+		public:         cp,
+		g1PointMemo:    make(map[string]kyber.Point),
+		g2PointMemo:    make(map[string]kyber.Point),
+		scalarMemo:     make(map[string]kyber.Scalar),
+		verifiedShares: make(map[string]struct{}),
 	}, nil
 }
 
 func PVSSKeyPairFromSeed(seed []byte) PVSSKeyPair {
 	group := suite()
-	sk := group.G1().Scalar().SetBytes(HashBytes([]byte("Spurt-v1/PVSS/key"), seed))
+	sk := group.G1().Scalar().SetBytes(HashBytes([]byte("Spurt-v2/PVSS/key"), seed))
 	if sk.Equal(group.G1().Scalar().Zero()) {
 		sk = group.G1().Scalar().One()
 	}
@@ -181,7 +217,21 @@ func (s *PVSSPairingFreeScheme) Share(dealer p2p.NodeID, seq uint64, members []p
 	return out, mustPointBytes(beaconSecret), nil
 }
 
+func (s *PVSSPairingFreeScheme) VerificationCache() *verification.Cache { return s.checks }
 func (s *PVSSPairingFreeScheme) Verify(c PVSSCommitment) bool {
+	return s.checks.Check(verification.JSONKey("spurt/pvss-sharing", s.verificationSetup, c), func() bool { return s.verifySharingUncached(c) })
+}
+func (s *PVSSPairingFreeScheme) verifySharingUncached(c PVSSCommitment) bool {
+	if c.Threshold != s.threshold || len(c.Members) != len(s.public) {
+		return false
+	}
+	membersSeen := make(map[p2p.NodeID]bool, len(c.Members))
+	for _, id := range c.Members {
+		if s.public[id] == nil || membersSeen[id] {
+			return false
+		}
+		membersSeen[id] = true
+	}
 	if c.Aggregate {
 		return s.verifyAggregate(c)
 	}
@@ -193,8 +243,8 @@ func (s *PVSSPairingFreeScheme) Verify(c PVSSCommitment) bool {
 	}
 	members := normalizeMembers(c.Members)
 	group := suite()
-	// SPURT Figure 2 verification: pairing consistency for every encrypted
-	// share, plus the Reed-Solomon dual-code check on the v-vector.
+	// Section V-B: DLEQ establishes knowledge of each exponent. Once it
+	// verifies, the corresponding pairing consistency check is redundant.
 	for _, member := range members {
 		pk := s.public[member]
 		if pk == nil {
@@ -208,7 +258,7 @@ func (s *PVSSPairingFreeScheme) Verify(c PVSSCommitment) bool {
 		if err != nil {
 			return false
 		}
-		if !group.Pair(pk, vj).Equal(group.Pair(cj, g1Point(group))) {
+		if !s.dleqVerifyShare(group, member, g1Point(group), pk, vj, cj, c.DLEQ[member]) {
 			return false
 		}
 	}
@@ -309,19 +359,38 @@ func (s *PVSSPairingFreeScheme) PreReconTrusted(c PVSSCommitment, holder p2p.Nod
 }
 
 func (s *PVSSPairingFreeScheme) VerifyShare(c PVSSCommitment, sh PVSSDecryptedShare) bool {
-	if sh.CommitmentID != c.SecretID {
+	return s.checks.Check(verification.JSONKey("spurt/pvss-share", s.verificationSetup, c, sh), func() bool { return s.verifyShareUncached(c, sh) })
+}
+func (s *PVSSPairingFreeScheme) verifyShareUncached(c PVSSCommitment, sh PVSSDecryptedShare) bool {
+	if sh.CommitmentID != c.SecretID || commitmentID(c) != c.SecretID || s.public[sh.Holder] == nil {
 		return false
+	}
+	key := string(HashBytes([]byte("SPURT-v2/verified-share"), []byte(c.SecretID), []byte(sh.Holder), []byte(sh.Value)))
+	s.cacheMu.RLock()
+	_, ok := s.verifiedShares[key]
+	s.cacheMu.RUnlock()
+	if ok {
+		return true
 	}
 	group := suite()
-	plain, err := pointG1FromHex(sh.Value)
+	plain, err := s.pointG1FromHex(sh.Value)
 	if err != nil {
 		return false
 	}
-	vj, err := pointG2FromHex(c.Commit[sh.Holder])
+	vj, err := s.pointG2FromHex(c.Commit[sh.Holder])
 	if err != nil {
 		return false
 	}
-	return group.Pair(plain, g1Point(group)).Equal(group.Pair(h0Point(group), vj))
+	if !group.Pair(plain, g1Point(group)).Equal(group.Pair(h0Point(group), vj)) {
+		return false
+	}
+	s.cacheMu.Lock()
+	if len(s.verifiedShares) >= 4096 {
+		s.verifiedShares = make(map[string]struct{})
+	}
+	s.verifiedShares[key] = struct{}{}
+	s.cacheMu.Unlock()
+	return true
 }
 
 func (s *PVSSPairingFreeScheme) Recon(c PVSSCommitment, shares []PVSSDecryptedShare, threshold int) ([]byte, error) {
@@ -365,7 +434,7 @@ func (s *PVSSPairingFreeScheme) ReconTrusted(c PVSSCommitment, shares []PVSSDecr
 	}
 	// Interpolate h0^s from decrypted shares h0^{p(j)}, then pair with h1 as
 	// in PVSS.Reconstruct(h0,h1,...) of SPURT Figure 2.
-	secretCommit, err := share.RecoverCommit(group.G1(), pubShares, threshold, len(c.Members))
+	secretCommit, err := pairing.RecoverCommit(group.G1(), pubShares, threshold, len(c.Members))
 	if err != nil {
 		return nil, err
 	}
@@ -373,6 +442,9 @@ func (s *PVSSPairingFreeScheme) ReconTrusted(c PVSSCommitment, shares []PVSSDecr
 }
 
 func (s *PVSSPairingFreeScheme) VerifyAggregationColumn(holder p2p.NodeID, aggregate PVSSCommitment, entries []PVSSColumnEntry) bool {
+	return s.checks.Check(verification.JSONKey("spurt/pvss-column", s.verificationSetup, holder, aggregate, entries), func() bool { return s.verifyColumnUncached(holder, aggregate, entries) })
+}
+func (s *PVSSPairingFreeScheme) verifyColumnUncached(holder p2p.NodeID, aggregate PVSSCommitment, entries []PVSSColumnEntry) bool {
 	if holder == "" || !aggregate.Aggregate || len(entries) < aggregate.Threshold || len(entries) != len(aggregate.Sources) {
 		return false
 	}
@@ -427,7 +499,11 @@ func (s *PVSSPairingFreeScheme) VerifyAggregationColumn(holder p2p.NodeID, aggre
 	return commitSum.Equal(aggCommit) && cipherSum.Equal(aggCipher)
 }
 
-func (s *PVSSPairingFreeScheme) dleqVerifyShare(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, proof DLEQProof) bool {
+func (s *PVSSPairingFreeScheme) dleqVerifyShare(group *pairing.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, proof DLEQProof) bool {
+	key := verification.JSONKey("spurt/dleq", s.verificationSetup, holder, mustPointBytes(g), mustPointBytes(pk), mustPointBytes(v), mustPointBytes(c), proof)
+	return s.checks.Check(key, func() bool { return s.dleqVerifyUncached(group, holder, g, pk, v, c, proof) })
+}
+func (s *PVSSPairingFreeScheme) dleqVerifyUncached(group *pairing.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, proof DLEQProof) bool {
 	a, err := s.pointG2FromHex(proof.A)
 	if err != nil {
 		return false
@@ -452,24 +528,26 @@ func CommitmentID(c PVSSCommitment) string {
 	return c.SecretID
 }
 
-func suite() *bn256.Suite {
-	return bn256.NewSuite()
+func suite() *pairing.Suite {
+	return pairing.NewSuite()
 }
 
-func h0Point(group *bn256.Suite) kyber.Point {
+func h0Point(group *pairing.Suite) kyber.Point {
 	return group.G1().Point().Base()
 }
 
-func g1Point(group *bn256.Suite) kyber.Point {
+func g1Point(group *pairing.Suite) kyber.Point {
 	return group.G2().Point().Base()
 }
 
-func h1Point(group *bn256.Suite) kyber.Point {
-	h := group.G2().Scalar().SetBytes(HashBytes([]byte("Spurt-v1/PVSS/h1")))
-	if h.Equal(group.G2().Scalar().Zero()) {
-		h = group.G2().Scalar().One()
-	}
-	return group.G2().Point().Mul(h, nil)
+var h1Once sync.Once
+var independentH1 kyber.Point
+
+func h1Point(group *pairing.Suite) kyber.Point {
+	h1Once.Do(func() {
+		independentH1 = pairing.HashG2([]byte("SPURT-v2/PVSS/independent-h1"), []byte("TYCHE_SPURT_BLS12381G2_XMD:SHA-256_SSWU_RO_"))
+	})
+	return independentH1.Clone()
 }
 
 func verifyPublicPolynomial(group kyber.Group, shares []*share.PubShare, threshold int) bool {
@@ -507,9 +585,9 @@ func commitmentID(c PVSSCommitment) string {
 	members := normalizeMembers(c.Members)
 	buf := bytes.Buffer{}
 	if c.Aggregate {
-		buf.WriteString("Spurt-v1/PVSS/aggregate/")
+		buf.WriteString("Spurt-v2/PVSS/aggregate/")
 	} else {
-		buf.WriteString("Spurt-v1/PVSS/commitment/")
+		buf.WriteString("Spurt-v2/PVSS/commitment/")
 	}
 	buf.WriteString(string(c.Dealer))
 	buf.WriteByte('/')
@@ -601,7 +679,7 @@ func aggregateHasSource(c PVSSCommitment, source PVSSSource) bool {
 	return false
 }
 
-func dleqProveShare(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, x kyber.Scalar) DLEQProof {
+func dleqProveShare(group *pairing.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, x kyber.Scalar) DLEQProof {
 	r := group.G1().Scalar().Pick(group.RandomStream())
 	a := group.G2().Point().Mul(r, g)
 	b := group.G1().Point().Mul(r, pk)
@@ -610,7 +688,7 @@ func dleqProveShare(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk kyb
 	return DLEQProof{A: mustPointHex(a), B: mustPointHex(b), Challenge: scalarHex(chal), Response: scalarHex(resp)}
 }
 
-func dleqVerifyShare(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, proof DLEQProof) bool {
+func dleqVerifyShare(group *pairing.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, proof DLEQProof) bool {
 	a, err := pointG2FromHex(proof.A)
 	if err != nil {
 		return false
@@ -631,9 +709,9 @@ func dleqVerifyShare(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk ky
 	return leftV.Equal(rightV) && leftC.Equal(rightC)
 }
 
-func dleqShareChallenge(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, a kyber.Point, b kyber.Point) kyber.Scalar {
+func dleqShareChallenge(group *pairing.Suite, holder p2p.NodeID, g kyber.Point, pk kyber.Point, v kyber.Point, c kyber.Point, a kyber.Point, b kyber.Point) kyber.Scalar {
 	buf := bytes.Buffer{}
-	buf.WriteString("Spurt-v1/PVSS/dleq-share/")
+	buf.WriteString("Spurt-v2/PVSS/dleq-share/")
 	buf.WriteString(string(holder))
 	for _, p := range []kyber.Point{g, pk, v, c, a, b} {
 		buf.WriteByte('/')
@@ -642,39 +720,26 @@ func dleqShareChallenge(group *bn256.Suite, holder p2p.NodeID, g kyber.Point, pk
 	return group.G1().Scalar().SetBytes(HashBytes(buf.Bytes()))
 }
 
-func verifyRSDualCodeG2(group *bn256.Suite, c PVSSCommitment, members []p2p.NodeID) bool {
-	// Figure 2 samples y^\perp from the RS dual code and checks
-	// prod_j v_j^{y_j}=1. The sample is derived deterministically from the
-	// transcript so all verifiers make the same public-verification decision.
-	weights, err := dualCodeWord(group.G2(), c, members)
-	if err != nil {
-		return false
-	}
-	acc := group.G2().Point().Null()
-	for i, member := range members {
-		vj, err := pointG2FromHex(c.Commit[member])
-		if err != nil {
-			return false
-		}
-		acc.Add(acc, group.G2().Point().Mul(weights[i], vj))
-	}
-	return acc.Equal(group.G2().Point().Null())
+func verifyRSDualCodeG2(group *pairing.Suite, c PVSSCommitment, members []p2p.NodeID) bool {
+	return checkRSDualCodeG2(group, c, members, pointG2FromHex)
 }
-
-func (s *PVSSPairingFreeScheme) verifyRSDualCodeG2(group *bn256.Suite, c PVSSCommitment, members []p2p.NodeID) bool {
+func (s *PVSSPairingFreeScheme) verifyRSDualCodeG2(group *pairing.Suite, c PVSSCommitment, members []p2p.NodeID) bool {
+	return checkRSDualCodeG2(group, c, members, s.pointG2FromHex)
+}
+func checkRSDualCodeG2(group *pairing.Suite, c PVSSCommitment, members []p2p.NodeID, decode func(string) (kyber.Point, error)) bool {
 	weights, err := dualCodeWord(group.G2(), c, members)
 	if err != nil {
 		return false
 	}
-	acc := group.G2().Point().Null()
+	points := make([]kyber.Point, len(members))
 	for i, member := range members {
-		vj, err := s.pointG2FromHex(c.Commit[member])
+		points[i], err = decode(c.Commit[member])
 		if err != nil {
 			return false
 		}
-		acc.Add(acc, group.G2().Point().Mul(weights[i], vj))
 	}
-	return acc.Equal(group.G2().Point().Null())
+	acc, err := pairing.MultiScalarMul(group.G2(), points, weights)
+	return err == nil && acc.Equal(group.G2().Point().Null())
 }
 
 func dualCodeWord(group kyber.Group, c PVSSCommitment, members []p2p.NodeID) ([]kyber.Scalar, error) {
@@ -683,9 +748,12 @@ func dualCodeWord(group kyber.Group, c PVSSCommitment, members []p2p.NodeID) ([]
 	}
 	degree := len(members) - c.Threshold - 1
 	coeffs := make([]kyber.Scalar, max(1, degree+1))
-	seed := dualCodeSeed(c, members)
+	stream := random.New()
 	for i := range coeffs {
-		coeffs[i] = group.Scalar().SetBytes(HashBytes(seed, []byte(fmt.Sprintf("/%d", i))))
+		coeffs[i] = group.Scalar().Pick(stream)
+	}
+	if degree < 0 {
+		coeffs[0].Zero()
 	}
 	out := make([]kyber.Scalar, len(members))
 	for i := range members {
@@ -693,19 +761,6 @@ func dualCodeWord(group kyber.Group, c PVSSCommitment, members []p2p.NodeID) ([]
 		out[i] = group.Scalar().Mul(evalScalarPoly(group, coeffs, xi), dualMultiplier(group, i, len(members)))
 	}
 	return out, nil
-}
-
-func dualCodeSeed(c PVSSCommitment, members []p2p.NodeID) []byte {
-	buf := bytes.Buffer{}
-	buf.WriteString("Spurt-v1/PVSS/rs-dual/")
-	buf.WriteString(c.SecretID)
-	for _, member := range members {
-		buf.WriteByte('/')
-		buf.WriteString(string(member))
-		buf.WriteByte(':')
-		buf.WriteString(c.Commit[member])
-	}
-	return HashBytes(buf.Bytes())
 }
 
 func evalScalarPoly(group kyber.Group, coeffs []kyber.Scalar, x kyber.Scalar) kyber.Scalar {

@@ -24,35 +24,35 @@ type PerfMetrics struct {
 	agreementNs    atomic.Int64
 	agreementCount atomic.Uint64
 
-	blsSignNs    atomic.Int64
-	blsSignCount atomic.Uint64
+	beaconSignNs    atomic.Int64
+	beaconSignCount atomic.Uint64
 
-	blsVerifyNs    atomic.Int64
-	blsVerifyCount atomic.Uint64
-
-	blsAggregateNs    atomic.Int64
-	blsAggregateCount atomic.Uint64
+	beaconVerifyNs    atomic.Int64
+	beaconVerifyCount atomic.Uint64
 }
 
 type PerfSnapshot struct {
-	PVSSShareCount    uint64
-	PVSSShareTotal    time.Duration
-	PVSSVerifyCount   uint64
-	PVSSVerifyTotal   time.Duration
-	PVSSPreReconCount uint64
-	PVSSPreReconTotal time.Duration
-	PVSSReconCount    uint64
-	PVSSReconTotal    time.Duration
-	RBCHandleCount    uint64
-	RBCHandleTotal    time.Duration
-	AgreementCount    uint64
-	AgreementTotal    time.Duration
-	BLSSignCount      uint64
-	BLSSignTotal      time.Duration
-	BLSVerifyCount    uint64
-	BLSVerifyTotal    time.Duration
-	BLSAggregateCount uint64
-	BLSAggregateTotal time.Duration
+	// Legacy output fields remain zero: ordinary messages have no outer signatures.
+	MessageSignCount   uint64
+	MessageSignTotal   time.Duration
+	MessageVerifyCount uint64
+	MessageVerifyTotal time.Duration
+	PVSSShareCount     uint64
+	PVSSShareTotal     time.Duration
+	PVSSVerifyCount    uint64
+	PVSSVerifyTotal    time.Duration
+	PVSSPreReconCount  uint64
+	PVSSPreReconTotal  time.Duration
+	PVSSReconCount     uint64
+	PVSSReconTotal     time.Duration
+	RBCHandleCount     uint64
+	RBCHandleTotal     time.Duration
+	AgreementCount     uint64
+	AgreementTotal     time.Duration
+	BeaconSignCount    uint64
+	BeaconSignTotal    time.Duration
+	BeaconVerifyCount  uint64
+	BeaconVerifyTotal  time.Duration
 }
 
 func (p *PerfMetrics) addShare(d time.Duration) {
@@ -85,19 +85,14 @@ func (p *PerfMetrics) addAgreement(d time.Duration) {
 	p.agreementCount.Add(1)
 }
 
-func (p *PerfMetrics) addBLSSign(d time.Duration) {
-	p.blsSignNs.Add(d.Nanoseconds())
-	p.blsSignCount.Add(1)
+func (p *PerfMetrics) addBeaconSign(d time.Duration) {
+	p.beaconSignNs.Add(d.Nanoseconds())
+	p.beaconSignCount.Add(1)
 }
 
-func (p *PerfMetrics) addBLSVerify(d time.Duration) {
-	p.blsVerifyNs.Add(d.Nanoseconds())
-	p.blsVerifyCount.Add(1)
-}
-
-func (p *PerfMetrics) addBLSAggregate(d time.Duration) {
-	p.blsAggregateNs.Add(d.Nanoseconds())
-	p.blsAggregateCount.Add(1)
+func (p *PerfMetrics) addBeaconVerify(d time.Duration) {
+	p.beaconVerifyNs.Add(d.Nanoseconds())
+	p.beaconVerifyCount.Add(1)
 }
 
 func (p *PerfMetrics) Snapshot() PerfSnapshot {
@@ -114,17 +109,17 @@ func (p *PerfMetrics) Snapshot() PerfSnapshot {
 		RBCHandleTotal:    time.Duration(p.rbcHandleNs.Load()),
 		AgreementCount:    p.agreementCount.Load(),
 		AgreementTotal:    time.Duration(p.agreementNs.Load()),
-		BLSSignCount:      p.blsSignCount.Load(),
-		BLSSignTotal:      time.Duration(p.blsSignNs.Load()),
-		BLSVerifyCount:    p.blsVerifyCount.Load(),
-		BLSVerifyTotal:    time.Duration(p.blsVerifyNs.Load()),
-		BLSAggregateCount: p.blsAggregateCount.Load(),
-		BLSAggregateTotal: time.Duration(p.blsAggregateNs.Load()),
+		BeaconSignCount:   p.beaconSignCount.Load(),
+		BeaconSignTotal:   time.Duration(p.beaconSignNs.Load()),
+		BeaconVerifyCount: p.beaconVerifyCount.Load(),
+		BeaconVerifyTotal: time.Duration(p.beaconVerifyNs.Load()),
 	}
 }
 
 func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 	return PerfSnapshot{
+		MessageSignCount: s.MessageSignCount + o.MessageSignCount, MessageSignTotal: s.MessageSignTotal + o.MessageSignTotal,
+		MessageVerifyCount: s.MessageVerifyCount + o.MessageVerifyCount, MessageVerifyTotal: s.MessageVerifyTotal + o.MessageVerifyTotal,
 		PVSSShareCount:    s.PVSSShareCount + o.PVSSShareCount,
 		PVSSShareTotal:    s.PVSSShareTotal + o.PVSSShareTotal,
 		PVSSVerifyCount:   s.PVSSVerifyCount + o.PVSSVerifyCount,
@@ -137,17 +132,17 @@ func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 		RBCHandleTotal:    s.RBCHandleTotal + o.RBCHandleTotal,
 		AgreementCount:    s.AgreementCount + o.AgreementCount,
 		AgreementTotal:    s.AgreementTotal + o.AgreementTotal,
-		BLSSignCount:      s.BLSSignCount + o.BLSSignCount,
-		BLSSignTotal:      s.BLSSignTotal + o.BLSSignTotal,
-		BLSVerifyCount:    s.BLSVerifyCount + o.BLSVerifyCount,
-		BLSVerifyTotal:    s.BLSVerifyTotal + o.BLSVerifyTotal,
-		BLSAggregateCount: s.BLSAggregateCount + o.BLSAggregateCount,
-		BLSAggregateTotal: s.BLSAggregateTotal + o.BLSAggregateTotal,
+		BeaconSignCount:   s.BeaconSignCount + o.BeaconSignCount,
+		BeaconSignTotal:   s.BeaconSignTotal + o.BeaconSignTotal,
+		BeaconVerifyCount: s.BeaconVerifyCount + o.BeaconVerifyCount,
+		BeaconVerifyTotal: s.BeaconVerifyTotal + o.BeaconVerifyTotal,
 	}
 }
 
 func (s PerfSnapshot) Sub(o PerfSnapshot) PerfSnapshot {
 	return PerfSnapshot{
+		MessageSignCount: s.MessageSignCount - o.MessageSignCount, MessageSignTotal: s.MessageSignTotal - o.MessageSignTotal,
+		MessageVerifyCount: s.MessageVerifyCount - o.MessageVerifyCount, MessageVerifyTotal: s.MessageVerifyTotal - o.MessageVerifyTotal,
 		PVSSShareCount:    s.PVSSShareCount - o.PVSSShareCount,
 		PVSSShareTotal:    s.PVSSShareTotal - o.PVSSShareTotal,
 		PVSSVerifyCount:   s.PVSSVerifyCount - o.PVSSVerifyCount,
@@ -160,12 +155,10 @@ func (s PerfSnapshot) Sub(o PerfSnapshot) PerfSnapshot {
 		RBCHandleTotal:    s.RBCHandleTotal - o.RBCHandleTotal,
 		AgreementCount:    s.AgreementCount - o.AgreementCount,
 		AgreementTotal:    s.AgreementTotal - o.AgreementTotal,
-		BLSSignCount:      s.BLSSignCount - o.BLSSignCount,
-		BLSSignTotal:      s.BLSSignTotal - o.BLSSignTotal,
-		BLSVerifyCount:    s.BLSVerifyCount - o.BLSVerifyCount,
-		BLSVerifyTotal:    s.BLSVerifyTotal - o.BLSVerifyTotal,
-		BLSAggregateCount: s.BLSAggregateCount - o.BLSAggregateCount,
-		BLSAggregateTotal: s.BLSAggregateTotal - o.BLSAggregateTotal,
+		BeaconSignCount:   s.BeaconSignCount - o.BeaconSignCount,
+		BeaconSignTotal:   s.BeaconSignTotal - o.BeaconSignTotal,
+		BeaconVerifyCount: s.BeaconVerifyCount - o.BeaconVerifyCount,
+		BeaconVerifyTotal: s.BeaconVerifyTotal - o.BeaconVerifyTotal,
 	}
 }
 
