@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,9 +38,10 @@ type reconPacket struct {
 	Share  crypto.PVSSDecryptedShare
 }
 type request struct {
-	Epoch    uint64
-	Instance string
-	Round    uint64
+	Epoch             uint64
+	Instance          string
+	Round             uint64
+	HaveThroughColumn uint64 `json:",omitempty"`
 }
 type response struct {
 	Columns []Column
@@ -58,35 +60,10 @@ type pendingRecon struct {
 	previousRandom                           string
 	shares                                   map[p2p.NodeID]crypto.PVSSDecryptedShare
 	verifying                                map[p2p.NodeID]bool
+	candidates                               map[p2p.NodeID]reconPacket
+	done                                     chan struct{}
 	releasePending, released, reconstructing bool
 	entry                                    *Entry
-}
-
-type sender struct {
-	mu    sync.Mutex
-	queue []p2p.Message
-	wake  chan struct{}
-}
-
-func (s *sender) push(m p2p.Message) {
-	s.mu.Lock()
-	s.queue = append(s.queue, m)
-	s.mu.Unlock()
-	select {
-	case s.wake <- struct{}{}:
-	default:
-	}
-}
-func (s *sender) pop() (p2p.Message, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.queue) == 0 {
-		return p2p.Message{}, false
-	}
-	m := s.queue[0]
-	s.queue[0] = p2p.Message{}
-	s.queue = s.queue[1:]
-	return m, true
 }
 
 // Node owns a single serialized consumer/ABA/RBC actor. Crypto jobs return
@@ -109,6 +86,8 @@ type Node struct {
 	start             sync.Once
 	events            chan func()
 	jobs              chan func()
+	urgentJobs        chan func()
+	outgoingBytes     atomic.Int64
 	senders           map[p2p.NodeID]*sender
 	ready             map[uint64]map[p2p.NodeID]Object
 	tasks             map[uint64]*columnTask
@@ -127,6 +106,7 @@ type Node struct {
 	recoveryEpoch     uint64
 	recoveryDelay     time.Duration
 	nextRecovery      time.Time
+	historyPeer       uint64
 	earlyShares       map[uint64]map[p2p.NodeID]reconPacket
 	witnesses         map[uint64]Entry
 	mu                sync.RWMutex
@@ -165,6 +145,7 @@ func New(cfg config.Config, id p2p.NodeID, t p2p.Transport) (*Node, error) {
 	}
 	n := &Node{checks: checks, ID: id, Config: cfg, Transport: t, Public: setup, private: kp.Private, pvss: pv, verifier: v, events: make(chan func(), cfg.TransportBuffer), jobs: make(chan func(), cfg.TransportBuffer), senders: make(map[p2p.NodeID]*sender), ready: make(map[uint64]map[p2p.NodeID]Object), tasks: make(map[uint64]*columnTask), instances: make(map[string]*aba.Instance), coreArchive: make(map[string]map[uint64][]p2p.Message), validationPending: make(map[string][]p2p.Message), begun: make(map[uint64]bool), columns: v.columns, nextSeq: 1, history: make(map[uint64]Entry), columnArchive: make(map[uint64]Column), notify: make(chan struct{}), earlyShares: make(map[uint64]map[p2p.NodeID]reconPacket), witnesses: make(map[uint64]Entry)}
 	n.rbc = rbc.New(rbc.Config{Verification: checks, ID: id, F: cfg.F, Members: setup.Members, Context: setup.Context, Private: kp.Private, Public: setup.Signing, Authenticated: p2p.AuthenticatedDelivery(t)})
+	n.urgentJobs = make(chan func(), cfg.TransportBuffer)
 	return n, nil
 }
 func (n *Node) Start(ctx context.Context) error {
@@ -177,7 +158,7 @@ func (n *Node) Start(ctx context.Context) error {
 		}
 		n.lastInstall = time.Now()
 		for _, id := range n.Public.Members {
-			s := &sender{wake: make(chan struct{}, 1)}
+			s := &sender{wake: make(chan struct{}, 1), total: &n.outgoingBytes}
 			n.senders[id] = s
 			n.wg.Add(1)
 			go n.sendLoop(id, s)
@@ -187,9 +168,21 @@ func (n *Node) Start(ctx context.Context) error {
 			go func() {
 				defer n.wg.Done()
 				for {
+					// Reconstruction is on the output critical path; ahead-of-time
+					// sharing/validation uses otherwise available worker capacity.
 					select {
 					case <-n.ctx.Done():
 						return
+					case job := <-n.urgentJobs:
+						job()
+						continue
+					default:
+					}
+					select {
+					case <-n.ctx.Done():
+						return
+					case job := <-n.urgentJobs:
+						job()
 					case job := <-n.jobs:
 						job()
 					}
@@ -274,6 +267,12 @@ func (n *Node) work(f func()) {
 	case <-n.ctx.Done():
 	}
 }
+func (n *Node) workUrgent(f func()) {
+	select {
+	case n.urgentJobs <- f:
+	case <-n.ctx.Done():
+	}
+}
 func (n *Node) fail(err error) {
 	n.mu.Lock()
 	if n.fatal == nil {
@@ -286,7 +285,11 @@ func (n *Node) fail(err error) {
 }
 func (n *Node) run() {
 	defer n.wg.Done()
-	ticker := time.NewTicker(time.Duration(n.Config.RecoveryMS) * time.Millisecond)
+	poll := time.Duration(n.Config.RecoveryMS) * time.Millisecond
+	if poll > 250*time.Millisecond {
+		poll = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	n.ensureColumn(1)
 	n.drive()
@@ -303,8 +306,9 @@ func (n *Node) run() {
 			}
 			n.handle(m)
 			n.drive()
-		case <-ticker.C:
-			n.recover()
+		case now := <-ticker.C:
+			n.emit(n.rbc.RetryPayloads(now))
+			n.recoverAt(now)
 			n.drive()
 		}
 	}
@@ -505,6 +509,7 @@ func (n *Node) handleRBC(m p2p.Message) {
 				return
 			}
 			n.validationPending[p.Hash] = []p2p.Message{m}
+			n.rbc.PayloadPending(p, true)
 			value := append([]byte(nil), p.Value...)
 			n.work(func() {
 				var o crypto.PVSSCommitment
@@ -515,6 +520,7 @@ func (n *Node) handleRBC(m p2p.Message) {
 					delete(n.validationPending, p.Hash)
 					if !ok {
 						n.Perf.Invalid.Add(1)
+						n.emit(n.rbc.PayloadPending(p, false))
 						return
 					}
 					n.verifier.objects[p.Hash] = verifiedPVSS{o.Dealer, o.Seq}
@@ -522,6 +528,7 @@ func (n *Node) handleRBC(m p2p.Message) {
 						packet, _ := p2p.DecodePayload[rbc.Packet](old)
 						n.acceptRBC(old, packet)
 					}
+					n.emit(n.rbc.PayloadPending(p, false))
 				})
 			})
 			return
@@ -598,6 +605,11 @@ func (n *Node) initializeGenesis() bool {
 }
 func (n *Node) produce() {
 	if n.producing || n.nextSeq > n.currentColumn()+uint64(n.Config.ProductionWindow)-1 {
+		return
+	}
+	// Backpressure only speculative production. Current/successor positions
+	// remain enabled, so congestion cannot create a look-ahead dependency cycle.
+	if n.nextSeq > n.currentColumn()+1 && n.outgoingBytes.Load() > 16<<20 {
 		return
 	}
 
@@ -735,7 +747,7 @@ func (n *Node) consume() {
 			return
 		}
 		h := reconHeader{record.Epoch, record.PreviousHash, record.Column, record.Source, record.ObjectHash}
-		n.recon = &pendingRecon{header: h, object: object, record: record, previousRandom: n.state.PreviousRandom, shares: make(map[p2p.NodeID]crypto.PVSSDecryptedShare), verifying: make(map[p2p.NodeID]bool)}
+		n.recon = &pendingRecon{header: h, object: object, record: record, previousRandom: n.state.PreviousRandom, shares: make(map[p2p.NodeID]crypto.PVSSDecryptedShare), verifying: make(map[p2p.NodeID]bool), candidates: make(map[p2p.NodeID]reconPacket), done: make(chan struct{})}
 	}
 
 	r := n.recon
@@ -759,7 +771,7 @@ func (n *Node) consume() {
 
 	if !r.releasePending {
 		r.releasePending = true
-		n.work(func() {
+		n.workUrgent(func() {
 			sh, err := n.pvss.PreReconTrusted(r.object.Transcript, n.ID)
 			n.post(func() {
 				if !n.live(h) {
@@ -787,7 +799,7 @@ func (n *Node) consume() {
 		for i := range shares {
 			shares[i] = r.shares[holders[i]]
 		}
-		n.work(func() {
+		n.workUrgent(func() {
 			z, err := n.pvss.ReconTrusted(r.object.Transcript, shares, n.Config.Threshold())
 			n.Perf.ReconCount.Add(1)
 			n.post(func() {
@@ -811,29 +823,57 @@ func (n *Node) consume() {
 	}
 }
 func (n *Node) acceptShare(from p2p.NodeID, p reconPacket) {
-	if !n.live(p.Header) || p.Share.Holder != from || n.recon == nil {
+	if !n.live(p.Header) || p.Share.Holder != from || n.Public.Signing[string(from)] == nil || n.recon == nil {
 		return
 	}
 	r := n.recon
 	if _, ok := r.shares[from]; ok || r.verifying[from] {
 		return
 	}
-	r.verifying[from] = true
-	h := p.Header
-	n.work(func() {
-		ok := n.pvss.VerifyShare(r.object.Transcript, p.Share)
-		n.post(func() {
-			if !n.live(h) || n.recon == nil {
+	if r.candidates == nil {
+		r.candidates = make(map[p2p.NodeID]reconPacket)
+	}
+	if _, queued := r.candidates[from]; !queued {
+		r.candidates[from] = p
+	}
+	n.checkShares()
+}
+
+// Keep surplus distinct shares available, but schedule only enough checks to
+// reach t valid shares. Invalid checks free a slot for another candidate.
+func (n *Node) checkShares() {
+	r := n.recon
+	if r == nil || r.entry != nil {
+		return
+	}
+	for from, p := range r.candidates {
+		if len(r.shares)+len(r.verifying) >= n.Config.Threshold() {
+			break
+		}
+		delete(r.candidates, from)
+		r.verifying[from] = true
+		from, p := from, p
+		n.workUrgent(func() {
+			select {
+			case <-r.done:
 				return
+			default:
 			}
-			delete(n.recon.verifying, from)
-			if ok {
-				n.recon.shares[from] = p.Share
-			} else {
-				n.Perf.Invalid.Add(1)
-			}
+			ok := n.pvss.VerifyShare(r.object.Transcript, p.Share)
+			n.post(func() {
+				if !n.live(p.Header) {
+					return
+				}
+				delete(r.verifying, from)
+				if ok {
+					r.shares[from] = p.Share
+				} else {
+					n.Perf.Invalid.Add(1)
+				}
+				n.checkShares()
+			})
 		})
-	})
+	}
 }
 
 // finishEpoch is the sole installation handler for native reconstruction and
@@ -853,6 +893,9 @@ func (n *Node) finishEpoch() {
 	close(n.notify)
 	n.notify = make(chan struct{})
 	n.mu.Unlock()
+	if r.done != nil {
+		close(r.done)
+	}
 	n.recon = nil
 	delete(n.earlyShares, e.Record.Epoch)
 	delete(n.witnesses, e.Record.Epoch)
@@ -892,7 +935,7 @@ func (n *Node) handleBeacon(m p2p.Message) {
 				// its queued share checks; do not pull full history on every small
 				// scheduling skew. Periodic recovery still covers a stalled epoch.
 				n.pullEpoch = n.state.Epoch
-				n.send("HISTORY", m.From, request{Epoch: n.state.Epoch})
+				n.requestHistory(m.From, n.state.Epoch)
 			}
 			if n.recon != nil && n.live(x.Header) {
 				n.acceptShare(m.From, x)
@@ -932,7 +975,7 @@ func (n *Node) handleBeacon(m p2p.Message) {
 		}
 		sort.Slice(cols, func(i, j int) bool { return cols[i] < cols[j] })
 		for _, c := range cols {
-			if col, ok := n.columns[c]; ok {
+			if col, ok := n.columns[c]; ok && c > x.HaveThroughColumn {
 				resp.Columns = append(resp.Columns, col)
 			}
 		}
@@ -1038,7 +1081,17 @@ func (n *Node) recoverAt(now time.Time) {
 		}
 	}
 	n.Perf.Recoveries.Add(1)
-	n.send("HISTORY", "", request{Epoch: epoch})
+	// Rotate peers instead of soliciting n copies of the same history. Every
+	// member is eventually tried; all returned evidence is still verified.
+	var peer p2p.NodeID
+	for range n.Public.Members {
+		index := (uint64(n.Config.ClusterIndex[n.ID]) + 1 + n.historyPeer) % uint64(len(n.Public.Members))
+		n.historyPeer++
+		if peer = n.Public.Members[index]; peer != n.ID {
+			n.requestHistory(peer, epoch)
+			break
+		}
+	}
 	for c := n.currentColumn(); c <= n.currentColumn()+1; c++ {
 		if _, ok := n.columns[c]; ok {
 			continue
@@ -1049,16 +1102,28 @@ func (n *Node) recoverAt(now time.Time) {
 			active[objectID(c, source)] = a
 		}
 		for instance, a := range active {
-			n.emit(a.RequestCertificate())
+			if peer == n.ID {
+				continue
+			}
+			n.emit(a.RequestCertificateFrom(peer))
 			status := a.Status()
 			if status.Proposed && !status.Stopped {
-				for _, id := range n.Public.Members {
-					n.send("SYNC", id, request{Instance: instance, Round: status.Round})
-				}
+				n.send("SYNC", peer, request{Instance: instance, Round: status.Round})
 			}
 		}
 	}
 
+}
+
+func (n *Node) requestHistory(peer p2p.NodeID, epoch uint64) {
+	through := uint64(0)
+	for {
+		if _, ok := n.columns[through+1]; !ok {
+			break
+		}
+		through++
+	}
+	n.send("HISTORY", peer, request{Epoch: epoch, HaveThroughColumn: through})
 }
 
 func (n *Node) bufferEpoch(e uint64) bool {

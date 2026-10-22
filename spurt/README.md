@@ -54,9 +54,10 @@ The runner prints per-epoch source/digest/random and periodic metrics including 
 
 ## TCP Topology
 
-The raw TCP adapter does not authenticate sender identities. Without outer
-message signatures it is rejected before deployment; reachability or a configured
-sender name is insufficient. Currently use the authenticated memory transport.
+Use `"authenticated_tcp": true` in TCP configuration to enable mutual TLS 1.3
+with pinned committee Ed25519 keys. The raw TCP adapter does not authenticate
+sender identities and remains rejected. Memory transport also supplies
+authenticated delivery. See `benchmark/README.md` for Docker simulation.
 
 ## Notes
 

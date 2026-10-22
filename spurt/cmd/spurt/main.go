@@ -58,8 +58,8 @@ func main() {
 	if *nodeID != "" {
 		cfg.NodeID = p2p.NodeID(*nodeID)
 	}
-	if cfg.Transport != "memory" {
-		log.Fatal("SPURT currently requires authenticated memory transport; raw TCP is not authenticated")
+	if cfg.Transport != "memory" && !(cfg.Transport == "tcp" && cfg.AuthenticatedTCP) {
+		log.Fatal("SPURT requires authenticated memory or mutual TLS TCP transport")
 	}
 	runDuration := parseDuration(*duration)
 
@@ -187,6 +187,12 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	}
 	peers := cfg.PeerMap()
 	nodeTransport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)))
+	if cfg.AuthenticatedTCP {
+		nodeTransport, err = p2p.NewAuthenticatedTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)), rt.keys[cfg.NodeID].Private, rt.pubs)
+		if err != nil {
+			return err
+		}
+	}
 	node, err := newNode(cfg, rt, cfg.NodeID, nodeTransport)
 	if err != nil {
 		return err
@@ -226,12 +232,13 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		}
 		stats.beacons.Add(1)
 		fmt.Printf("ts=%s node=%s epoch=%d leader=%s digest=%s random=%x\n",
-			logTimestamp(), node.ID, b.Epoch, node.State.Leader(b.Epoch), b.Digest, b.Random[:8])
+			logTimestamp(), node.ID, b.Epoch, node.State.Leader(b.Epoch), b.Digest, b.Random)
 		finalWindow.recordBeacon([]*spurt.Node{node})
 	}
 	nodes := []*spurt.Node{node}
 	cacheTotal, cacheMax := collectCachedCommitments(nodes)
 	finalWindow.print(nodes, cacheTotal, cacheMax)
+	fmt.Printf("benchmark_complete outputs=%d\n", stats.beacons.Load())
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}

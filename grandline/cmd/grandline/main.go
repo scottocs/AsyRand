@@ -70,8 +70,8 @@ func main() {
 	if cfg.BeaconMode != "standard" && cfg.BeaconMode != "reference" {
 		log.Fatal("beacon-mode must be standard or reference")
 	}
-	if *writeSetup == "" && cfg.Transport != "memory" {
-		log.Fatal("GRandLine currently requires authenticated memory transport; raw TCP is not authenticated")
+	if cfg.Transport != "memory" && cfg.Transport != "tcp" {
+		log.Fatal("transport must be memory or tcp (mutual TLS)")
 	}
 	runDuration := parseDuration(*duration)
 
@@ -224,7 +224,14 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	runCtx, cancel := runtimeContext(cfg, duration)
 	defer cancel()
 	peers := cfg.PeerMap()
-	transport := p2p.NewTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)))
+	keys, pubs, err := cfg.KeyPairs()
+	if err != nil {
+		return err
+	}
+	transport, err := p2p.NewAuthenticatedTCPTransport(cfg.NodeID, cfg.ListenAddr(cfg.NodeID), peers, p2p.TCPBufferForPeers(len(peers)), keys[cfg.NodeID].Private, pubs)
+	if err != nil {
+		return err
+	}
 	if err := transport.Start(runCtx); err != nil {
 		return err
 	}
@@ -274,11 +281,12 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		stats.beacons.Add(1)
 		if b != nil {
 			fmt.Printf("ts=%s node=%s epoch=%d msg_hash=%s shares=%d signature=%s random=%x\n",
-				logTimestamp(), node.ID, b.Epoch, b.Commit, b.Shares, b.SigHex[:16], b.Random[:8])
+				logTimestamp(), node.ID, b.Epoch, b.Commit, b.Shares, b.SigHex[:16], b.Random)
 		}
 		finalWindow.recordBeacon(nodes)
 	}
 	finalWindow.print(nodes)
+	fmt.Printf("benchmark_complete outputs=%d\n", stats.beacons.Load())
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}
@@ -286,8 +294,8 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 }
 
 func prepareRuntime(cfg config.Config) (runtimeKeys, error) {
-	if cfg.Transport != "memory" {
-		return runtimeKeys{}, fmt.Errorf("GRandLine currently requires authenticated memory transport")
+	if cfg.Transport != "memory" && cfg.Transport != "tcp" {
+		return runtimeKeys{}, fmt.Errorf("transport must be memory or tcp (mutual TLS)")
 	}
 	ids := cfg.Members()
 	if len(ids) == 0 {

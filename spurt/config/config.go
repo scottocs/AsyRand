@@ -19,26 +19,27 @@ type Peer struct {
 }
 
 type Config struct {
-	WarmupOutputs int                   `json:"warmup_outputs"`
-	Name          p2p.NodeID            `json:"name"`
-	Protocol      string                `json:"protocol"`
-	Transport     string                `json:"transport"`
-	F             int                   `json:"f"`
-	Round         int                   `json:"round"`
-	ListenIP      string                `json:"listen_ip"`
-	PrefillMS     int                   `json:"prefill_ms"`
-	EpochMS       int                   `json:"epoch_timeout_ms"`
-	ReportMS      int                   `json:"report_interval_ms"`
-	LingerMS      int                   `json:"linger_ms"`
-	Lookahead     int                   `json:"aggregation_lookahead"`
-	Seed          string                `json:"seed"`
-	BatchSize     int                   `json:"batch_size"`
-	MaxPool       int                   `json:"max_pool"`
-	LogLevel      int                   `json:"log_level"`
-	ClusterIndex  map[p2p.NodeID]int    `json:"cluster_index"`
-	ClusterIPs    map[p2p.NodeID]string `json:"cluster_ips"`
-	PeerP2PPort   map[p2p.NodeID]int    `json:"peers_p2p_port"`
-	NodeSeeds     map[p2p.NodeID]string `json:"node_key_seed"`
+	AuthenticatedTCP bool                  `json:"authenticated_tcp"`
+	WarmupOutputs    int                   `json:"warmup_outputs"`
+	Name             p2p.NodeID            `json:"name"`
+	Protocol         string                `json:"protocol"`
+	Transport        string                `json:"transport"`
+	F                int                   `json:"f"`
+	Round            int                   `json:"round"`
+	ListenIP         string                `json:"listen_ip"`
+	PrefillMS        int                   `json:"prefill_ms"`
+	EpochMS          int                   `json:"epoch_timeout_ms"`
+	ReportMS         int                   `json:"report_interval_ms"`
+	LingerMS         int                   `json:"linger_ms"`
+	Lookahead        int                   `json:"aggregation_lookahead"`
+	Seed             string                `json:"seed"`
+	BatchSize        int                   `json:"batch_size"`
+	MaxPool          int                   `json:"max_pool"`
+	LogLevel         int                   `json:"log_level"`
+	ClusterIndex     map[p2p.NodeID]int    `json:"cluster_index"`
+	ClusterIPs       map[p2p.NodeID]string `json:"cluster_ips"`
+	PeerP2PPort      map[p2p.NodeID]int    `json:"peers_p2p_port"`
+	NodeSeeds        map[p2p.NodeID]string `json:"node_key_seed"`
 
 	NodeID p2p.NodeID `json:"node_id"`
 	Peers  []Peer     `json:"peers"`

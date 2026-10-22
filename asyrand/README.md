@@ -1,7 +1,7 @@
 # AsyRand implementation
 
 This module implements the individual-object AsyRand construction in
-`paper/Asyrand.tex`. The previous copied SPURT command/state machine has been
+`paper/Tyche/main.tex`. The previous copied SPURT command/state machine has been
 replaced. The current wire/config version is `asyrand-v2`: it follows the
 shared-column Producer and BEACON-only Consumer history. Version 1 archives
 and mixed-version peers cannot be reused under this version. It uses contextual single-secret ALBATROSS PVSS and local-coin Quadratic-ABA;
@@ -87,7 +87,11 @@ fixed configuration seed. The old `aggregation_lookahead` has been replaced by
   from authenticated sender archives; they do not allocate unbounded rounds.
   A future RECON can trigger one immediate predecessor pull when column
   prerequisites are missing; a stalled native reconstruction uses periodic
-  recovery. Membership requests cover faulty or unavailable responders.
+  recovery. Periodic history pulls rotate through the membership and advertise
+  the contiguous column evidence already retained locally, avoiding multiple
+  full copies. Unavailable responders do not prevent later peers being tried.
+  Certificate pulls and authenticated core replay use the same rotating peer;
+  native ABA messages and decision votes keep their original dissemination.
   Repeated recovery within an unchanged epoch uses exponential backoff capped
   at max(4s, the configured base interval); output progress resets the delay.
   SYNC serves retained core messages without triggering an additional
@@ -95,6 +99,19 @@ fixed configuration seed. The old `aggregation_lookahead` has been replaced by
 - State updates and signing run on one actor. Expensive crypto callbacks recheck
   the captured epoch/history/selection before changing state. ABA handlers stay
   available after decision for entered-round relay and certificate recovery.
+
+Normal-path scheduling preserves all proposal, delivery, verification and
+share-release gates. A received RBC value awaiting PVSS validation suppresses
+payload retrieval without counting as a validated value or permitting ECHO.
+Genuinely missing values are requested from one holder at a time, with retries
+covering the full membership; validation failure resumes retrieval. Crypto
+workers prioritize reconstruction, schedule only the share checks needed for a
+valid threshold subset, and skip obsolete queued checks. Invalid shares free a
+slot for remaining candidates. Identical recovery packets queued for the same
+peer are coalesced, while later retries and distinct evidence remain enabled.
+An estimated 16 MiB outgoing-queue watermark pauses only production beyond the
+current and successor columns. This is producer backpressure, not a hard memory
+bound on all retained history or protocol queues.
 
 `protocol.NewVerifier`, `AddColumn`, `Initialize`, `CheckEntry`, `Apply` and
 `VerifyHistory` need public keys only. Verification replays genesis, decisions,

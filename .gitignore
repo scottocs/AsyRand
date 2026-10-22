@@ -1,8 +1,10 @@
 .vscode/
-paper/.*
+/Agent.md
+paper/*
 benchmarks/
 benchmark-ref/
 benchmark/.venv/
+/benchmark/local/
 benchmark/generated/*
 benchmark/runs/*
 !benchmark/generated/.gitkeep

@@ -20,16 +20,17 @@ type Peer struct {
 }
 
 type Config struct {
-	Name      p2p.NodeID `json:"name"`
-	Protocol  string     `json:"protocol"`
-	Transport string     `json:"transport"`
-	F         int        `json:"f"`
-	Round     int        `json:"round"`
-	ListenIP  string     `json:"listen_ip"`
-	PrefillMS int        `json:"prefill_ms"`
-	EpochMS   int        `json:"epoch_timeout_ms"`
-	ReportMS  int        `json:"report_interval_ms"`
-	LingerMS  int        `json:"linger_ms"`
+	AuthenticatedTCP bool       `json:"authenticated_tcp"`
+	Name             p2p.NodeID `json:"name"`
+	Protocol         string     `json:"protocol"`
+	Transport        string     `json:"transport"`
+	F                int        `json:"f"`
+	Round            int        `json:"round"`
+	ListenIP         string     `json:"listen_ip"`
+	PrefillMS        int        `json:"prefill_ms"`
+	EpochMS          int        `json:"epoch_timeout_ms"`
+	ReportMS         int        `json:"report_interval_ms"`
+	LingerMS         int        `json:"linger_ms"`
 	// The quorum, reconstruction threshold and RSQ capacity follow n and f.
 	ProductionWindow    int                   `json:"production_window"`
 	ParallelConsumption bool                  `json:"parallel_consumption"`

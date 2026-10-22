@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 )
 
 const Protocol = "asyrand/rbc/v1"
@@ -56,20 +57,30 @@ type valueState struct {
 	value           []byte
 	echoes, readies map[p2p.NodeID]string
 	delivered       bool
+	pending         bool
+	attempts        uint64
+	nextRequest     time.Time
 }
 type instance struct {
 	values              map[string]*valueState
 	echo, ready         string
 	seenEcho, seenReady map[p2p.NodeID]string
 }
+type payloadKey struct {
+	dealer p2p.NodeID
+	seq    uint64
+	hash   string
+}
 type Broadcaster struct {
-	cfg    Config
-	states map[string]*instance
+	cfg     Config
+	states  map[string]*instance
+	missing map[*valueState]Packet
+	pending map[payloadKey]bool
 }
 
 func New(cfg Config) *Broadcaster {
 	cfg.Verification = verification.Select(cfg.Verification)
-	return &Broadcaster{cfg: cfg, states: make(map[string]*instance)}
+	return &Broadcaster{cfg: cfg, states: make(map[string]*instance), missing: make(map[*valueState]Packet), pending: make(map[payloadKey]bool)}
 }
 func Key(dealer p2p.NodeID, seq uint64) string { return fmt.Sprintf("%s/%d", dealer, seq) }
 func Hash(value []byte) string                 { h := sha256.Sum256(value); return hex.EncodeToString(h[:]) }
@@ -128,6 +139,88 @@ func (b *Broadcaster) Broadcast(seq uint64, value []byte) []p2p.Message {
 func (b *Broadcaster) Request(dealer p2p.NodeID, seq uint64, hash string) p2p.Message {
 	return b.message("REQUEST", "", Packet{Dealer: dealer, Seq: seq, Hash: hash})
 }
+
+// PayloadPending records receipt without admitting an unverified value or
+// emitting ECHO. Verification in progress is not a missing network payload.
+// Clearing a failed validation resumes retrieval if READY already requires it.
+func (b *Broadcaster) PayloadPending(p Packet, pending bool) []p2p.Message {
+	key := payloadKey{p.Dealer, p.Seq, p.Hash}
+	if pending {
+		b.pending[key] = true
+	} else {
+		delete(b.pending, key)
+	}
+	// An unverified VAL alone must not leave a permanent RBC/hash state.
+	i := b.states[Key(p.Dealer, p.Seq)]
+	if i == nil {
+		return nil
+	}
+	v := i.values[p.Hash]
+	if v == nil {
+		return nil
+	}
+	v.pending = pending
+	if pending {
+		delete(b.missing, v)
+	} else if i.ready == p.Hash && v.value == nil {
+		return b.requestPayload(p, v, time.Now())
+	}
+	return nil
+}
+
+// RetryPayloads rotates through the full membership. Timers only retry data
+// retrieval; they never supply a delivery or an agreement input. One holder at
+// a time avoids n simultaneous full-payload replies to one missing value.
+func (b *Broadcaster) RetryPayloads(now time.Time) []p2p.Message {
+	var out []p2p.Message
+	for v, p := range b.missing {
+		if !v.pending && !now.Before(v.nextRequest) {
+			out = append(out, b.requestPayload(p, v, now)...)
+		}
+	}
+	return out
+}
+
+func (b *Broadcaster) requestPayload(p Packet, v *valueState, now time.Time) []p2p.Message {
+	if len(b.cfg.Members) < 2 {
+		return nil
+	}
+	local := 0
+	for i, id := range b.cfg.Members {
+		if id == b.cfg.ID {
+			local = i
+			break
+		}
+	}
+	// Prefer an observed ECHO holder on the first try. Later tries cover every
+	// member, including an honest holder when the first candidate is silent.
+	var target p2p.NodeID
+	for offset := 0; offset < len(b.cfg.Members); offset++ {
+		id := b.cfg.Members[(local+1+int(v.attempts%uint64(len(b.cfg.Members)))+offset)%len(b.cfg.Members)]
+		if id == b.cfg.ID {
+			continue
+		}
+		if v.attempts == 0 {
+			if _, ok := v.echoes[id]; !ok {
+				continue
+			}
+		}
+		target = id
+		break
+	}
+	if target == "" {
+		for _, id := range b.cfg.Members {
+			if id != b.cfg.ID {
+				target = id
+				break
+			}
+		}
+	}
+	v.attempts++
+	v.nextRequest = now.Add(time.Second)
+	b.missing[v] = pVote(p)
+	return []p2p.Message{b.message("REQUEST", target, pVote(p))}
+}
 func (b *Broadcaster) state(p Packet) (*instance, *valueState) {
 	key := Key(p.Dealer, p.Seq)
 	i := b.states[key]
@@ -137,7 +230,7 @@ func (b *Broadcaster) state(p Packet) (*instance, *valueState) {
 	}
 	v := i.values[p.Hash]
 	if v == nil {
-		v = &valueState{echoes: make(map[p2p.NodeID]string), readies: make(map[p2p.NodeID]string)}
+		v = &valueState{echoes: make(map[p2p.NodeID]string), readies: make(map[p2p.NodeID]string), pending: b.pending[payloadKey{p.Dealer, p.Seq, p.Hash}]}
 		i.values[p.Hash] = v
 	}
 	return i, v
@@ -177,7 +270,12 @@ func (b *Broadcaster) Handle(msg p2p.Message, p Packet) ([]p2p.Message, []Delive
 	var deliveries []Delivery
 	switch msg.Type {
 	case "VAL", "REPLY":
-		v.value = append([]byte(nil), p.Value...)
+		if v.value == nil {
+			v.value = append([]byte(nil), p.Value...)
+		}
+		v.pending = false
+		delete(b.pending, payloadKey{p.Dealer, p.Seq, p.Hash})
+		delete(b.missing, v)
 		if msg.Type == "VAL" && i.echo == "" {
 			i.echo = p.Hash
 			m := b.message("ECHO", "", pVote(p))
@@ -218,8 +316,10 @@ func (b *Broadcaster) Handle(msg p2p.Message, p Packet) ([]p2p.Message, []Delive
 		x, _ := p2p.DecodePayload[Packet](m)
 		v.readies[b.cfg.ID] = x.Signature
 		out = append(out, m)
-		if v.value == nil {
-			out = append(out, b.Request(p.Dealer, p.Seq, p.Hash))
+	}
+	if i.ready == p.Hash && v.value == nil && !v.pending {
+		if _, requested := b.missing[v]; !requested {
+			out = append(out, b.requestPayload(p, v, time.Now())...)
 		}
 	}
 	if !v.delivered && v.value != nil && len(v.readies) >= len(b.cfg.Members)-b.cfg.F {

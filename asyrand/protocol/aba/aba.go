@@ -255,16 +255,23 @@ func (a *Instance) Handle(msg p2p.Message) ([]p2p.Message, error) {
 // and serve a retained certificate when available; no polling timer is needed.
 // Recovery traffic is separate from the core's quadratic-per-round traffic.
 func (a *Instance) RequestCertificate() []p2p.Message {
+	return a.RequestCertificateFrom("")
+}
+
+// RequestCertificateFrom retrieves unchanged certified evidence from one peer.
+// The caller must rotate peers when retrying so a silent holder cannot prevent
+// totality. An empty peer keeps the membership-broadcast interface.
+func (a *Instance) RequestCertificateFrom(peer p2p.NodeID) []p2p.Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.certificate != nil {
+	if a.certificate != nil || (peer != "" && a.verifier.public[peer] == nil) {
 		return nil
 	}
 	payload := CertificateRequest{CommitteeID: a.verifier.committeeID}
 	if !a.authenticated {
 		payload.SigHex = hex.EncodeToString(asig.Sign(a.private, a.requestStatement(a.id)))
 	}
-	return []p2p.Message{a.message(REQUEST, "", payload)}
+	return []p2p.Message{a.message(REQUEST, peer, payload)}
 }
 
 // Adopt serializes certificate installation with proposal submission. It

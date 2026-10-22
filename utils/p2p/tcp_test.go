@@ -2,6 +2,8 @@ package p2p
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"net"
 	"testing"
 	"time"
@@ -123,4 +125,54 @@ func addrPort(addr string) string {
 		return ""
 	}
 	return ":" + port
+}
+
+func TestMutualTLSBindsSenderAndPinsDestination(t *testing.T) {
+	pubA, privA, _ := ed25519.GenerateKey(rand.Reader)
+	pubB, privB, _ := ed25519.GenerateKey(rand.Reader)
+	pubs := map[string]ed25519.PublicKey{"a": pubA, "b": pubB}
+	peers := map[NodeID]string{"a": freeAddr(t), "b": freeAddr(t)}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	a, err := NewAuthenticatedTCPTransport("a", peers["a"], peers, 8, privA, pubs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewAuthenticatedTCPTransport("b", peers["b"], peers, 8, privB, pubs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	msg, _ := NewMessage("test", "PING", "i", "a", "b", nil)
+	if err := a.Send(ctx, "b", msg); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-b.Inbox():
+		if !got.Authenticated() || got.From != "a" {
+			t.Fatal("message not bound to TLS sender")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	msg.From = "b"
+	if err := a.Send(ctx, "b", msg); err == nil {
+		t.Fatal("accepted forged sender")
+	}
+	// B's valid certificate cannot impersonate A at a misrouted destination.
+	msg.From = "a"
+	a.peers["a"] = peers["b"]
+	if err := a.sendOnce(ctx, "a", peers["b"], []byte("{}")); err == nil {
+		t.Fatal("accepted wrong destination identity")
+	}
+	if _, err := NewAuthenticatedTCPTransport("a", peers["a"], peers, 8, privB, pubs); err == nil {
+		t.Fatal("accepted wrong local key")
+	}
 }

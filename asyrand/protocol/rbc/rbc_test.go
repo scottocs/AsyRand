@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"testing"
+	"time"
 )
 
 func broadcasters() []*Broadcaster {
@@ -22,6 +23,92 @@ func broadcasters() []*Broadcaster {
 		out = append(out, New(Config{ID: id, F: 1, Members: members, Context: Hash([]byte("test")), Private: priv[id], Public: pub}))
 	}
 	return out
+}
+
+func TestPendingValidationDoesNotRequestOrEchoUnverifiedPayload(t *testing.T) {
+	bs := broadcasters()
+	b := bs[3]
+	m := bs[0].Broadcast(1, []byte("pending value"))[0]
+	p, _ := Authenticate(b.cfg.Context, b.cfg.Public, m)
+	b.PayloadPending(p, true)
+	for _, holder := range bs[:3] {
+		ready := holder.message("READY", "", pVote(p))
+		packet, ok := Authenticate(b.cfg.Context, b.cfg.Public, ready)
+		if !ok {
+			t.Fatal("invalid test READY")
+		}
+		out, delivered := b.Handle(ready, packet)
+		for _, sent := range out {
+			if sent.Type == "REQUEST" || sent.Type == "ECHO" {
+				t.Fatal("pending validation caused retrieval or premature ECHO")
+			}
+		}
+		if len(delivered) != 0 {
+			t.Fatal("delivered unverified payload")
+		}
+	}
+	if out := b.RetryPayloads(time.Now().Add(time.Hour)); len(out) != 0 {
+		t.Fatal("retried locally pending validation")
+	}
+	_, delivered := b.Handle(m, p) // Caller has now completed payload validation.
+	if len(delivered) != 1 {
+		t.Fatal("validated payload did not complete delivery")
+	}
+	if out := b.PayloadPending(p, false); len(out) != 0 {
+		t.Fatal("retrieved an already accepted payload")
+	}
+}
+
+func TestMissingPayloadRotatesPastSilentHolderAndStopsAfterDelivery(t *testing.T) {
+	bs := broadcasters()
+	b := bs[3]
+	m := bs[0].Broadcast(1, []byte("value"))[0]
+	p, _ := Authenticate(b.cfg.Context, b.cfg.Public, m)
+	b.PayloadPending(p, true)
+	for _, holder := range bs[:3] {
+		ready := holder.message("READY", "", pVote(p))
+		packet, _ := Authenticate(b.cfg.Context, b.cfg.Public, ready)
+		b.Handle(ready, packet)
+	}
+	out := b.PayloadPending(p, false) // Failed local validation must not suppress recovery forever.
+	if len(out) != 1 || out[0].To == "" {
+		t.Fatal("retrieval should contact one holder")
+	}
+	seen := map[p2p.NodeID]bool{out[0].To: true}
+	if retry := b.RetryPayloads(time.Now()); len(retry) != 0 {
+		t.Fatal("retried before backoff")
+	}
+	for i := 1; i <= len(bs)+1; i++ {
+		retry := b.RetryPayloads(time.Now().Add(time.Duration(i) * 2 * time.Second))
+		if len(retry) != 1 || retry[0].To == "" || retry[0].To == b.cfg.ID {
+			t.Fatal("invalid targeted retry")
+		}
+		seen[retry[0].To] = true
+	}
+	if len(seen) != len(bs)-1 {
+		t.Fatal("silent first holder prevented membership fallback")
+	}
+	reply := bs[0].message("REPLY", b.cfg.ID, Packet{Dealer: p.Dealer, Seq: p.Seq, Hash: p.Hash, Value: p.Value})
+	packet, _ := Authenticate(b.cfg.Context, b.cfg.Public, reply)
+	_, delivered := b.Handle(reply, packet)
+	if len(delivered) != 1 {
+		t.Fatal("valid retrieved value was not delivered")
+	}
+	if retry := b.RetryPayloads(time.Now().Add(time.Hour)); len(retry) != 0 {
+		t.Fatal("retrieval continued after delivery")
+	}
+}
+
+func TestFailedPendingValuesDoNotRetainUnverifiedHashStates(t *testing.T) {
+	b := broadcasters()[3]
+	for i := 0; i < 1000; i++ {
+		p := Packet{Dealer: "a", Seq: 1, Hash: Hash([]byte{byte(i), byte(i >> 8)})}
+		b.PayloadPending(p, true)
+		b.PayloadPending(p, false)
+	}
+	if len(b.states) != 0 || len(b.pending) != 0 || len(b.missing) != 0 {
+		t.Fatal("failed validation retained unbounded RBC states")
+	}
 }
 func TestDeliveryProofAndMissingPayloadRecovery(t *testing.T) {
 	bs := broadcasters()

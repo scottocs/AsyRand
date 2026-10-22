@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -541,16 +542,16 @@ func TestABACertificatePullIsDeferredToRecovery(t *testing.T) {
 	// Even an instance with no proposal must still be able to recover a result.
 	node.lastInstall = time.Now().Add(-2 * time.Duration(cfg.RecoveryMS) * time.Millisecond)
 	node.recover()
+	found := map[string]int{}
 	for _, s := range node.senders {
-		found := map[string]bool{}
 		for _, m := range s.queue {
 			if m.Protocol == aba.Protocol && m.Type == aba.REQUEST {
-				found[m.Instance] = true
+				found[m.Instance]++
 			}
 		}
-		if !found[columnID(1)] || !found[objectID(1, "node1")] {
-			t.Fatal("recovery did not request unresolved ABA certificates independently of proposal")
-		}
+	}
+	if found[columnID(1)] != 1 || found[objectID(1, "node1")] != 1 {
+		t.Fatal("recovery must request unresolved certificates once, independently of proposal")
 	}
 }
 
@@ -926,5 +927,217 @@ func TestPVSSCacheCannotRebindRBCPosition(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRecoveryQueueCoalescesOnlyIdenticalPendingPackets(t *testing.T) {
+	var total atomic.Int64
+	s := &sender{wake: make(chan struct{}, 1), total: &total}
+	m, _ := p2p.NewMessage(rbc.Protocol, "REPLY", "node1/1", "node1", "node0", map[string]string{"value": "one"})
+	s.push(m)
+	s.push(m)
+	other := m
+	other.Payload = []byte(`{"value":"two"}`)
+	s.push(other)
+	if len(s.queue) != 2 {
+		t.Fatal("duplicate recovery copied payload or distinct evidence was lost")
+	}
+	if got, ok := s.pop(); !ok || string(got.Payload) != string(m.Payload) {
+		t.Fatal("queue ordering changed")
+	}
+	s.push(m) // A retry after transmission must remain possible.
+	if len(s.queue) != 2 {
+		t.Fatal("coalescing suppressed a later retry")
+	}
+	for {
+		if _, ok := s.pop(); !ok {
+			break
+		}
+	}
+	if total.Load() != 0 {
+		t.Fatal("queue byte accounting did not drain")
+	}
+	native := m
+	native.Type = "ECHO"
+	s.push(native)
+	s.push(native)
+	if len(s.queue) != 2 {
+		t.Fatal("native protocol messages were discarded")
+	}
+}
+
+func shareCheckFixture(t *testing.T) (*Node, []reconPacket) {
+	t.Helper()
+	cfg := testConfig(7, true)
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.ctx = context.Background()
+	object, _, err := node.pvss.Share(node.ID, 1, node.Public.Members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := reconHeader{Epoch: 1, Previous: "previous", Column: 1, Source: node.ID, ObjectHash: rbc.Hash(encode(object))}
+	node.state = &consumptionState{Epoch: 1, Column: 1, PreviousHash: h.Previous}
+	node.recon = &pendingRecon{header: h, object: Object{Transcript: object}, shares: make(map[p2p.NodeID]crypto.PVSSDecryptedShare), verifying: make(map[p2p.NodeID]bool), candidates: make(map[p2p.NodeID]reconPacket), done: make(chan struct{})}
+	seeds, _ := cfg.NodeSeedBytes()
+	var packets []reconPacket
+	for _, id := range cfg.Members() {
+		kp := crypto.PVSSKeyPairFromSeed(seeds[id])
+		scheme, err := crypto.NewALBATROSSPVSSScheme(id, cfg.Threshold(), kp.Private, node.Public.PVSS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sh, err := scheme.PreReconTrusted(object, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packets = append(packets, reconPacket{h, sh})
+	}
+	return node, packets
+}
+
+func TestThresholdShareChecksRefillAfterInvalidCandidate(t *testing.T) {
+	node, packets := shareCheckFixture(t)
+	node.recon.shares[node.ID] = packets[0].Share
+	packets[1].Share.Proof.R = "invalid"
+	for _, p := range packets[1:] {
+		node.acceptShare(p.Share.Holder, p)
+	}
+	if len(node.urgentJobs) != node.Config.Threshold()-1 {
+		t.Fatal("scheduled surplus share checks")
+	}
+	for len(node.urgentJobs) > 0 {
+		(<-node.urgentJobs)()
+		if len(node.events) > 0 {
+			(<-node.events)()
+		}
+	}
+	if len(node.recon.shares) != node.Config.Threshold() || node.Perf.Invalid.Load() != 1 {
+		t.Fatal("invalid candidate prevented a valid threshold subset")
+	}
+	for _, sh := range node.recon.shares {
+		if !node.pvss.VerifyShare(node.recon.object.Transcript, sh) {
+			t.Fatal("accepted an unchecked share")
+		}
+	}
+	if len(node.recon.candidates) == 0 {
+		t.Fatal("surplus candidates were needlessly consumed")
+	}
+}
+
+func TestStaleQueuedShareChecksSkipCryptography(t *testing.T) {
+	node, packets := shareCheckFixture(t)
+	for _, p := range packets[1:] {
+		node.acceptShare(p.Share.Holder, p)
+	}
+	before := node.checks.Stats().Executions
+	close(node.recon.done)
+	for len(node.urgentJobs) > 0 {
+		(<-node.urgentJobs)()
+	}
+	if node.checks.Stats().Executions != before || len(node.events) != 0 {
+		t.Fatal("obsolete epoch still performed cryptography")
+	}
+}
+
+func TestProducerBackpressurePreservesSuccessorProduction(t *testing.T) {
+	cfg := testConfig(7, true)
+	cfg.ProductionWindow = 4
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.ctx = context.Background()
+	node.outgoingBytes.Store(17 << 20)
+	node.nextSeq = 3
+	node.produce()
+	if node.producing || len(node.jobs) != 0 {
+		t.Fatal("congestion did not backpressure speculation")
+	}
+	node.nextSeq = 2
+	node.produce()
+	if !node.producing || len(node.jobs) != 1 {
+		t.Fatal("congestion blocked the required successor")
+	}
+}
+
+func TestHistoryReplyOmitsOnlyRequesterRetainedColumns(t *testing.T) {
+	cfg := testConfig(7, true)
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.ctx = context.Background()
+	node.senders["node1"] = &sender{wake: make(chan struct{}, 1)}
+	node.history[1] = Entry{Record: BeaconRecord{Epoch: 1, Column: 1}}
+	node.columns[1] = Column{Record: ColumnRecord{Column: 1}}
+	node.columns[2] = Column{Record: ColumnRecord{Column: 2}}
+	keys, _, _ := cfg.KeyPairs()
+	for through := uint64(0); through <= 2; through++ {
+		body := json.RawMessage(encode(request{Epoch: 1, HaveThroughColumn: through}))
+		from := p2p.NodeID("node1")
+		env := envelope{node.Public.Context, body, hex.EncodeToString(ed25519.Sign(keys[from].Private, envelopeStatement(node.Public.Context, "HISTORY", from, body)))}
+		m, _ := p2p.NewMessage(Protocol, "HISTORY", node.Public.Context, from, node.ID, env)
+		node.handleBeacon(m)
+		reply, ok := node.senders[from].pop()
+		if !ok {
+			t.Fatal("history request was not answered")
+		}
+		packet, _ := p2p.DecodePayload[envelope](reply)
+		var resp response
+		if json.Unmarshal(packet.Body, &resp) != nil || len(resp.Entries) != 1 || len(resp.Columns) != 2-int(through) {
+			t.Fatal("column omission lost entries or required evidence")
+		}
+		for _, col := range resp.Columns {
+			if col.Record.Column <= through {
+				t.Fatal("resent retained column")
+			}
+		}
+	}
+}
+
+func TestPeriodicHistoryRecoveryRotatesAcrossMembership(t *testing.T) {
+	cfg := testConfig(7, true)
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.ctx = context.Background()
+	for _, id := range cfg.Members() {
+		node.senders[id] = &sender{wake: make(chan struct{}, 1)}
+	}
+	now := time.Now()
+	node.lastInstall = now.Add(-time.Minute)
+	seen := map[p2p.NodeID]bool{}
+	for attempt := 0; attempt < len(cfg.Members())-1; attempt++ {
+		node.recoverAt(now.Add(time.Duration(attempt) * 10 * time.Second))
+		count := 0
+		for peer, s := range node.senders {
+			for {
+				m, ok := s.pop()
+				if !ok {
+					break
+				}
+				if m.Protocol == Protocol && m.Type == "HISTORY" {
+					count++
+					seen[peer] = true
+					if peer == node.ID {
+						t.Fatal("history recovery queried self")
+					}
+				}
+			}
+		}
+		if count != 1 {
+			t.Fatal("periodic recovery solicited duplicate full histories")
+		}
+	}
+	if len(seen) != len(cfg.Members())-1 {
+		t.Fatal("history recovery cannot pass silent peers")
 	}
 }

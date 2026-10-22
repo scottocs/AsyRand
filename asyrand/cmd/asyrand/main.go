@@ -66,7 +66,18 @@ func run(cfg config.Config, duration time.Duration, historyPath string) error {
 	for _, id := range ids {
 		var t p2p.Transport
 		if cfg.Transport == "tcp" {
-			t = p2p.NewTCPTransport(id, cfg.ListenAddr(id), peers, cfg.TransportBuffer)
+			if cfg.AuthenticatedTCP {
+				keys, pubs, err := cfg.KeyPairs()
+				if err != nil {
+					return err
+				}
+				t, err = p2p.NewAuthenticatedTCPTransport(id, cfg.ListenAddr(id), peers, cfg.TransportBuffer, keys[id].Private, pubs)
+				if err != nil {
+					return err
+				}
+			} else {
+				t = p2p.NewTCPTransport(id, cfg.ListenAddr(id), peers, cfg.TransportBuffer)
+			}
 		} else {
 			t = network.NewTransport(id, cfg.TransportBuffer)
 		}
@@ -137,7 +148,7 @@ func run(cfg config.Config, duration time.Duration, historyPath string) error {
 		}
 		c()
 		completed.Store(epoch)
-		fmt.Printf("ts=%s epoch=%d column=%d source=%s digest=%s random=%s\n", time.Now().UTC().Format(time.RFC3339Nano), epoch, sample.Record.Column, sample.Record.Source, sample.Record.Hash(), sample.Record.Random[:16])
+		fmt.Printf("ts=%s epoch=%d column=%d source=%s digest=%s random=%s\n", time.Now().UTC().Format(time.RFC3339Nano), epoch, sample.Record.Column, sample.Record.Source, sample.Record.Hash(), sample.Record.Random)
 		if runFirst.IsZero() {
 			runFirst = time.Now()
 			runBefore = snapshotTraffic(nodes)
@@ -188,6 +199,7 @@ func run(cfg config.Config, duration time.Duration, historyPath string) error {
 		}
 	}
 	if cfg.NodeID != "" {
+		fmt.Printf("benchmark_complete outputs=%d\n", cfg.Round+cfg.Warmup)
 		select {
 		case <-time.After(time.Duration(cfg.LingerMS) * time.Millisecond):
 		case <-ctx.Done():

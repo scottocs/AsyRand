@@ -3,6 +3,7 @@ package p2p
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -30,16 +31,18 @@ func TCPBufferForPeers(peers int) int {
 }
 
 type TCPTransport struct {
-	id        NodeID
-	addr      string
-	peers     map[NodeID]string
-	inbox     chan Message
-	listener  net.Listener
-	mu        sync.RWMutex
-	closed    bool
-	conns     map[NodeID]*tcpPeerConn
-	statsMu   sync.Mutex
-	typeStats map[string]MessageTypeMetrics
+	id           NodeID
+	addr         string
+	peers        map[NodeID]string
+	inbox        chan Message
+	listener     net.Listener
+	mu           sync.RWMutex
+	closed       bool
+	conns        map[NodeID]*tcpPeerConn
+	statsMu      sync.Mutex
+	typeStats    map[string]MessageTypeMetrics
+	tlsConfig    *tls.Config
+	peerIdentity func(tls.ConnectionState) (NodeID, error)
 
 	maxMessageBytes uint32
 	dialTimeout     time.Duration
@@ -73,6 +76,8 @@ func NewTCPTransport(id NodeID, addr string, peers map[NodeID]string, buffer int
 
 func (t *TCPTransport) ID() NodeID            { return t.id }
 func (t *TCPTransport) Inbox() <-chan Message { return t.inbox }
+
+func (t *TCPTransport) AuthenticatedDelivery() bool { return t.tlsConfig != nil }
 
 func (t *TCPTransport) InboxStats() (int, int) {
 	return len(t.inbox), cap(t.inbox)
@@ -117,6 +122,21 @@ func (t *TCPTransport) acceptLoop() {
 func (t *TCPTransport) handleConn(conn net.Conn) {
 	defer conn.Close()
 	tuneTCPConn(conn)
+	var sender NodeID
+	if t.tlsConfig != nil {
+		secure := tls.Server(conn, t.tlsConfig)
+		_ = secure.SetDeadline(time.Now().Add(30 * time.Second))
+		if err := secure.Handshake(); err != nil {
+			return
+		}
+		var err error
+		sender, err = t.peerIdentity(secure.ConnectionState())
+		if err != nil {
+			return
+		}
+		_ = secure.SetDeadline(time.Time{})
+		conn = secure
+	}
 	r := bufio.NewReader(conn)
 	for {
 		var size uint32
@@ -134,6 +154,12 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		if t.tlsConfig != nil {
+			if msg.From != sender || msg.To != t.id {
+				return
+			}
+			msg.authenticated = true
+		}
 		sizeWithFrame := uint64(size) + 4
 		t.recvMessages.Add(1)
 		t.recvBytes.Add(sizeWithFrame)
@@ -143,6 +169,12 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 }
 
 func (t *TCPTransport) Send(ctx context.Context, to NodeID, msg Message) error {
+	if t.tlsConfig != nil {
+		if msg.From != t.id {
+			return errors.New("TLS sender does not match transport identity")
+		}
+		msg.authenticated = true
+	}
 	msg.To = to
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -325,6 +357,25 @@ func (t *TCPTransport) sendOnce(ctx context.Context, to NodeID, addr string, dat
 			return err
 		}
 		tuneTCPConn(conn)
+		if t.tlsConfig != nil {
+			cfg := t.tlsConfig.Clone()
+			cfg.VerifyConnection = func(state tls.ConnectionState) error {
+				id, err := t.peerIdentity(state)
+				if err != nil {
+					return err
+				}
+				if id != to {
+					return errors.New("TLS peer identity does not match destination")
+				}
+				return nil
+			}
+			secure := tls.Client(conn, cfg)
+			if err := secure.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return err
+			}
+			conn = secure
+		}
 		pc.conn = conn
 	}
 	_ = pc.conn.SetWriteDeadline(time.Now().Add(t.dialTimeout))

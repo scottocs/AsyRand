@@ -11,8 +11,9 @@ cd grandline
 go run ./cmd/grandline -config configs/local_8.json -duration 300s
 ```
 
-Ordinary packets require an authenticated sender-bound transport. Currently the
-memory transport supplies it; the raw TCP adapter does not and is rejected.
+Ordinary packets require an authenticated sender-bound transport. Memory and
+mutual TLS TCP supply it; raw unauthenticated TCP remains unsupported. Independent
+TCP nodes require a common validated `-setup-file` generated with `-write-setup`.
 
 ## Output
 
@@ -86,8 +87,9 @@ enables outer signatures. The explicit `reference` mode follows DiPa0123/GRandLi
 from the private setup, there is no online COMMIT, and SHARE has its native DLEQ
 and pairing checks without a second Ed25519 envelope.
 Both modes require authenticated delivery at both transport construction and
-message ingress. Currently only the memory transport supplies that capability;
-TCP fails closed. A configured sender name alone does not authenticate a packet.
+message ingress. Standard mode supports memory and mutual TLS TCP with pinned
+committee keys. Reference mode remains restricted to memory. A configured sender
+name alone does not authenticate a packet.
 
 ```sh
 go run ./cmd/grandline -config configs/local_8.json -beacon-mode reference
