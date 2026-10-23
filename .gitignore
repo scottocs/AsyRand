@@ -17,12 +17,12 @@ build/
 bin/
 *.zip
 
-# AsyRand benchmark harness and reviewable measurement artifacts.
+# Version benchmark entry points and helpers; keep generated runs local.
 !asyrand/benchmarks/
-!asyrand/benchmarks/**
-asyrand/benchmarks/**/bin/
-asyrand/benchmarks/local_20261014/
-asyrand/benchmarks/local_20261014_full/
-asyrand/benchmarks/local_20261014_witness/
-asyrand/benchmarks/local_20261014_final/
-asyrand/benchmarks
+asyrand/benchmarks/*
+!asyrand/benchmarks/latest_compare.py
+!asyrand/benchmarks/latest_report.py
+!asyrand/benchmarks/bandwidth_report.py
+!asyrand/benchmarks/traffic_breakdown.py
+!asyrand/benchmarks/README.md
+!asyrand/benchmarks/requirements.txt
