@@ -847,7 +847,7 @@ func TestProducerWindowAdvancesOnlyWithConsumptionColumn(t *testing.T) {
 		}
 	}
 	node.produce()
-	if state.Column != 2 || !node.producing || len(node.jobs) != 1 || node.nextSeq != 4 {
+	if state.Column != 2 || !node.producing || len(node.validationJobs) != 1 || len(node.jobs) != 0 || node.nextSeq != 4 {
 		t.Fatal("shared column did not replenish exactly the next producer position")
 	}
 }
@@ -898,13 +898,13 @@ func TestPVSSCacheCannotRebindRBCPosition(t *testing.T) {
 			if pending {
 				node.handleRBC(packet(dealer, 1))
 				node.handleRBC(packet("node2", 1))
-				if len(node.jobs) != 1 {
+				if len(node.validationJobs) != 1 || len(node.jobs) != 0 {
 					t.Fatal("did not deduplicate in-flight PVSS check")
 				}
-				(<-node.jobs)()
+				(<-node.validationJobs)()
 				(<-node.events)()
 			} else {
-				node.verifier.objects[hash] = verifiedPVSS{dealer, 1}
+				node.verifier.objects[hash] = verifiedPVSS{dealer: dealer, seq: 1}
 				node.handleRBC(packet("node2", 1))
 				node.handleRBC(packet(dealer, 2))
 			}
@@ -982,6 +982,7 @@ func shareCheckFixture(t *testing.T) (*Node, []reconPacket) {
 	h := reconHeader{Epoch: 1, Previous: "previous", Column: 1, Source: node.ID, ObjectHash: rbc.Hash(encode(object))}
 	node.state = &consumptionState{Epoch: 1, Column: 1, PreviousHash: h.Previous}
 	node.recon = &pendingRecon{header: h, object: Object{Transcript: object}, shares: make(map[p2p.NodeID]crypto.PVSSDecryptedShare), verifying: make(map[p2p.NodeID]bool), candidates: make(map[p2p.NodeID]reconPacket), done: make(chan struct{})}
+	node.recon.prepared, _ = node.pvss.Prepare(object)
 	seeds, _ := cfg.NodeSeedBytes()
 	var packets []reconPacket
 	for _, id := range cfg.Members() {
@@ -1011,7 +1012,9 @@ func TestThresholdShareChecksRefillAfterInvalidCandidate(t *testing.T) {
 	}
 	for len(node.urgentJobs) > 0 {
 		(<-node.urgentJobs)()
-		if len(node.events) > 0 {
+		if len(node.urgentEvents) > 0 {
+			(<-node.urgentEvents)()
+		} else if len(node.events) > 0 {
 			(<-node.events)()
 		}
 	}
@@ -1025,6 +1028,23 @@ func TestThresholdShareChecksRefillAfterInvalidCandidate(t *testing.T) {
 	}
 	if len(node.recon.candidates) == 0 {
 		t.Fatal("surplus candidates were needlessly consumed")
+	}
+}
+
+func TestPendingOwnShareReservesOneCheckSlot(t *testing.T) {
+	node, packets := shareCheckFixture(t)
+	node.recon.releasePending = true
+	for _, p := range packets[1:] {
+		node.acceptShare(p.Share.Holder, p)
+	}
+	if len(node.urgentJobs) != node.Config.Threshold()-1 {
+		t.Fatal("did not reserve the pending local share")
+	}
+	node.recon.shares[node.ID] = packets[0].Share
+	node.recon.released = true
+	node.checkShares()
+	if len(node.urgentJobs) != node.Config.Threshold()-1 {
+		t.Fatal("local share installation scheduled a surplus check")
 	}
 }
 
@@ -1060,8 +1080,164 @@ func TestProducerBackpressurePreservesSuccessorProduction(t *testing.T) {
 	}
 	node.nextSeq = 2
 	node.produce()
-	if !node.producing || len(node.jobs) != 1 {
+	if !node.producing || len(node.validationJobs) != 1 || len(node.jobs) != 0 {
 		t.Fatal("congestion blocked the required successor")
+	}
+}
+
+func TestAdaptiveProductionBoundsAndCriticalProgress(t *testing.T) {
+	cfg := testConfig(7, true)
+	cfg.ProductionWindow = 8
+	cfg.AdaptiveProduction = true
+	cfg.ProductionWindowMin = 2
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.ctx = context.Background()
+	node.ready[7] = map[p2p.NodeID]Object{"node1": {}}
+	now := time.Now()
+	node.outgoingBytes.Store(9 << 20)
+	for i := 0; i < 8; i++ {
+		node.reviewProduction(now.Add(time.Duration(i) * 250 * time.Millisecond))
+	}
+	if node.production.active != 8 || node.Config.ProductionWindow != 8 || len(node.ready[7]) != 1 {
+		t.Fatal("startup filling shrank the horizon or discarded evidence")
+	}
+	// A busy worker with no queued work is not spare capacity.
+	node.production.active = 3
+	node.cryptoActive.Store(int64(cfg.MaxPool))
+	node.outgoingBytes.Store(0)
+	for i := 8; i < 16; i++ {
+		node.reviewProduction(now.Add(time.Duration(i) * 250 * time.Millisecond))
+	}
+	if node.production.active != 3 {
+		t.Fatal("busy workers mistaken for an empty execution pipeline")
+	}
+	node.cryptoActive.Store(0)
+	node.outgoingBytes.Store(0)
+	// Excess complete inventory permits a cautious decrease without requiring
+	// a large outbound queue. Accepted evidence and peer horizons stay intact.
+	for c := uint64(3); c <= 10; c++ {
+		node.columns[c] = Column{Record: ColumnRecord{Column: c, Whole: aba.One}}
+	}
+	for i := 16; i < 28; i++ {
+		node.state = &consumptionState{Column: 3 + uint64((i-16)/4)}
+		node.reviewProduction(now.Add(time.Duration(i) * 250 * time.Millisecond))
+	}
+	if node.production.active != 2 || node.Perf.ProductionShrinks.Load() != 1 {
+		t.Fatal("safe reserve did not permit bounded shrinking", node.production)
+	}
+	node.state = nil
+	node.nextSeq = 2
+	node.produce()
+	if !node.producing || len(node.validationJobs) != 1 {
+		t.Fatal("adaptive congestion blocked the required successor")
+	}
+	node.outgoingBytes.Store(0)
+	// The queued successor is required work, not unused worker capacity.
+	<-node.validationJobs
+	for i := 28; i < 44; i++ {
+		node.reviewProduction(now.Add(time.Duration(i) * 250 * time.Millisecond))
+	}
+	if node.production.active != 8 || node.Perf.ProductionShrinks.Load() != 1 || node.Perf.ProductionGrows.Load() != 6 {
+		t.Fatal("adaptive bounds/hysteresis failed", node.production)
+	}
+}
+
+func TestAdaptiveFallbackRestoresLookaheadWithoutChangingDecision(t *testing.T) {
+	cfg := testConfig(7, true)
+	cfg.ProductionWindow, cfg.ProductionWindowMin, cfg.AdaptiveProduction = 8, 2, true
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.production.active = 2
+	node.state = &consumptionState{Column: 3}
+	node.columns[3] = Column{Record: ColumnRecord{Column: 3, Whole: aba.Zero}}
+	node.reviewProduction(time.Now())
+	if node.production.active != 3 || node.columns[3].Record.Whole != aba.Zero || node.Config.ProductionWindow != 8 {
+		t.Fatal("fallback feedback changed evidence or failed to restore lookahead")
+	}
+}
+
+func TestReadyAuthenticationCompletesBeforeActorAdmission(t *testing.T) {
+	cfg := testConfig(4, true)
+	net := p2p.NewMemoryNetwork()
+	node, err := New(cfg, "node0", net.NewTransport("node0", 8192))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.ctx, node.cancel = context.WithCancel(context.Background())
+	defer func() { node.cancel(); node.wg.Wait() }()
+	keys, _, _ := cfg.KeyPairs()
+	p := rbc.Packet{Context: node.Public.Context, Dealer: "node2", Seq: 1, Hash: rbc.Hash([]byte("value"))}
+	statement := encode(struct {
+		Domain, Context, Type string
+		From, Dealer          p2p.NodeID
+		Seq                   uint64
+		Hash                  string
+	}{rbc.Protocol, p.Context, "READY", "node1", p.Dealer, p.Seq, p.Hash})
+	p.Signature = hex.EncodeToString(ed25519.Sign(keys["node1"].Private, statement))
+	valid, _ := p2p.NewMessage(rbc.Protocol, "READY", rbc.Key(p.Dealer, p.Seq), "node1", node.ID, p)
+	node.authStarted.Store(true)
+	node.handleRBC(valid)
+	if len(node.authJobs) != 1 || node.checks.Stats().Executions != 0 {
+		t.Fatal("actor synchronously performed queued READY cryptography")
+	}
+	node.wg.Add(1)
+	go node.authenticateReady()
+	runCompletion := func() {
+		t.Helper()
+		select {
+		case f := <-node.events:
+			f()
+		case <-time.After(5 * time.Second):
+			t.Fatal("authentication completion missing")
+		}
+	}
+	runCompletion()
+	if node.Perf.Invalid.Load() != 0 || node.checks.Stats().Executions != 1 {
+		t.Fatal("valid signature did not authenticate exactly once")
+	}
+	p.Hash = rbc.Hash([]byte("tampered value"))
+	bad, _ := p2p.NewMessage(rbc.Protocol, "READY", rbc.Key(p.Dealer, p.Seq), "node1", node.ID, p)
+	node.handleRBC(bad)
+	runCompletion()
+	if node.Perf.Invalid.Load() != 1 || len(node.ready) != 0 || len(node.columns) != 0 {
+		t.Fatal("unverified READY changed protocol evidence")
+	}
+}
+
+func TestAdaptiveWindowPublicHistoryAndSilentFaults(t *testing.T) {
+	for _, silent := range []int{0, 1} {
+		t.Run(fmt.Sprint(silent), func(t *testing.T) {
+			cfg := testConfig(4, true)
+			cfg.ProductionWindow = 8
+			cfg.AdaptiveProduction = true
+			cfg.ProductionWindowMin = 2
+			nodes, ctx := testConfiguredCluster(t, cfg, silent)
+			for epoch := uint64(1); epoch <= 9; epoch++ {
+				var hash string
+				for _, node := range nodes {
+					e, err := node.WaitBeacon(ctx, epoch)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if hash != "" && e.Record.Hash() != hash {
+						t.Fatal("adaptive agreement failure")
+					}
+					hash = e.Record.Hash()
+				}
+			}
+			for _, node := range nodes {
+				if err := VerifyHistory(node.Public, node.Export(9)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -1139,5 +1315,123 @@ func TestPeriodicHistoryRecoveryRotatesAcrossMembership(t *testing.T) {
 	}
 	if len(seen) != len(cfg.Members())-1 {
 		t.Fatal("history recovery cannot pass silent peers")
+	}
+}
+
+type consumptionTap struct {
+	p2p.Transport
+	owner            *Node
+	wrongPredecessor atomic.Uint64
+	released         atomic.Uint64
+}
+
+func (tap *consumptionTap) Send(ctx context.Context, to p2p.NodeID, message p2p.Message) error {
+	if message.Protocol == Protocol && message.Type == "RECON" {
+		var envelope envelope
+		var packet reconPacket
+		if json.Unmarshal(message.Payload, &envelope) != nil || json.Unmarshal(envelope.Body, &packet) != nil {
+			tap.wrongPredecessor.Add(1)
+		} else if packet.Header.Epoch > 1 {
+			tap.owner.mu.RLock()
+			previous, ok := tap.owner.history[packet.Header.Epoch-1]
+			tap.owner.mu.RUnlock()
+			if !ok || previous.Record.Hash() != packet.Header.Previous {
+				tap.wrongPredecessor.Add(1)
+			}
+		}
+		tap.released.Add(1)
+		// Allow real slack between online release and peer arrival, without
+		// delaying the actor. This exercises the private precompute path.
+		time.Sleep(2 * time.Millisecond)
+	}
+	return tap.Transport.Send(ctx, to, message)
+}
+
+func TestConsumptionPrefetchKeepsReleaseBindingAndPublicHistory(t *testing.T) {
+	t.Setenv("TYCHE_ASY_PREDECRYPT", "1")
+	cfg := testConfig(4, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	network := p2p.NewMemoryNetwork()
+	var nodes []*Node
+	var taps []*consumptionTap
+	for _, id := range cfg.Members() {
+		tap := &consumptionTap{Transport: network.NewTransport(id, cfg.TransportBuffer)}
+		node, err := New(cfg, id, tap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tap.owner = node
+		nodes = append(nodes, node)
+		taps = append(taps, tap)
+	}
+	t.Cleanup(func() {
+		cancel()
+		for _, n := range nodes {
+			n.Stop()
+		}
+		for _, tap := range taps {
+			tap.Close()
+		}
+	})
+	for _, n := range nodes {
+		if err := n.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	for _, tap := range taps {
+		if tap.released.Load() != 0 {
+			t.Fatal("released before Begin")
+		}
+	}
+	for _, n := range nodes {
+		n.Begin()
+	}
+	const outputs = 17
+	for e := uint64(1); e <= outputs; e++ {
+		var hash string
+		for _, n := range nodes {
+			entry, err := n.WaitBeacon(ctx, e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hash != "" && entry.Record.Hash() != hash {
+				t.Fatal("agreement failure")
+			}
+			hash = entry.Record.Hash()
+		}
+	}
+	var hits uint64
+	for i, n := range nodes {
+		if taps[i].wrongPredecessor.Load() != 0 {
+			t.Fatal("released share before its predecessor was installed")
+		}
+		hits += n.Perf.PrefetchHits.Load()
+		if err := VerifyHistory(n.Public, n.Export(outputs)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if hits == 0 {
+		t.Fatal("did not exercise completed private-share cache")
+	}
+}
+
+func TestConsumerPriorityDrainsCompletionsBeforeBackgroundWithoutStarvingIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	node := &Node{ctx: ctx, consumerPriority: true, Transport: p2p.NewMemoryNetwork().NewTransport("node0", 8), events: make(chan func(), 8), urgentEvents: make(chan func(), 8)}
+	var order []string
+	for i := 0; i < 4; i++ {
+		node.post(func() { order = append(order, "background") })
+	}
+	node.postUrgent(func() { order = append(order, "consumer") })
+	if !node.drainReady() || len(order) != 5 || order[0] != "consumer" {
+		t.Fatal("priority or background progress lost", order)
+	}
+	node.consumerPriority = false
+	node.postUrgent(func() {})
+	if len(node.events) != 1 || len(node.urgentEvents) != 0 {
+		t.Fatal("disabled option changed original callback routing")
 	}
 }

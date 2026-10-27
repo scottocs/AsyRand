@@ -197,6 +197,11 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 	if err != nil {
 		return err
 	}
+	probe, err := p2p.OpenBenchmark(string(cfg.NodeID), nodeTransport, uint64(cfg.Round))
+	if err != nil {
+		return err
+	}
+	defer probe.Close()
 	if err := nodeTransport.Start(runCtx); err != nil {
 		return err
 	}
@@ -234,11 +239,23 @@ func runSingleNode(cfg config.Config, duration time.Duration) error {
 		fmt.Printf("ts=%s node=%s epoch=%d leader=%s digest=%s random=%x\n",
 			logTimestamp(), node.ID, b.Epoch, node.State.Leader(b.Epoch), b.Digest, b.Random)
 		finalWindow.recordBeacon([]*spurt.Node{node})
+		if err := probe.Output(count, func() any { return collectPerf([]*spurt.Node{node}) }); err != nil {
+			return err
+		}
 	}
 	nodes := []*spurt.Node{node}
 	cacheTotal, cacheMax := collectCachedCommitments(nodes)
 	finalWindow.print(nodes, cacheTotal, cacheMax)
+	if err := probe.Finish(runCtx); err != nil {
+		return err
+	}
+	if probe != nil {
+		cancel()
+	}
 	fmt.Printf("benchmark_complete outputs=%d\n", stats.beacons.Load())
+	if err := probe.Complete(); err != nil {
+		return err
+	}
 	if cfg.LingerMS > 0 {
 		time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
 	}

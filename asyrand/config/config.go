@@ -33,6 +33,8 @@ type Config struct {
 	LingerMS         int        `json:"linger_ms"`
 	// The quorum, reconstruction threshold and RSQ capacity follow n and f.
 	ProductionWindow    int                   `json:"production_window"`
+	AdaptiveProduction  bool                  `json:"adaptive_production_window"`
+	ProductionWindowMin int                   `json:"production_window_min"`
 	ParallelConsumption bool                  `json:"parallel_consumption"`
 	SessionID           string                `json:"session_id"`
 	TransportBuffer     int                   `json:"transport_buffer"`
@@ -93,6 +95,9 @@ func Load(path string) (Config, error) {
 	if cfg.ProductionWindow == 0 {
 		cfg.ProductionWindow = 8
 	}
+	if cfg.ProductionWindowMin == 0 {
+		cfg.ProductionWindowMin = 2
+	}
 	if cfg.F < 0 {
 		cfg.F = (len(cfg.ClusterIndex) - 1) / 3
 	}
@@ -118,6 +123,9 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.AdaptiveProduction && (c.ProductionWindowMin < 2 || c.ProductionWindowMin > c.ProductionWindow) {
+		return errors.New("adaptive production requires 2 <= minimum <= configured window")
+	}
 	n := len(c.ClusterIndex)
 	if n == 0 || c.F < 0 || 3*c.F >= n {
 		return errors.New("AsyRand requires n > 3f >= 0")

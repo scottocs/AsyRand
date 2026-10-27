@@ -25,8 +25,9 @@ type Verifier struct {
 // A cache hit binds the exact canonical transcript hash to its dealer/position.
 // The node actor may reuse a successful check under the same fixed PVSS setup.
 type verifiedPVSS struct {
-	dealer p2p.NodeID
-	seq    uint64
+	dealer   p2p.NodeID
+	seq      uint64
+	prepared *crypto.VerifiedPVSS
 }
 
 func NewVerifier(s PublicSetup, caches ...*verification.Cache) (*Verifier, error) {
@@ -95,10 +96,11 @@ func (v *Verifier) AddColumn(c Column) error {
 				return errors.New("invalid object binding or delivery certificate")
 			}
 			if _, verified := v.objects[h]; !verified {
-				if !v.pvss.Verify(o.Transcript) {
+				prepared, valid := v.pvss.Prepare(o.Transcript)
+				if !valid {
 					return errors.New("invalid PVSS transcript")
 				}
-				v.objects[h] = verifiedPVSS{o.Transcript.Dealer, o.Transcript.Seq}
+				v.objects[h] = verifiedPVSS{o.Transcript.Dealer, o.Transcript.Seq, prepared}
 			}
 			accepted++
 		}
@@ -177,7 +179,11 @@ func (v *Verifier) CheckEntry(e Entry) error {
 	}
 	// ReconTrusted verifies shares and distinct holders itself. With exactly t
 	// inputs it cannot ignore an invalid or duplicate share and still succeed.
-	z, err := v.pvss.ReconTrusted(o.Transcript, e.Shares, v.setup.F+1)
+	prepared, err := v.preparedObject(e.Record.ObjectHash, o.Transcript)
+	if err != nil {
+		return err
+	}
+	z, err := v.pvss.ReconPrepared(prepared, e.Shares, v.setup.F+1)
 	if err != nil {
 		return err
 	}
@@ -185,6 +191,20 @@ func (v *Verifier) CheckEntry(e Entry) error {
 		return errors.New("incorrect beacon randomness")
 	}
 	return nil
+}
+
+// Only call for an object already bound into a checked, privately owned column.
+func (v *Verifier) preparedObject(hash string, object crypto.PVSSCommitment) (*crypto.VerifiedPVSS, error) {
+	known := v.objects[hash]
+	if known.prepared == nil {
+		prepared, valid := v.pvss.Prepare(object)
+		if !valid {
+			return nil, errors.New("invalid prepared object")
+		}
+		known = verifiedPVSS{object.Dealer, object.Seq, prepared}
+		v.objects[hash] = known
+	}
+	return known.prepared, nil
 }
 func (v *Verifier) Apply(e Entry) error {
 	if err := v.CheckEntry(e); err != nil {

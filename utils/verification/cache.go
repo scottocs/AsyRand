@@ -3,6 +3,7 @@
 package verification
 
 import (
+	"Tyche/utils/cryptoexec"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
@@ -68,6 +69,32 @@ func JSONKey(domain string, values ...any) Key {
 // Check executes work at most once for an identical successful input. All
 // callers, including waiters, get only a boolean, never a mutable cached object.
 func (c *Cache) Check(key Key, work func() bool) (valid bool) {
+	return c.checkBudget(key, work, false)
+}
+
+func (c *Cache) checkBudget(key Key, work func() bool, fast bool) (valid bool) {
+	if c != nil {
+		c.mu.Lock()
+		old := c.results[key]
+		if old != nil {
+			c.hits++
+			c.mu.Unlock()
+			<-old.done
+			return old.valid
+		}
+		c.mu.Unlock()
+	}
+	// Reserve a miss only after it is executing on a budget worker. Otherwise
+	// a worker could wait for an owner that is still queued behind that worker.
+	if fast {
+		cryptoexec.WithCPUGroupFast(func() { valid = c.check(key, work) })
+	} else {
+		cryptoexec.WithCPUGroup(func() { valid = c.check(key, work) })
+	}
+	return valid
+}
+
+func (c *Cache) check(key Key, work func() bool) (valid bool) {
 	if c == nil {
 		return work()
 	}
@@ -109,10 +136,10 @@ func (c *Cache) Ed25519Once(public ed25519.PublicKey, message, signature []byte)
 	if len(public) != ed25519.PublicKeySize || len(signature) != ed25519.SignatureSize {
 		return false, false
 	}
-	valid = c.Check(Digest("ed25519", public, message, signature), func() bool {
+	valid = c.checkBudget(Digest("ed25519", public, message, signature), func() bool {
 		executed = true
 		return ed25519.Verify(public, message, signature)
-	})
+	}, true)
 	return valid, executed
 }
 

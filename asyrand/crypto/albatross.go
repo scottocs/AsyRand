@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"Tyche/utils/verification"
 	"go.dedis.ch/kyber/v3"
@@ -41,8 +42,15 @@ func (s *PVSSPairingFreeScheme) shareALBATROSS(dealer p2p.NodeID, seq uint64) (P
 		Threshold: s.threshold, Members: append([]p2p.NodeID(nil), s.members...),
 		Cipher: make(map[p2p.NodeID]string, len(s.members)),
 	}
-	for i, member := range s.members {
+	ciphertexts := make([]kyber.Point, len(s.members))
+	cryptoexec.AllLabeled("pvss-share", len(s.members), func(i int) bool {
+		member := s.members[i]
 		cipher := group.Point().Mul(evaluatePVSSPolynomial(coefficients, i+1), s.public[member])
+		ciphertexts[i] = cipher
+		return true
+	})
+	for i, member := range s.members {
+		cipher := ciphertexts[i]
 		c.Cipher[member] = mustPointHex(cipher)
 		s.cachePoint(c.Cipher[member], cipher)
 	}
@@ -59,8 +67,15 @@ func (s *PVSSPairingFreeScheme) proveALBATROSSSharing(c *PVSSCommitment, coeffic
 		nonces[i] = group.Scalar().Pick(stream)
 	}
 	c.Commit = make(map[p2p.NodeID]string, len(s.members))
-	for i, member := range s.members {
+	commitments := make([]kyber.Point, len(s.members))
+	cryptoexec.AllLabeled("pvss-share", len(s.members), func(i int) bool {
+		member := s.members[i]
 		commitment := group.Point().Mul(evaluatePVSSPolynomial(nonces, i+1), s.public[member])
+		commitments[i] = commitment
+		return true
+	})
+	for i, member := range s.members {
+		commitment := commitments[i]
 		c.Commit[member] = mustPointHex(commitment)
 		s.cachePoint(c.Commit[member], commitment)
 	}
@@ -87,8 +102,9 @@ func (s *PVSSPairingFreeScheme) verifyALBATROSS(c PVSSCommitment) bool {
 			return false
 		}
 	}
-	group := suite()
-	for i, member := range s.members {
+	negativeChallenge := suite().Scalar().Neg(challenge)
+	return cryptoexec.AllLabeled("pvss-verify", len(s.members), func(i int) bool {
+		member := s.members[i]
 		commitment, err := s.pointFromHex(c.Commit[member])
 		if err != nil {
 			return false
@@ -97,13 +113,11 @@ func (s *PVSSPairingFreeScheme) verifyALBATROSS(c PVSSCommitment) bool {
 		if err != nil {
 			return false
 		}
-		lhs := group.Point().Mul(evaluatePVSSPolynomial(coefficients, i+1), s.public[member])
-		rhs := group.Point().Add(commitment, group.Point().Mul(challenge, cipher))
-		if !lhs.Equal(rhs) {
+		if !publicPointDoubleMulEqual(evaluatePVSSPolynomial(coefficients, i+1), s.public[member], negativeChallenge, cipher, commitment) {
 			return false
 		}
-	}
-	return true
+		return true
+	})
 }
 
 func albatrossSharingChallenge(c PVSSCommitment) kyber.Scalar {

@@ -11,6 +11,9 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 )
 
-require Tyche/utils v0.0.0
+require (
+	Tyche/utils v0.0.0
+	filippo.io/edwards25519 v1.1.0
+)
 
 replace Tyche/utils => ../utils

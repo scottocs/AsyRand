@@ -88,6 +88,15 @@ func run(cfg config.Config, duration time.Duration, historyPath string) error {
 		nodes = append(nodes, node)
 		transports = append(transports, t)
 	}
+	var probe *p2p.BenchmarkProbe
+	if cfg.NodeID != "" {
+		var err error
+		probe, err = p2p.OpenBenchmark(string(cfg.NodeID), transports[0], uint64(cfg.Round+cfg.Warmup))
+		if err != nil {
+			return err
+		}
+	}
+	defer probe.Close()
 	defer func() {
 		cancel()
 		for _, n := range nodes {
@@ -166,13 +175,19 @@ func run(cfg config.Config, duration time.Duration, historyPath string) error {
 		} else {
 			measured++
 		}
+		if err := probe.Output(epoch, func() any { return nodes[0].BenchmarkStats() }); err != nil {
+			return err
+		}
 	}
 	elapsed := time.Since(first).Seconds()
 	runElapsed := time.Since(runFirst).Seconds()
 	after := snapshotTraffic(nodes)
 	printTraffic("final", measured, elapsed, before, after)
 	printTraffic("run", cfg.Round+cfg.Warmup-1, runElapsed, runBefore, after)
-	if cfg.NodeID == "" {
+	if err := probe.Finish(ctx); err != nil {
+		return err
+	}
+	if cfg.NodeID == "" || probe != nil {
 		cancel()
 		for _, n := range nodes {
 			n.Stop()
@@ -200,6 +215,13 @@ func run(cfg config.Config, duration time.Duration, historyPath string) error {
 	}
 	if cfg.NodeID != "" {
 		fmt.Printf("benchmark_complete outputs=%d\n", cfg.Round+cfg.Warmup)
+		if err := probe.Complete(); err != nil {
+			return err
+		}
+		if probe != nil {
+			time.Sleep(time.Duration(cfg.LingerMS) * time.Millisecond)
+			return nil
+		}
 		select {
 		case <-time.After(time.Duration(cfg.LingerMS) * time.Millisecond):
 		case <-ctx.Done():

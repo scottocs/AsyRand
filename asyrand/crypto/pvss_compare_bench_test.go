@@ -7,12 +7,134 @@ import (
 	"testing"
 
 	"Tyche/utils/p2p"
+	"Tyche/utils/verification"
 	"go.dedis.ch/kyber/v3"
 )
 
 // BenchmarkPVSSComparison uses identical keys, group and threshold for both
 // schemes. Constructors and fixture validation are outside measured regions.
 // Warm means decoded subgroup points are cached, never a cached sharing proof.
+func BenchmarkSubgroupCheck(b *testing.B) {
+	point := suite().Point().Mul(suite().Scalar().SetBytes([]byte("public benchmark point")), pvssGeneratorG)
+	for _, method := range []string{"integer-binary", "order-minus-one", "native-order-minus-one"} {
+		b.Run(method, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var result kyber.Point
+				if method == "integer-binary" {
+					result = referenceIntegerOrder(point)
+				} else if method == "native-order-minus-one" {
+					result = publicPointMul(pvssOrderMinusOne, point)
+					result.Add(result, point)
+				} else {
+					result = suite().Point()
+					if variable, ok := result.(kyber.AllowsVarTime); ok {
+						variable.AllowVarTime(true)
+					}
+					result.Mul(pvssOrderMinusOne, point)
+					result.Add(result, point)
+				}
+				if !result.Equal(suite().Point().Null()) {
+					b.Fatal("subgroup check failed")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkPublicProofEquation(b *testing.B) {
+	g := suite()
+	r := g.XOF([]byte("public-proof-equation benchmark"))
+	a, c := g.Scalar().Pick(r), g.Scalar().Pick(r)
+	A, B := g.Point().Mul(g.Scalar().Pick(r), nil), g.Point().Mul(g.Scalar().Pick(r), nil)
+	for _, method := range []string{"kyber-separate", "native-separate", "native-joint"} {
+		b.Run(method, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				switch method {
+				case "kyber-separate":
+					x, y := g.Point(), g.Point()
+					x.(kyber.AllowsVarTime).AllowVarTime(true)
+					y.(kyber.AllowsVarTime).AllowVarTime(true)
+					operationBenchmarkPoint = g.Point().Add(x.Mul(a, A), y.Mul(c, B))
+				case "native-separate":
+					operationBenchmarkPoint = g.Point().Add(publicPointMul(a, A), publicPointMul(c, B))
+				case "native-joint":
+					operationBenchmarkPoint = publicPointDoubleMul(a, A, c, B)
+				}
+			}
+		})
+	}
+}
+
+// A verified object retains its ciphertext points; every timed iteration uses
+// fresh foreign point decoding and proof checks, then reuses those checked
+// shares for interpolation. Fixture/cache resets are outside the timed region.
+func BenchmarkPreparedConsumption(b *testing.B) {
+	for _, n := range []int{31, 61} {
+		t := (n-1)/3 + 1
+		ids := make([]p2p.NodeID, n)
+		keys := make([]PVSSKeyPair, n)
+		pub := map[p2p.NodeID]kyber.Point{}
+		for i := range ids {
+			ids[i] = p2p.NodeID(fmt.Sprintf("node%03d", i))
+			keys[i] = PVSSKeyPairFromSeed([]byte(string(ids[i])))
+			pub[ids[i]] = keys[i].Public
+		}
+		holders := make([]*PVSSPairingFreeScheme, t)
+		for i := range holders {
+			var err error
+			holders[i], err = NewALBATROSSPVSSScheme(ids[i], t, keys[i].Private, pub)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		object, _, err := holders[0].Share(ids[0], 1, ids)
+		if err != nil {
+			b.Fatal(err)
+		}
+		parts := make([]PVSSDecryptedShare, t)
+		for i, s := range holders {
+			parts[i], err = s.PreReconTrusted(object, ids[i])
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		s := holders[0]
+		prepared, valid := s.Prepare(object)
+		if !valid {
+			b.Fatal("invalid fixture")
+		}
+		b.Run(fmt.Sprintf("n%d/FreshForeignPoints", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				resetPVSSBenchmarkCache(s, true)
+				prepared.mu.Lock()
+				clear(prepared.shares)
+				prepared.shareKeys = nil
+				prepared.shareNext = 0
+				prepared.mu.Unlock()
+				b.StartTimer()
+				own, err := s.PreReconPrepared(prepared, ids[0])
+				if err != nil {
+					b.Fatal(err)
+				}
+				shares := append([]PVSSDecryptedShare{own}, parts[1:]...)
+				for _, sh := range shares[1:] {
+					if !s.VerifyPreparedShare(prepared, sh) {
+						b.Fatal("invalid share")
+					}
+				}
+				if _, err = s.ReconPrepared(prepared, shares, t); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkPVSSComparison(b *testing.B) {
 	for _, n := range []int{4, 8, 16, 32, 64} {
 		threshold := (n-1)/3 + 1
@@ -74,6 +196,7 @@ func BenchmarkPVSSComparison(b *testing.B) {
 					b.ReportMetric(float64(32*(2*n+responseCount+1)), "crypto_B")
 				})
 				b.Run("VerifyCold", func(b *testing.B) {
+					before := verifier.headerChecks.Load()
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
@@ -84,17 +207,29 @@ func BenchmarkPVSSComparison(b *testing.B) {
 							b.Fatal("sharing verification failed")
 						}
 					}
+					b.StopTimer()
+					if verifier.headerChecks.Load()-before != uint64(b.N) {
+						b.Fatal("cold verification benchmark reused a successful proof")
+					}
 				})
 				b.Run("VerifyWarm", func(b *testing.B) {
 					if !verifier.Verify(c) {
 						b.Fatal("sharing verification failed")
 					}
+					before := verifier.headerChecks.Load()
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
+						b.StopTimer()
+						resetPVSSBenchmarkCache(verifier, false)
+						b.StartTimer()
 						if !verifier.Verify(c) {
 							b.Fatal("sharing verification failed")
 						}
+					}
+					b.StopTimer()
+					if verifier.headerChecks.Load()-before != uint64(b.N) {
+						b.Fatal("warm-decoding benchmark reused a successful proof")
 					}
 				})
 				b.Run("PreReconTrusted", func(b *testing.B) {
@@ -157,6 +292,9 @@ func BenchmarkPVSSComparison(b *testing.B) {
 }
 
 func resetPVSSBenchmarkCache(s *PVSSPairingFreeScheme, points bool) {
+	// A cold proof must clear the successful boolean verification cache too.
+	// Keeping it made VerifyCold/VerifyWarm measure JSON keys and cache hits.
+	s.checks = verification.New()
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	clear(s.verifiedShares)

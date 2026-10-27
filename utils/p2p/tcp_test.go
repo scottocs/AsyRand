@@ -1,13 +1,53 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
 )
+
+type frameRecordingConn struct {
+	net.Conn
+	bytes.Buffer
+	limit, writes int
+}
+
+func (c *frameRecordingConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *frameRecordingConn) Read(p []byte) (int, error)       { return c.Buffer.Read(p) }
+func (c *frameRecordingConn) Write(p []byte) (int, error) {
+	c.writes++
+	if c.limit > 0 && len(p) > c.limit {
+		p = p[:c.limit]
+	}
+	return c.Buffer.Write(p)
+}
+
+func TestTCPFrameSingleWriteAndPartialWriteRecovery(t *testing.T) {
+	for _, limit := range []int{0, 3} {
+		conn := &frameRecordingConn{limit: limit}
+		transport := NewTCPTransport("node0", "", nil, 8)
+		transport.conns["node1"] = &tcpPeerConn{conn: conn}
+		for _, payload := range [][]byte{[]byte(`{"payload":"first"}`), []byte("second frame")} {
+			conn.Reset()
+			conn.writes = 0
+			if err := transport.sendOnce(context.Background(), "node1", "", payload); err != nil {
+				t.Fatal(err)
+			}
+			wire := conn.Bytes()
+			if len(wire) != 4+len(payload) || binary.BigEndian.Uint32(wire[:4]) != uint32(len(payload)) || !bytes.Equal(wire[4:], payload) {
+				t.Fatal("TCP frame changed or a partial write lost bytes")
+			}
+			if limit == 0 && conn.writes != 1 {
+				t.Fatal("header and body used separate writes")
+			}
+		}
+	}
+}
 
 func TestTCPTransportSendAndMetrics(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -174,5 +214,15 @@ func TestMutualTLSBindsSenderAndPinsDestination(t *testing.T) {
 	}
 	if _, err := NewAuthenticatedTCPTransport("a", peers["a"], peers, 8, privB, pubs); err == nil {
 		t.Fatal("accepted wrong local key")
+	}
+	network := a.NetworkMessageTypeMetrics()["test/PING"]
+	if network.SentMessages != 1 || b.NetworkMessageTypeMetrics()["test/PING"].RecvMessages != 1 {
+		t.Fatal("network counters lost remote delivery")
+	}
+	if err := a.Send(ctx, "a", msg); err != nil {
+		t.Fatal(err)
+	}
+	if a.NetworkMessageTypeMetrics()["test/PING"] != network {
+		t.Fatal("network counters include local self-delivery")
 	}
 }

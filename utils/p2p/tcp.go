@@ -41,6 +41,7 @@ type TCPTransport struct {
 	conns        map[NodeID]*tcpPeerConn
 	statsMu      sync.Mutex
 	typeStats    map[string]MessageTypeMetrics
+	networkStats map[string]MessageTypeMetrics
 	tlsConfig    *tls.Config
 	peerIdentity func(tls.ConnectionState) (NodeID, error)
 
@@ -56,8 +57,9 @@ type TCPTransport struct {
 }
 
 type tcpPeerConn struct {
-	mu   sync.Mutex
-	conn net.Conn
+	mu    sync.Mutex
+	conn  net.Conn
+	frame []byte // Reused under mu; large recovery frames are not retained.
 }
 
 func NewTCPTransport(id NodeID, addr string, peers map[NodeID]string, buffer int) *TCPTransport {
@@ -293,6 +295,18 @@ func (t *TCPTransport) MessageTypeMetrics() map[string]MessageTypeMetrics {
 	return out
 }
 
+// NetworkMessageTypeMetrics excludes local self-delivery. Bytes are framed
+// application plaintext, consistently excluding TLS/TCP/IP overhead.
+func (t *TCPTransport) NetworkMessageTypeMetrics() map[string]MessageTypeMetrics {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+	out := make(map[string]MessageTypeMetrics, len(t.networkStats))
+	for key, value := range t.networkStats {
+		out[key] = value
+	}
+	return out
+}
+
 func (t *TCPTransport) recordSentTypeStats(msg Message, size uint64) {
 	key := msg.Protocol + "/" + msg.Type
 	t.statsMu.Lock()
@@ -304,6 +318,15 @@ func (t *TCPTransport) recordSentTypeStats(msg Message, size uint64) {
 	stats.SentMessages++
 	stats.SentBytes += size
 	t.typeStats[key] = stats
+	if msg.To != t.id {
+		if t.networkStats == nil {
+			t.networkStats = make(map[string]MessageTypeMetrics)
+		}
+		network := t.networkStats[key]
+		network.SentMessages++
+		network.SentBytes += size
+		t.networkStats[key] = network
+	}
 }
 
 func (t *TCPTransport) recordRecvTypeStats(msg Message, size uint64) {
@@ -317,6 +340,15 @@ func (t *TCPTransport) recordRecvTypeStats(msg Message, size uint64) {
 	stats.RecvMessages++
 	stats.RecvBytes += size
 	t.typeStats[key] = stats
+	if msg.From != t.id {
+		if t.networkStats == nil {
+			t.networkStats = make(map[string]MessageTypeMetrics)
+		}
+		network := t.networkStats[key]
+		network.RecvMessages++
+		network.RecvBytes += size
+		t.networkStats[key] = network
+	}
 }
 
 func (t *TCPTransport) Close() error {
@@ -379,12 +411,22 @@ func (t *TCPTransport) sendOnce(ctx context.Context, to NodeID, addr string, dat
 		pc.conn = conn
 	}
 	_ = pc.conn.SetWriteDeadline(time.Now().Add(t.dialTimeout))
-	if err := binary.Write(pc.conn, binary.BigEndian, uint32(len(data))); err != nil {
-		_ = pc.conn.Close()
-		pc.conn = nil
-		return err
+	// One complete application frame per TLS write. Separate header/body
+	// writes created two TLS records and socket writes for every small packet.
+	// Keep the wire format and byte counters identical, with no batching delay.
+	size := len(data) + 4
+	var frame []byte
+	if size <= 256<<10 {
+		if cap(pc.frame) < size {
+			pc.frame = make([]byte, size)
+		}
+		frame = pc.frame[:size]
+	} else {
+		frame = make([]byte, size)
 	}
-	if err := writeFull(pc.conn, data); err != nil {
+	binary.BigEndian.PutUint32(frame, uint32(len(data)))
+	copy(frame[4:], data)
+	if err := writeFull(pc.conn, frame); err != nil {
 		_ = pc.conn.Close()
 		pc.conn = nil
 		return err
@@ -417,6 +459,9 @@ func writeFull(w io.Writer, data []byte) error {
 		n, err := w.Write(data)
 		if err != nil {
 			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 		data = data[n:]
 	}

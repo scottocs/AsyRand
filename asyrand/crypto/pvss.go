@@ -7,12 +7,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"Tyche/utils/verification"
+	fasted "filippo.io/edwards25519"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/group/edwards25519"
 	"go.dedis.ch/kyber/v3/share"
@@ -32,6 +36,15 @@ var pvssGroupOrder = [32]byte{
 	0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
 }
+
+// l-1 is canonical and does not reduce to zero. Kyber's variable-base Mul
+// multiplies these integer bits even for a point with a torsion component.
+// [(l-1)]P+P therefore tests [l]P=0, preserving the full subgroup check.
+var pvssOrderMinusOne = func() kyber.Scalar {
+	raw := pvssGroupOrder
+	raw[0]--
+	return suite().Scalar().SetBytes(raw[:])
+}()
 
 type PVSSKeyPair struct {
 	Private kyber.Scalar
@@ -127,6 +140,7 @@ type PVSSPairingFreeScheme struct {
 	id             p2p.NodeID
 	threshold      int
 	private        kyber.Scalar
+	privateInverse kyber.Scalar
 	public         map[p2p.NodeID]kyber.Point
 	members        []p2p.NodeID
 	index          map[p2p.NodeID]int
@@ -139,6 +153,137 @@ type PVSSPairingFreeScheme struct {
 	verifiedShares map[string]struct{}
 	shareKeys      []string
 	shareNext      int
+	pointHits      atomic.Uint64
+	pointMisses    atomic.Uint64
+	headerChecks   atomic.Uint64
+	preparedBuilds atomic.Uint64
+	shareHits      atomic.Uint64
+	shareChecks    atomic.Uint64
+}
+
+// VerifiedPVSS owns a deep-copied, validated object and its decoded ciphertexts.
+// Its private fields prevent callers from mutating inputs after verification.
+// Handles are local to one scheme, never transferred between committee nodes.
+type VerifiedPVSS struct {
+	owner     *PVSSPairingFreeScheme
+	object    PVSSCommitment
+	context   []byte
+	cipher    map[p2p.NodeID]kyber.Point
+	mu        sync.Mutex
+	shares    map[string]kyber.Point
+	shareKeys []string
+	shareNext int
+}
+
+func (s *PVSSPairingFreeScheme) WorkStats() map[string]uint64 {
+	return map[string]uint64{"point_cache_hits": s.pointHits.Load(), "point_cache_misses": s.pointMisses.Load(),
+		"full_header_checks": s.headerChecks.Load(), "prepared_objects": s.preparedBuilds.Load(),
+		"prepared_share_hits": s.shareHits.Load(), "prepared_share_checks": s.shareChecks.Load()}
+}
+
+// Prepare verifies a complete immutable copy before issuing a reusable handle.
+// SecretID alone is never sufficient to trust an arbitrary caller's object.
+func (s *PVSSPairingFreeScheme) Prepare(c PVSSCommitment) (*VerifiedPVSS, bool) {
+	owned := c
+	owned.Members = append([]p2p.NodeID(nil), c.Members...)
+	owned.Commit = maps.Clone(c.Commit)
+	owned.Cipher = maps.Clone(c.Cipher)
+	owned.Proof.Responses = maps.Clone(c.Proof.Responses)
+	owned.Proof.Coefficients = append([]string(nil), c.Proof.Coefficients...)
+	owned.DLEQ = maps.Clone(c.DLEQ)
+	owned.Sources = append([]PVSSSource(nil), c.Sources...)
+	if !s.Verify(owned) {
+		return nil, false
+	}
+	v := &VerifiedPVSS{owner: s, object: owned, context: objectBytes(owned),
+		cipher: make(map[p2p.NodeID]kyber.Point, len(s.members)), shares: make(map[string]kyber.Point)}
+	for _, id := range s.members {
+		point, err := s.pointFromHex(owned.Cipher[id])
+		if err != nil {
+			return nil, false
+		}
+		v.cipher[id] = point
+	}
+	s.preparedBuilds.Add(1)
+	return v, true
+}
+
+func (s *PVSSPairingFreeScheme) owns(v *VerifiedPVSS) bool { return v != nil && v.owner == s }
+
+func (s *PVSSPairingFreeScheme) PreReconPrepared(v *VerifiedPVSS, holder p2p.NodeID) (PVSSDecryptedShare, error) {
+	if !s.owns(v) || s.private == nil || holder != s.id {
+		return PVSSDecryptedShare{}, errors.New("invalid prepared PVSS object or holder")
+	}
+	return s.makeDecryptionShare(v.object, holder, v.cipher[holder], v.context, v)
+}
+
+func preparedShareKey(v *VerifiedPVSS, sh PVSSDecryptedShare) string {
+	return hex.EncodeToString(pvssHash(v.object.Version+"/prepared-share", []byte(v.object.SetupID), []byte(v.object.SecretID), pvssEncode(sh)))
+}
+
+func (v *VerifiedPVSS) remember(key string, point kyber.Point) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	cacheInsert(v.shares, &v.shareKeys, &v.shareNext, key, point.Clone())
+}
+
+func (s *PVSSPairingFreeScheme) checkedPreparedShare(v *VerifiedPVSS, sh PVSSDecryptedShare) (kyber.Point, bool) {
+	if !s.owns(v) || sh.CommitmentID != v.object.SecretID || s.public[sh.Holder] == nil {
+		return nil, false
+	}
+	key := preparedShareKey(v, sh)
+	v.mu.Lock()
+	point := v.shares[key]
+	v.mu.Unlock()
+	if point != nil {
+		s.shareHits.Add(1)
+		return point.Clone(), true
+	}
+	s.shareChecks.Add(1)
+	d, err := s.pointFromHex(sh.Value)
+	if err != nil {
+		return nil, false
+	}
+	if !s.verifyDecryptionProof(v.object, sh, d, v.cipher[sh.Holder], v.context) {
+		return nil, false
+	}
+	v.remember(key, d)
+	return d, true
+}
+
+func (s *PVSSPairingFreeScheme) VerifyPreparedShare(v *VerifiedPVSS, sh PVSSDecryptedShare) bool {
+	_, valid := s.checkedPreparedShare(v, sh)
+	return valid
+}
+
+func (s *PVSSPairingFreeScheme) ReconPrepared(v *VerifiedPVSS, shares []PVSSDecryptedShare, threshold int) ([]byte, error) {
+	if !s.owns(v) || (threshold != 0 && threshold != s.threshold) {
+		return nil, errors.New("prepared PVSS owner or threshold mismatch")
+	}
+	seen := make(map[p2p.NodeID]bool, s.threshold)
+	parts := make([]*share.PubShare, 0, s.threshold)
+	for _, sh := range shares {
+		if seen[sh.Holder] {
+			continue
+		}
+		point, valid := s.checkedPreparedShare(v, sh)
+		if !valid {
+			continue
+		}
+		seen[sh.Holder] = true
+		parts = append(parts, &share.PubShare{I: s.index[sh.Holder], V: point})
+		if len(parts) == s.threshold {
+			break
+		}
+	}
+	if len(parts) != s.threshold {
+		return nil, errors.New("not enough distinct valid prepared shares")
+	}
+	point, err := recoverPVSSCommit(parts, s.threshold, len(s.members))
+	if err != nil {
+		return nil, err
+	}
+	return point.MarshalBinary()
 }
 
 func suite() *edwards25519.SuiteEd25519 {
@@ -197,6 +342,7 @@ func newPVSSScheme(version string, id p2p.NodeID, threshold int, private kyber.S
 		return nil, errors.New("PVSS private key does not match the local shareholder public key")
 	}
 	s.id, s.private = id, sk
+	s.privateInverse = suite().Scalar().Inv(sk)
 	return s, nil
 }
 
@@ -338,8 +484,8 @@ func (s *PVSSPairingFreeScheme) verifySharingUncached(c PVSSCommitment) bool {
 		if z == nil {
 			return false
 		}
-		a[i] = group.Point().Add(group.Point().Mul(z, s.g), group.Point().Mul(epsilon, v[i]))
-		b[i] = group.Point().Add(group.Point().Mul(z, s.public[member]), group.Point().Mul(epsilon, cipher))
+		a[i] = group.Point().Add(publicPointMul(z, s.g), publicPointMul(epsilon, v[i]))
+		b[i] = group.Point().Add(publicPointMul(z, s.public[member]), publicPointMul(epsilon, cipher))
 	}
 	if !sharingChallenge(c, a, b).Equal(epsilon) {
 		return false
@@ -369,12 +515,16 @@ func (s *PVSSPairingFreeScheme) PreReconTrusted(c PVSSCommitment, holder p2p.Nod
 	if err != nil {
 		return PVSSDecryptedShare{}, err
 	}
+	return s.makeDecryptionShare(c, holder, cipher, objectBytes(c), nil)
+}
+
+func (s *PVSSPairingFreeScheme) makeDecryptionShare(c PVSSCommitment, holder p2p.NodeID, cipher kyber.Point, context []byte, prepared *VerifiedPVSS) (PVSSDecryptedShare, error) {
 	group := suite()
-	d := group.Point().Mul(group.Scalar().Inv(s.private), cipher)
+	d := group.Point().Mul(s.privateInverse, cipher)
 	w := group.Scalar().Pick(group.RandomStream())
 	a := group.Point().Mul(w, s.h)
 	b := group.Point().Mul(w, d)
-	epsilon := s.decryptionChallenge(c, holder, d, cipher, a, b)
+	epsilon := s.decryptionChallengeContext(c, context, holder, d, cipher, a, b)
 	z := group.Scalar().Sub(w, group.Scalar().Mul(epsilon, s.private))
 	sh := PVSSDecryptedShare{
 		CommitmentID: c.SecretID, Holder: holder, Value: mustPointHex(d),
@@ -388,7 +538,11 @@ func (s *PVSSPairingFreeScheme) PreReconTrusted(c PVSSCommitment, holder p2p.Nod
 	s.cachePoint(sh.Value, d)
 	// The local proof was generated with the matching private key. Cache the
 	// exact object/share binding, just as after successful VerifyShare.
-	s.cacheShare(c, sh)
+	if prepared != nil {
+		prepared.remember(preparedShareKey(prepared, sh), d)
+	} else {
+		s.cacheShare(c, sh)
+	}
 	return sh, nil
 }
 
@@ -423,11 +577,20 @@ func (s *PVSSPairingFreeScheme) verifyShareUncached(c PVSSCommitment, sh PVSSDec
 	if err != nil {
 		return false
 	}
+	if !s.verifyDecryptionProof(c, sh, d, cipher, objectBytes(c)) {
+		return false
+	}
+	s.cacheMu.Lock()
+	cacheInsert(s.verifiedShares, &s.shareKeys, &s.shareNext, key, struct{}{})
+	s.cacheMu.Unlock()
+	return true
+}
+
+func (s *PVSSPairingFreeScheme) verifyDecryptionProof(c PVSSCommitment, sh PVSSDecryptedShare, d, cipher kyber.Point, context []byte) bool {
 	z := scalarFromHex(sh.Proof.R)
 	if z == nil {
 		return false
 	}
-	group := suite()
 	if s.version == albatrossPVSSVersion {
 		if sh.Proof.C != "" {
 			return false
@@ -440,10 +603,15 @@ func (s *PVSSPairingFreeScheme) verifyShareUncached(c PVSSCommitment, sh PVSSDec
 		if err != nil {
 			return false
 		}
-		epsilon := s.decryptionChallenge(c, sh.Holder, d, cipher, a, b)
-		wantA := group.Point().Add(group.Point().Mul(z, s.h), group.Point().Mul(epsilon, s.public[sh.Holder]))
-		wantB := group.Point().Add(group.Point().Mul(z, d), group.Point().Mul(epsilon, cipher))
-		if !wantA.Equal(a) || !wantB.Equal(b) {
+		epsilon := s.decryptionChallengeContext(c, context, sh.Holder, d, cipher, a, b)
+		// Both complete equations use only validated, immutable public inputs.
+		// Partition their tail as well as the outer set of foreign shares.
+		if !cryptoexec.AllLabeled("recon-proof-equations", 2, func(i int) bool {
+			if i == 0 {
+				return publicPointDoubleMulEqual(z, s.h, epsilon, s.public[sh.Holder], a)
+			}
+			return publicPointDoubleMulEqual(z, d, epsilon, cipher, b)
+		}) {
 			return false
 		}
 	} else {
@@ -451,15 +619,12 @@ func (s *PVSSPairingFreeScheme) verifyShareUncached(c PVSSCommitment, sh PVSSDec
 		if epsilon == nil || sh.Proof.A != "" || sh.Proof.B != "" {
 			return false
 		}
-		a := group.Point().Add(group.Point().Mul(z, s.h), group.Point().Mul(epsilon, s.public[sh.Holder]))
-		b := group.Point().Add(group.Point().Mul(z, d), group.Point().Mul(epsilon, cipher))
-		if !s.decryptionChallenge(c, sh.Holder, d, cipher, a, b).Equal(epsilon) {
+		a := publicPointDoubleMul(z, s.h, epsilon, s.public[sh.Holder])
+		b := publicPointDoubleMul(z, d, epsilon, cipher)
+		if !s.decryptionChallengeContext(c, context, sh.Holder, d, cipher, a, b).Equal(epsilon) {
 			return false
 		}
 	}
-	s.cacheMu.Lock()
-	cacheInsert(s.verifiedShares, &s.shareKeys, &s.shareNext, key, struct{}{})
-	s.cacheMu.Unlock()
 	return true
 }
 
@@ -509,11 +674,57 @@ func (s *PVSSPairingFreeScheme) ReconTrusted(c PVSSCommitment, shares []PVSSDecr
 	if len(pubShares) < threshold {
 		return nil, errors.New("not enough distinct valid PVSS decryption shares")
 	}
-	secret, err := share.RecoverCommit(suite(), pubShares, threshold, len(s.members))
+	secret, err := recoverPVSSCommit(pubShares, threshold, len(s.members))
 	if err != nil {
 		return nil, err
 	}
 	return secret.MarshalBinary() // Canonical Encode(Z), Z=h^s in G.
+}
+
+// Interpolation uses published shares and indices only. One batch inversion
+// computes all Lagrange weights, then a joint public multi-scalar multiplication
+// shares the doubling chain. Secret generation/decryption retains its own Mul.
+func recoverPVSSCommit(parts []*share.PubShare, threshold, n int) (kyber.Point, error) {
+	if threshold < 1 || n < threshold || len(parts) != threshold {
+		return nil, errors.New("invalid PVSS interpolation dimensions")
+	}
+	seen := make(map[int]bool, threshold)
+	for _, part := range parts {
+		if part == nil || part.V == nil || part.I < 0 || part.I >= n || seen[part.I] {
+			return nil, errors.New("invalid PVSS interpolation share")
+		}
+		seen[part.I] = true
+	}
+	one := publicScalar(suite().Scalar().One())
+	xs := make([]*fasted.Scalar, threshold)
+	points := make([]*fasted.Point, threshold)
+	for i, part := range parts {
+		xs[i] = publicScalar(suite().Scalar().SetInt64(int64(part.I + 1)))
+		points[i] = publicPoint(part.V)
+	}
+	numerators, denominators, prefixes := make([]*fasted.Scalar, threshold), make([]*fasted.Scalar, threshold), make([]*fasted.Scalar, threshold)
+	product := new(fasted.Scalar).Set(one)
+	for i := range parts {
+		numerator, denominator := new(fasted.Scalar).Set(one), new(fasted.Scalar).Set(one)
+		for j := range parts {
+			if i != j {
+				numerator.Multiply(numerator, xs[j])
+				denominator.Multiply(denominator, new(fasted.Scalar).Subtract(xs[j], xs[i]))
+			}
+		}
+		numerators[i], denominators[i] = numerator, denominator
+		prefixes[i] = new(fasted.Scalar).Set(product)
+		product.Multiply(product, denominator)
+	}
+	// Distinct nonnegative indices make each difference nonzero modulo l.
+	inverse := new(fasted.Scalar).Invert(product)
+	weights := make([]*fasted.Scalar, threshold)
+	for i := threshold - 1; i >= 0; i-- {
+		weights[i] = new(fasted.Scalar).Multiply(inverse, prefixes[i])
+		weights[i].Multiply(weights[i], numerators[i])
+		inverse.Multiply(inverse, denominators[i])
+	}
+	return publicPointResult(new(fasted.Point).VarTimeMultiScalarMult(weights, points)), nil
 }
 
 var ErrPVSSAggregationUnsupported = errors.New("AsyRand PVSS reconstructs individual objects; SPURT aggregation is unsupported")
@@ -550,6 +761,7 @@ func (s *PVSSPairingFreeScheme) sameMembers(members []p2p.NodeID) bool {
 }
 
 func (s *PVSSPairingFreeScheme) validHeader(c PVSSCommitment) bool {
+	s.headerChecks.Add(1)
 	n := len(s.members)
 	if c.Version != s.version || c.SetupID != s.setupID || c.Seq == 0 || s.public[c.Dealer] == nil ||
 		c.Threshold != s.threshold || !s.sameMembers(c.Members) || c.Aggregate || len(c.Sources) != 0 || len(c.DLEQ) != 0 ||
@@ -605,8 +817,11 @@ func sharingChallenge(c PVSSCommitment, a, b []kyber.Point) kyber.Scalar {
 }
 
 func (s *PVSSPairingFreeScheme) decryptionChallenge(c PVSSCommitment, holder p2p.NodeID, d, cipher, a, b kyber.Point) kyber.Scalar {
+	return s.decryptionChallengeContext(c, objectBytes(c), holder, d, cipher, a, b)
+}
+func (s *PVSSPairingFreeScheme) decryptionChallengeContext(c PVSSCommitment, context []byte, holder p2p.NodeID, d, cipher, a, b kyber.Point) kyber.Scalar {
 	statement := []string{string(holder), mustPointHex(s.h), mustPointHex(s.public[holder]), mustPointHex(d), mustPointHex(cipher), mustPointHex(a), mustPointHex(b)}
-	return oracleScalar(s.version+"/decrypt-dleq", objectBytes(c), []byte(c.SecretID), pvssEncode(statement))
+	return oracleScalar(s.version+"/decrypt-dleq", context, []byte(c.SecretID), pvssEncode(statement))
 }
 
 // Uniformly sample n-t field coefficients defining q(X) of degree < n-t.
@@ -700,6 +915,59 @@ func scalarFromHex(raw string) kyber.Scalar {
 	return s
 }
 
+// Verification-only multiplication. Every caller supplies published proof data;
+// key generation, sharing and decryption with secrets keep constant-time Mul.
+func publicPointMul(scalar kyber.Scalar, point kyber.Point) kyber.Point {
+	return publicPointResult(new(fasted.Point).ScalarMult(publicScalar(scalar), publicPoint(point)))
+}
+
+// Public proof equations share their doubling chain. Both inputs have already
+// passed canonical decoding and the complete prime-subgroup check. This path
+// is never used for private keys, secret polynomial coefficients or nonces.
+func publicPointDoubleMul(a kyber.Scalar, A kyber.Point, b kyber.Scalar, B kyber.Point) kyber.Point {
+	return publicPointResult(new(fasted.Point).VarTimeMultiScalarMult(
+		[]*fasted.Scalar{publicScalar(a), publicScalar(b)},
+		[]*fasted.Point{publicPoint(A), publicPoint(B)}))
+}
+
+// Compare the canonical result directly. Converting a public equation result
+// back through Kyber would decompress a point only to compare it immediately.
+// Inputs still come from complete canonical and prime-order validation.
+func publicPointDoubleMulEqual(a kyber.Scalar, A kyber.Point, b kyber.Scalar, B kyber.Point, want kyber.Point) bool {
+	result := new(fasted.Point).VarTimeMultiScalarMult(
+		[]*fasted.Scalar{publicScalar(a), publicScalar(b)},
+		[]*fasted.Point{publicPoint(A), publicPoint(B)})
+	return bytes.Equal(result.Bytes(), mustPointBytes(want))
+}
+
+func publicScalar(s kyber.Scalar) *fasted.Scalar {
+	raw, err := s.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	x, err := new(fasted.Scalar).SetCanonicalBytes(raw)
+	if err != nil {
+		panic(err)
+	}
+	return x
+}
+
+func publicPoint(p kyber.Point) *fasted.Point {
+	x, err := new(fasted.Point).SetBytes(mustPointBytes(p))
+	if err != nil {
+		panic(err)
+	}
+	return x
+}
+
+func publicPointResult(p *fasted.Point) kyber.Point {
+	x := suite().Point()
+	if err := x.UnmarshalBinary(p.Bytes()); err != nil {
+		panic(err)
+	}
+	return x
+}
+
 func pointFromHex(raw string) (kyber.Point, error) {
 	if len(raw) != 64 {
 		return nil, errors.New("PVSS point must have a 32-byte encoding")
@@ -708,26 +976,25 @@ func pointFromHex(raw string) (kyber.Point, error) {
 	if err != nil || hex.EncodeToString(b) != raw {
 		return nil, errors.New("noncanonical PVSS point hex encoding")
 	}
-	group := suite()
-	p := group.Point()
-	if err := p.UnmarshalBinary(b); err != nil {
+	native, err := new(fasted.Point).SetBytes(b)
+	if err != nil {
 		return nil, err
 	}
-	canonical, err := p.MarshalBinary()
-	if err != nil || !bytes.Equal(b, canonical) {
+	if !bytes.Equal(b, native.Bytes()) {
 		return nil, errors.New("noncanonical PVSS curve point")
 	}
 	// Small-order rejection alone would miss subgroup points with added torsion.
 	// Multiply by the INTEGER order, not a scalar reduced modulo that order.
-	acc := group.Point().Null()
-	for i := 252; i >= 0; i-- {
-		acc.Add(acc, acc)
-		if pvssGroupOrder[i/8]&(1<<uint(i%8)) != 0 {
-			acc.Add(acc, p)
-		}
-	}
-	if !acc.Equal(group.Point().Null()) {
+	acc := new(fasted.Point).ScalarMult(publicScalar(pvssOrderMinusOne), native)
+	acc.Add(acc, native)
+	if acc.Equal(fasted.NewIdentityPoint()) != 1 {
 		return nil, errors.New("PVSS point is outside the prime-order subgroup")
+	}
+	// Convert once for the existing Kyber interfaces, after canonicality and
+	// the full integer-order test. Re-encoding through Kyber repeats an inverse.
+	p := suite().Point()
+	if err := p.UnmarshalBinary(b); err != nil {
+		return nil, err
 	}
 	return p, nil
 }
@@ -737,8 +1004,10 @@ func (s *PVSSPairingFreeScheme) pointFromHex(raw string) (kyber.Point, error) {
 	p := s.points[raw]
 	s.cacheMu.RUnlock()
 	if p != nil {
+		s.pointHits.Add(1)
 		return p.Clone(), nil
 	}
+	s.pointMisses.Add(1)
 	p, err := pointFromHex(raw)
 	if err != nil {
 		return nil, err

@@ -1,6 +1,7 @@
 package spurt
 
 import (
+	"Tyche/utils/cryptoexec"
 	"crypto/ed25519"
 	"encoding/hex"
 	"sync/atomic"
@@ -301,9 +302,9 @@ func (s *countingPVSSScheme) PreReconTrusted(asig.PVSSCommitment, p2p.NodeID) (a
 	return asig.PVSSDecryptedShare{}, nil
 }
 
-func (s *countingPVSSScheme) VerifyShare(asig.PVSSCommitment, asig.PVSSDecryptedShare) bool {
+func (s *countingPVSSScheme) VerifyShare(_ asig.PVSSCommitment, share asig.PVSSDecryptedShare) bool {
 	s.verifyShares.Add(1)
-	return true
+	return share.Value != "invalid"
 }
 
 func (s *countingPVSSScheme) Recon(asig.PVSSCommitment, []asig.PVSSDecryptedShare, int) ([]byte, error) {
@@ -343,5 +344,55 @@ func TestHandleReconStopsVerifyingAfterThreshold(t *testing.T) {
 
 	if got, want := pvss.verifyShares.Load(), int32(2); got != want {
 		t.Fatalf("VerifyShare calls = %d, want %d", got, want)
+	}
+}
+
+func TestParallelReconRefillsInvalidCandidateAndReservesOwnShare(t *testing.T) {
+	n, es, _ := beaconTestNode(t)
+	n.Crypto = cryptoexec.New(2)
+	es.reconLocalPending = true
+	entered, release, drained := make(chan struct{}, 2), make(chan struct{}), make(chan struct{})
+	for i := 0; i < 2; i++ {
+		n.Crypto.Go(t.Context(), func() { entered <- struct{}{}; <-release })
+	}
+	<-entered
+	<-entered
+	for _, id := range []p2p.NodeID{"n1", "n2", "n3"} {
+		msg := ReconMessage{Epoch: 0, Digest: "digest", Share: asig.PVSSDecryptedShare{CommitmentID: "aggregate", Holder: id}}
+		if id == "n1" {
+			bad := msg
+			bad.Share.Value = "invalid"
+			n.handleRecon(bad, id)
+		}
+		n.handleRecon(msg, id)
+	}
+	n.mu.Lock()
+	if len(es.reconChecking) != 1 {
+		t.Error("surplus concurrent reconstruction checks", len(es.reconChecking))
+	}
+	n.mu.Unlock()
+	// Priority work and its invalid-candidate refill drain before this marker.
+	n.Crypto.Go(t.Context(), func() { close(drained) })
+	close(release)
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("candidate verification stalled")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		n.mu.Lock()
+		done := len(es.reconShares) == 1 && len(es.reconChecking) == 0
+		n.mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("invalid proof blocked honest threshold candidate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n.PVSS.(*countingPVSSScheme).verifyShares.Load() != 2 {
+		t.Fatal("did not stop at one valid foreign share")
 	}
 }

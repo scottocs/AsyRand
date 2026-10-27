@@ -22,6 +22,144 @@ type pvssFixture struct {
 	schemes map[p2p.NodeID]*PVSSPairingFreeScheme
 }
 
+func referenceIntegerOrder(p kyber.Point) kyber.Point {
+	acc := suite().Point().Null()
+	for i := 252; i >= 0; i-- {
+		acc.Add(acc, acc)
+		if pvssGroupOrder[i/8]&(1<<uint(i%8)) != 0 {
+			acc.Add(acc, p)
+		}
+	}
+	return acc
+}
+
+func TestSubgroupCheckMatchesIntegerOrderAcrossAllTorsionCosets(t *testing.T) {
+	stream := suite().XOF([]byte("subgroup differential test: public deterministic bytes"))
+	cosets := map[string]bool{}
+	checked := 0
+	for checked < 256 {
+		raw := make([]byte, 32)
+		stream.XORKeyStream(raw, raw)
+		point := suite().Point()
+		if point.UnmarshalBinary(raw) != nil {
+			continue
+		}
+		encoded := mustPointHex(point)
+		order := referenceIntegerOrder(point)
+		cosets[mustPointHex(order)] = true
+		_, err := pointFromHex(encoded)
+		if (err == nil) != order.Equal(suite().Point().Null()) {
+			t.Fatalf("optimized subgroup check changed acceptance for %s", encoded)
+		}
+		checked++
+	}
+	if len(cosets) != 8 {
+		t.Fatalf("test did not cover all eight torsion cosets: %d", len(cosets))
+	}
+}
+
+func TestPublicProofArithmeticMatchesKyber(t *testing.T) {
+	g := suite()
+	r := g.XOF([]byte("native public proof arithmetic differential test"))
+	for i := 0; i < 64; i++ {
+		a, b := g.Scalar().Pick(r), g.Scalar().Pick(r)
+		if i == 0 {
+			a.Zero()
+			b.One()
+		}
+		A, B := g.Point().Mul(g.Scalar().Pick(r), nil), g.Point().Mul(g.Scalar().Pick(r), nil)
+		want := g.Point().Add(g.Point().Mul(a, A), g.Point().Mul(b, B))
+		if !publicPointDoubleMul(a, A, b, B).Equal(want) || !publicPointMul(a, A).Equal(g.Point().Mul(a, A)) {
+			t.Fatal("native public arithmetic differs from Kyber", i)
+		}
+		beforeA, beforeB := mustPointHex(A), mustPointHex(B)
+		if !publicPointDoubleMulEqual(a, A, b, B, want) ||
+			publicPointDoubleMulEqual(a, A, b, B, g.Point().Add(want, pvssGeneratorG)) {
+			t.Fatal("direct public equation comparison changed acceptance", i)
+		}
+		if beforeA != mustPointHex(A) || beforeB != mustPointHex(B) {
+			t.Fatal("public equation comparison mutated an input", i)
+		}
+	}
+}
+
+func TestPreparedPVSSOwnsInputsAndReusesVerifiedPoints(t *testing.T) {
+	f := newALBATROSSFixture(t, 7, 3)
+	c, secret := f.sharing(t)
+	s := f.schemes[f.ids[0]]
+	v, valid := s.Prepare(c)
+	if !valid {
+		t.Fatal("honest object rejected")
+	}
+	parts := make([]PVSSDecryptedShare, 3)
+	for i := range parts {
+		holder := f.schemes[f.ids[i]]
+		prepared, ok := holder.Prepare(c)
+		if !ok {
+			t.Fatal("holder preparation failed")
+		}
+		var err error
+		parts[i], err = holder.PreReconPrepared(prepared, f.ids[i])
+		if err != nil || !s.VerifyPreparedShare(v, parts[i]) {
+			t.Fatal("honest share rejected", err)
+		}
+	}
+	if _, err := f.schemes[f.ids[1]].PreReconPrepared(v, f.ids[1]); err == nil {
+		t.Fatal("cross-owner handle accepted")
+	}
+	if _, err := s.ReconPrepared(v, parts, 2); err == nil {
+		t.Fatal("threshold downgrade accepted")
+	}
+	if _, err := s.ReconPrepared(v, []PVSSDecryptedShare{parts[0], parts[0], parts[1]}, 3); err == nil {
+		t.Fatal("duplicate holders accepted")
+	}
+	bad := parts[1]
+	bad.Proof.R = strings.Repeat("0", 64)
+	if s.VerifyPreparedShare(v, bad) {
+		t.Fatal("cached share accepted a changed proof")
+	}
+	bad = parts[1]
+	bad.Holder = "unknown"
+	if s.VerifyPreparedShare(v, bad) {
+		t.Fatal("unknown holder accepted")
+	}
+	resetPVSSBenchmarkCache(s, true)
+	before := s.WorkStats()
+	for i := 0; i < 4; i++ {
+		z, err := s.ReconPrepared(v, parts, 3)
+		if err != nil || !bytes.Equal(z, secret) {
+			t.Fatal("prepared reconstruction failed", err)
+		}
+	}
+	after := s.WorkStats()
+	if after["full_header_checks"] != before["full_header_checks"] || after["point_cache_misses"] != before["point_cache_misses"] {
+		t.Fatal("prepared reconstruction repeated object binding or point checks")
+	}
+	c.Cipher[f.ids[1]] = mustPointHex(suite().Point().Null())
+	if _, valid := s.Prepare(c); valid {
+		t.Fatal("mutated input accepted under old object ID")
+	}
+	c.SecretID = commitmentID(c)
+	if _, valid := s.Prepare(c); valid {
+		t.Fatal("mutated input accepted under a new object ID")
+	}
+	z, err := s.ReconPrepared(v, parts, 3)
+	if err != nil || !bytes.Equal(z, secret) {
+		t.Fatal("caller mutation changed immutable prepared object")
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !s.VerifyPreparedShare(v, parts[1]) {
+				t.Error("concurrent cache reuse failed")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func newPVSSFixture(t *testing.T, n, threshold int) pvssFixture {
 	t.Helper()
 	f := pvssFixture{keys: make(map[p2p.NodeID]PVSSKeyPair), public: make(map[p2p.NodeID]kyber.Point), schemes: make(map[p2p.NodeID]*PVSSPairingFreeScheme)}
@@ -61,6 +199,158 @@ func clonePVSS(t *testing.T, c PVSSCommitment) PVSSCommitment {
 		t.Fatal(err)
 	}
 	return cloned
+}
+
+func TestPublicInterpolationMatchesKyberForNonconsecutiveShares(t *testing.T) {
+	for _, threshold := range []int{1, 3, 6, 14} {
+		group := suite()
+		poly := share.NewPriPoly(group, threshold, nil, group.RandomStream())
+		all := poly.Commit(pvssGeneratorH).Shares(40)
+		parts := make([]*share.PubShare, threshold)
+		for i := range parts {
+			parts[i] = all[(i*3+7)%40]
+		}
+		want, err := share.RecoverCommit(group, parts, threshold, 40)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := recoverPVSSCommit(parts, threshold, 40)
+		if err != nil || !got.Equal(want) || !got.Equal(poly.Commit(pvssGeneratorH).Commit()) {
+			t.Fatal("parallel public interpolation differs from the reference", threshold, err)
+		}
+		if _, err = recoverPVSSCommit(append(parts, parts[0]), threshold+1, 40); err == nil {
+			t.Fatal("duplicate interpolation index accepted")
+		}
+	}
+}
+
+// Independent pre-c4 parser: Kyber canonical encoding and an integer-order
+// multiplication. It deliberately does not reuse the native decoder/check.
+func referenceCanonicalPVSSPoint(raw string) (kyber.Point, error) {
+	if len(raw) != 64 {
+		return nil, errors.New("length")
+	}
+	b, err := hex.DecodeString(raw)
+	if err != nil || hex.EncodeToString(b) != raw {
+		return nil, errors.New("hex")
+	}
+	p := suite().Point()
+	if err := p.UnmarshalBinary(b); err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(mustPointBytes(p), b) {
+		return nil, errors.New("encoding")
+	}
+	if !referenceIntegerOrder(p).Equal(suite().Point().Null()) {
+		return nil, errors.New("subgroup")
+	}
+	return p, nil
+}
+
+func TestNativeCanonicalDecodeMatchesIndependentParser(t *testing.T) {
+	inputs := []string{"", strings.Repeat("00", 32), strings.Repeat("ff", 32),
+		"01" + strings.Repeat("00", 31), "01" + strings.Repeat("00", 30) + "80",
+		mustPointHex(pvssGeneratorG), strings.ToUpper(mustPointHex(pvssGeneratorG)), mustPointHex(pvssGeneratorH) + "00"}
+	r := suite().XOF([]byte("canonical decoder differential bytes"))
+	for i := 0; i < 384; i++ {
+		b := make([]byte, 32)
+		r.XORKeyStream(b, b)
+		inputs = append(inputs, hex.EncodeToString(b))
+	}
+	for i, raw := range inputs {
+		want, oldErr := referenceCanonicalPVSSPoint(raw)
+		got, err := pointFromHex(raw)
+		if (oldErr == nil) != (err == nil) || (err == nil && !got.Equal(want)) {
+			t.Fatalf("decoder acceptance changed at case %d", i)
+		}
+	}
+}
+
+func TestJointPublicInterpolationMatchesIndependentPowersAndDoesNotMutate(t *testing.T) {
+	g := suite()
+	r := g.XOF([]byte("batch inverse and joint interpolation differential"))
+	for _, threshold := range []int{1, 3, 6, 9, 14, 21} {
+		parts := make([]*share.PubShare, threshold)
+		before := make([]string, threshold)
+		for i := range parts {
+			parts[i] = &share.PubShare{I: (i*7 + 3) % 80, V: g.Point().Mul(g.Scalar().Pick(r), pvssGeneratorH)}
+			before[i] = mustPointHex(parts[i].V)
+		}
+		want, err := share.RecoverCommit(g, parts, threshold, 80)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for worker := 0; worker < 8; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got, err := recoverPVSSCommit(parts, threshold, 80)
+				if err != nil || !got.Equal(want) {
+					t.Errorf("joint interpolation changed value for t=%d: %v", threshold, err)
+				}
+			}()
+		}
+		wg.Wait()
+		for i, p := range parts {
+			if mustPointHex(p.V) != before[i] {
+				t.Fatal("interpolation mutated input", threshold, i)
+			}
+		}
+	}
+}
+
+func TestParallelALBATROSSDecryptionEquationsMatchSequentialReference(t *testing.T) {
+	f := newALBATROSSFixture(t, 7, 3)
+	c, _ := f.sharing(t)
+	s := f.schemes[f.ids[0]]
+	v, ok := s.Prepare(c)
+	if !ok {
+		t.Fatal("prepare")
+	}
+	sh, err := f.schemes[f.ids[1]].PreReconTrusted(c, f.ids[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []PVSSDecryptedShare{sh}
+	for _, field := range []string{"A", "B", "R", "Value", "Holder", "ID", "C"} {
+		bad := sh
+		switch field {
+		case "A":
+			bad.Proof.A = mustPointHex(suite().Point().Null())
+		case "B":
+			bad.Proof.B = mustPointHex(suite().Point().Null())
+		case "R":
+			bad.Proof.R = strings.Repeat("00", 32)
+		case "Value":
+			bad.Value = mustPointHex(suite().Point().Null())
+		case "Holder":
+			bad.Holder = f.ids[2]
+		case "ID":
+			bad.CommitmentID = "other"
+		case "C":
+			bad.Proof.C = strings.Repeat("00", 32)
+		}
+		cases = append(cases, bad)
+	}
+	for i, input := range cases {
+		want := false
+		if input.CommitmentID == c.SecretID && input.Proof.C == "" && s.public[input.Holder] != nil {
+			d, e1 := referenceCanonicalPVSSPoint(input.Value)
+			cipher, e2 := referenceCanonicalPVSSPoint(c.Cipher[input.Holder])
+			a, e3 := referenceCanonicalPVSSPoint(input.Proof.A)
+			b, e4 := referenceCanonicalPVSSPoint(input.Proof.B)
+			z := scalarFromHex(input.Proof.R)
+			if e1 == nil && e2 == nil && e3 == nil && e4 == nil && z != nil {
+				e := s.decryptionChallenge(c, input.Holder, d, cipher, a, b)
+				g := suite()
+				want = g.Point().Add(g.Point().Mul(z, s.h), g.Point().Mul(e, s.public[input.Holder])).Equal(a) && g.Point().Add(g.Point().Mul(z, d), g.Point().Mul(e, cipher)).Equal(b)
+			}
+		}
+		if got := s.VerifyPreparedShare(v, input); got != want || got != (i == 0) {
+			t.Fatal("parallel equation acceptance differs", i, got, want)
+		}
+	}
 }
 
 func TestPVSSVerifyPreReconAndRecon(t *testing.T) {

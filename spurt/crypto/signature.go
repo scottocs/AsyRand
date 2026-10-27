@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/verification"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -22,7 +23,9 @@ func GenerateKeyPair() (KeyPair, error) {
 
 func Sign(priv ed25519.PrivateKey, msg []byte) []byte {
 	digest := sha256.Sum256(msg)
-	return ed25519.Sign(priv, digest[:])
+	var signature []byte
+	cryptoexec.WithCPUGroupFast(func() { signature = ed25519.Sign(priv, digest[:]) })
+	return signature
 }
 
 func Verify(pub ed25519.PublicKey, msg, sig []byte, caches ...*verification.Cache) bool {

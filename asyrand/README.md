@@ -113,6 +113,16 @@ An estimated 16 MiB outgoing-queue watermark pauses only production beyond the
 current and successor columns. This is producer backpressure, not a hard memory
 bound on all retained history or protocol queues.
 
+PVSS verification checks canonical prime-order points using `[(l-1)]P + P`.
+The multiplier is the canonical integer `l-1`, so the result equals `[l]P`
+even for mixed-order points. Variable-time arithmetic is confined to public
+verification inputs; operations involving private scalars keep constant-time
+multiplication. A scheme-bound `VerifiedPVSS` handle owns a deep copy of a
+checked object, its context bytes and decoded ciphertext points. Consumption
+reuses this immutable binding and exact checked share proofs/points, avoiding
+full-object hashing and subgroup checks repeated during reconstruction. Public
+verification constructs fresh, independent scheme-local handles.
+
 `protocol.NewVerifier`, `AddColumn`, `Initialize`, `CheckEntry`, `Apply` and
 `VerifyHistory` need public keys only. Verification replays genesis, decisions,
 RBC delivery, PVSS, selection/RSQ, reconstruction and implicit column advancement. Its
@@ -369,3 +379,33 @@ Caches are not shared between committee members. A new independent public
 history verifier starts with an empty cache and performs its own checks. The
 success cache grows with retained evidence and is released with its node/verifier;
 it is not the bounded point-decoding memo. Signature requirements are unchanged.
+
+## Adaptive production admission
+
+`adaptive_production_window` defaults to false. When enabled,
+`production_window_min` (at least 2) and `production_window` bound a local
+production target. Startup filling does not shrink that target. Three fully
+supplied column transitions and at least three complete successor columns in
+reserve are required to reduce it by one, retaining two successors after the
+decrease. Persistent excess inventory can reduce the target even when queues
+drain between reviews. A thin reserve with
+idle workers grows it slowly; a non-genesis fallback restores one position.
+Queue emptiness alone is insufficient to infer spare worker capacity.
+Current/successor work stays enabled.
+Current-column validation is scheduled ahead of speculative validation.
+
+The configured maximum remains the peer-message horizon. Shrinking the local
+target neither discards accepted evidence nor cancels admitted work. Nodes may
+have different local targets; quorum, ABA decisions, reconstruction thresholds,
+RSQ capacity and predecessor/look-ahead barriers are unchanged. Checkpoints
+record the actual target, its observed bounds and adjustment counters. This
+controller is opt-in; its performance must be measured against the fixed target.
+
+Public verification arithmetic uses `filippo.io/edwards25519` with canonical
+encodings identical to Kyber. Double-scalar proof equations share a doubling
+chain; the complete integer-order subgroup check is retained. Secret-key,
+polynomial and nonce operations keep the original constant-time `Mul` path.
+ALBATROSS generation, verification and public interpolation can use bounded
+independent partitions via `TYCHE_CRYPTO_PARALLELISM=2`. Cold-verification
+microbenchmarks clear both decoded-point and successful-proof caches; the
+warm-decoding variant still executes every proof, retaining only decoded points.

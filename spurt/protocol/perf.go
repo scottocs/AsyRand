@@ -6,8 +6,10 @@ import (
 )
 
 type PerfMetrics struct {
-	pvssShareNs    atomic.Int64
-	pvssShareCount atomic.Uint64
+	pvssInputVerifyCount atomic.Uint64
+	pvssReconVerifyCount atomic.Uint64
+	pvssShareNs          atomic.Int64
+	pvssShareCount       atomic.Uint64
 
 	pvssVerifyNs    atomic.Int64
 	pvssVerifyCount atomic.Uint64
@@ -29,6 +31,8 @@ type PerfMetrics struct {
 }
 
 type PerfSnapshot struct {
+	PVSSInputVerifyCount uint64
+	PVSSReconVerifyCount uint64
 	// Legacy output fields remain zero: ordinary messages have no outer signatures.
 	MessageSignCount   uint64
 	MessageSignTotal   time.Duration
@@ -87,26 +91,30 @@ func (p *PerfMetrics) addBeaconVerify(d time.Duration) {
 
 func (p *PerfMetrics) Snapshot() PerfSnapshot {
 	return PerfSnapshot{
-		PVSSShareCount:    p.pvssShareCount.Load(),
-		PVSSShareTotal:    time.Duration(p.pvssShareNs.Load()),
-		PVSSVerifyCount:   p.pvssVerifyCount.Load(),
-		PVSSVerifyTotal:   time.Duration(p.pvssVerifyNs.Load()),
-		PVSSPreReconCount: p.pvssPreReconCount.Load(),
-		PVSSPreReconTotal: time.Duration(p.pvssPreReconNs.Load()),
-		PVSSReconCount:    p.pvssReconCount.Load(),
-		PVSSReconTotal:    time.Duration(p.pvssReconNs.Load()),
-		AgreementCount:    p.agreementCount.Load(),
-		AgreementTotal:    time.Duration(p.agreementNs.Load()),
-		BeaconSignCount:   p.beaconSignCount.Load(),
-		BeaconSignTotal:   time.Duration(p.beaconSignNs.Load()),
-		BeaconVerifyCount: p.beaconVerifyCount.Load(),
-		BeaconVerifyTotal: time.Duration(p.beaconVerifyNs.Load()),
+		PVSSInputVerifyCount: p.pvssInputVerifyCount.Load(),
+		PVSSReconVerifyCount: p.pvssReconVerifyCount.Load(),
+		PVSSShareCount:       p.pvssShareCount.Load(),
+		PVSSShareTotal:       time.Duration(p.pvssShareNs.Load()),
+		PVSSVerifyCount:      p.pvssVerifyCount.Load(),
+		PVSSVerifyTotal:      time.Duration(p.pvssVerifyNs.Load()),
+		PVSSPreReconCount:    p.pvssPreReconCount.Load(),
+		PVSSPreReconTotal:    time.Duration(p.pvssPreReconNs.Load()),
+		PVSSReconCount:       p.pvssReconCount.Load(),
+		PVSSReconTotal:       time.Duration(p.pvssReconNs.Load()),
+		AgreementCount:       p.agreementCount.Load(),
+		AgreementTotal:       time.Duration(p.agreementNs.Load()),
+		BeaconSignCount:      p.beaconSignCount.Load(),
+		BeaconSignTotal:      time.Duration(p.beaconSignNs.Load()),
+		BeaconVerifyCount:    p.beaconVerifyCount.Load(),
+		BeaconVerifyTotal:    time.Duration(p.beaconVerifyNs.Load()),
 	}
 }
 
 func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 	return PerfSnapshot{
-		MessageSignCount: s.MessageSignCount + o.MessageSignCount, MessageSignTotal: s.MessageSignTotal + o.MessageSignTotal,
+		PVSSInputVerifyCount: s.PVSSInputVerifyCount + o.PVSSInputVerifyCount,
+		PVSSReconVerifyCount: s.PVSSReconVerifyCount + o.PVSSReconVerifyCount,
+		MessageSignCount:     s.MessageSignCount + o.MessageSignCount, MessageSignTotal: s.MessageSignTotal + o.MessageSignTotal,
 		MessageVerifyCount: s.MessageVerifyCount + o.MessageVerifyCount, MessageVerifyTotal: s.MessageVerifyTotal + o.MessageVerifyTotal,
 		PVSSShareCount:    s.PVSSShareCount + o.PVSSShareCount,
 		PVSSShareTotal:    s.PVSSShareTotal + o.PVSSShareTotal,
@@ -127,7 +135,9 @@ func (s PerfSnapshot) Add(o PerfSnapshot) PerfSnapshot {
 
 func (s PerfSnapshot) Sub(o PerfSnapshot) PerfSnapshot {
 	return PerfSnapshot{
-		MessageSignCount: s.MessageSignCount - o.MessageSignCount, MessageSignTotal: s.MessageSignTotal - o.MessageSignTotal,
+		PVSSInputVerifyCount: s.PVSSInputVerifyCount - o.PVSSInputVerifyCount,
+		PVSSReconVerifyCount: s.PVSSReconVerifyCount - o.PVSSReconVerifyCount,
+		MessageSignCount:     s.MessageSignCount - o.MessageSignCount, MessageSignTotal: s.MessageSignTotal - o.MessageSignTotal,
 		MessageVerifyCount: s.MessageVerifyCount - o.MessageVerifyCount, MessageVerifyTotal: s.MessageVerifyTotal - o.MessageVerifyTotal,
 		PVSSShareCount:    s.PVSSShareCount - o.PVSSShareCount,
 		PVSSShareTotal:    s.PVSSShareTotal - o.PVSSShareTotal,

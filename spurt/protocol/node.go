@@ -23,6 +23,7 @@ var errEpochTimeout = errors.New("epoch timeout")
 const sendTimeout = 20 * time.Second
 
 type Node struct {
+	ctx       context.Context
 	checks    *verification.Cache
 	ID        p2p.NodeID
 	Keys      asig.KeyPair
@@ -97,6 +98,11 @@ type pendingPrivateData struct {
 	from p2p.NodeID
 }
 
+type commitCandidate struct {
+	commit asig.PVSSCommitment
+	key    verification.Key
+}
+
 type pendingVote struct {
 	stage string
 	msg   VoteMessage
@@ -140,9 +146,12 @@ type epochState struct {
 	// leader. SPURT has no producer-consumer queue: one dealer contributes at
 	// most one PVSS commitment per leader/epoch, and the leader aggregates one
 	// deterministic set after collecting t inputs.
-	commits         map[p2p.NodeID]asig.PVSSCommitment
-	preAggregating  bool
-	selectedColumns map[p2p.NodeID][]asig.PVSSColumnEntry
+	commits          map[p2p.NodeID]asig.PVSSCommitment
+	commitChecking   map[p2p.NodeID]verification.Key
+	commitCandidates map[p2p.NodeID][]commitCandidate
+	commitOrder      []p2p.NodeID
+	preAggregating   bool
+	selectedColumns  map[p2p.NodeID][]asig.PVSSColumnEntry
 	// Private data can arrive before the public proposal on an asynchronous
 	// transport. Buffer it until Aggregate is known, then validate it against the
 	// digest-bound public proposal.
@@ -155,10 +164,14 @@ type epochState struct {
 	// both public aggregate consistency and its private column proof pass.
 	privateVerified bool
 
-	reconShares  map[p2p.NodeID]asig.PVSSDecryptedShare
-	reconSent    bool
-	pendingRecon []ReconMessage
-	secret       []byte
+	reconShares       map[p2p.NodeID]asig.PVSSDecryptedShare
+	reconSent         bool
+	reconLocalPending bool
+	reconChecking     map[p2p.NodeID]ReconMessage
+	reconCandidates   map[p2p.NodeID][]ReconMessage
+	reconOrder        []p2p.NodeID
+	pendingRecon      []ReconMessage
+	secret            []byte
 
 	random         []byte
 	randomHash     string
@@ -228,6 +241,7 @@ func (n *Node) Start(ctx context.Context) error {
 }
 
 func (n *Node) StartProtocol(ctx context.Context) {
+	n.ctx = ctx
 	go n.dispatch(ctx)
 }
 
@@ -453,20 +467,20 @@ func (n *Node) dispatchSpurt(msg p2p.Message) {
 		if !ok || body.Dealer != msg.From {
 			return
 		}
-		n.Crypto.Go(context.Background(), func() { n.handleCommit(epoch, body) })
+		n.queueCommit(epoch, body)
 	case "PROPOSAL":
 		body, err := p2p.DecodePayload[AgreementMessage](msg)
 		if err != nil || body.Leader != msg.From {
 			return
 		}
-		n.Crypto.Go(context.Background(), func() { n.handleProposal(body) })
+		n.Crypto.GoPriority(n.workContext(), func() { p2p.BenchmarkTask("proposal-verify", func() { n.handleProposal(body) }) })
 	case "PVSS_DATA":
 		body, err := p2p.DecodePayload[PrivateDataMessage](msg)
 		if err != nil {
 			return
 		}
 		from := msg.From
-		n.Crypto.Go(context.Background(), func() { n.handlePrivateData(body, from) })
+		n.Crypto.GoPriority(n.workContext(), func() { p2p.BenchmarkTask("private-data-verify", func() { n.handlePrivateData(body, from) }) })
 	case "PREPARE", "PRECOMMIT", "COMMIT", "FINALIZE":
 		body, err := p2p.DecodePayload[VoteMessage](msg)
 		if err != nil {
@@ -479,14 +493,14 @@ func (n *Node) dispatchSpurt(msg p2p.Message) {
 			return
 		}
 		from := msg.From
-		n.Crypto.Go(context.Background(), func() { n.handleRecon(body, from) })
+		n.Crypto.GoPriority(n.workContext(), func() { p2p.BenchmarkTask("recon-handle", func() { n.handleRecon(body, from) }) })
 	case "BEACON":
 		body, err := p2p.DecodePayload[BeaconMessage](msg)
 		if err != nil {
 			return
 		}
 		from := msg.From
-		n.Crypto.Go(context.Background(), func() { n.handleBeacon(body, from) })
+		n.Crypto.GoPriority(n.workContext(), func() { p2p.BenchmarkTask("beacon-verify", func() { n.handleBeacon(body, from) }) })
 	}
 }
 
@@ -497,11 +511,21 @@ func (n *Node) handleCommit(epoch uint64, commit asig.PVSSCommitment) {
 	if commit.Dealer == "" || commit.Seq == 0 {
 		return
 	}
+	n.mu.Lock()
+	es := n.stateAtLocked(epoch)
+	obsolete := es == nil || es.proposalBroadcast || es.proposing || es.commits == nil || es.commits[commit.Dealer].Dealer != ""
+	n.mu.Unlock()
+	if obsolete {
+		return
+	}
+	if n.Perf != nil {
+		n.Perf.pvssInputVerifyCount.Add(1)
+	}
 	if !n.PVSS.Verify(commit) {
 		return
 	}
 	n.mu.Lock()
-	es := n.stateAtLocked(epoch)
+	es = n.stateAtLocked(epoch)
 	if es == nil || es.proposalBroadcast || es.proposing || es.commits == nil {
 		n.mu.Unlock()
 		return
@@ -513,6 +537,102 @@ func (n *Node) handleCommit(epoch uint64, commit asig.PVSSCommitment) {
 	es.commits[commit.Dealer] = commit
 	n.mu.Unlock()
 	n.tick(epoch)
+}
+
+func (n *Node) workContext() context.Context {
+	if n.ctx != nil {
+		return n.ctx
+	}
+	return context.Background()
+}
+
+func (n *Node) queueCommit(epoch uint64, commit asig.PVSSCommitment) {
+	if !n.epochAllowed(epoch) || n.State.Leader(epoch) != n.ID || !n.State.IsMember(commit.Dealer) || commit.Seq == 0 {
+		return
+	}
+	key := verification.JSONKey("spurt/input-candidate", epoch, commit)
+	n.mu.Lock()
+	es := n.stateAtLocked(epoch)
+	if es == nil || es.proposalBroadcast || es.proposing || es.commits[commit.Dealer].Dealer != "" {
+		n.mu.Unlock()
+		return
+	}
+	if es.commitCandidates == nil {
+		es.commitCandidates = make(map[p2p.NodeID][]commitCandidate)
+		es.commitChecking = make(map[p2p.NodeID]verification.Key)
+	}
+	if active, ok := es.commitChecking[commit.Dealer]; ok && active == key {
+		n.mu.Unlock()
+		return
+	}
+	pending := es.commitCandidates[commit.Dealer]
+	for _, candidate := range pending {
+		if candidate.key == key {
+			n.mu.Unlock()
+			return
+		}
+	}
+	if len(pending) < 32 {
+		if len(pending) == 0 {
+			es.commitOrder = append(es.commitOrder, commit.Dealer)
+		}
+		es.commitCandidates[commit.Dealer] = append(pending, commitCandidate{commit, key})
+	}
+	n.mu.Unlock()
+	n.scheduleCommits(es)
+}
+
+func (n *Node) scheduleCommits(es *epochState) {
+	n.mu.Lock()
+	if es.proposalBroadcast || es.proposing {
+		n.mu.Unlock()
+		return
+	}
+	var jobs []func()
+	for _, id := range es.commitOrder {
+		if len(es.commits)+len(es.commitChecking) >= n.State.Threshold() {
+			break
+		}
+		if _, active := es.commitChecking[id]; active || es.commits[id].Dealer != "" || len(es.commitCandidates[id]) == 0 {
+			continue
+		}
+		candidate := es.commitCandidates[id][0]
+		es.commitCandidates[id] = es.commitCandidates[id][1:]
+		es.commitChecking[id] = candidate.key
+		jobs = append(jobs, func() {
+			defer n.finishCommitCandidate(es, id, candidate.key)
+			p2p.BenchmarkTask("pvss-verify", func() { n.handleCommit(es.epoch, candidate.commit) })
+		})
+	}
+	kept := es.commitOrder[:0]
+	for _, id := range es.commitOrder {
+		if len(es.commitCandidates[id]) > 0 && es.commits[id].Dealer == "" {
+			kept = append(kept, id)
+		}
+	}
+	es.commitOrder = kept
+	n.mu.Unlock()
+	for _, job := range jobs {
+		if es.epoch == n.State.CurrentEpoch() {
+			n.Crypto.GoPriority(n.workContext(), job)
+		} else {
+			n.Crypto.Go(n.workContext(), job)
+		}
+	}
+}
+
+func (n *Node) finishCommitCandidate(es *epochState, id p2p.NodeID, key verification.Key) {
+	n.mu.Lock()
+	if active, ok := es.commitChecking[id]; !ok || active != key {
+		n.mu.Unlock()
+		return
+	}
+	delete(es.commitChecking, id)
+	if es.commits[id].Dealer != "" {
+		delete(es.commitCandidates, id)
+	}
+	n.mu.Unlock()
+	n.scheduleCommits(es)
 }
 
 func (n *Node) tick(epoch uint64) {
@@ -573,7 +693,7 @@ func (n *Node) maybePreAggregate(es *epochState) {
 	n.mu.Unlock()
 
 	members := n.State.MembersSnapshot()
-	n.Crypto.Go(context.Background(), func() {
+	n.Crypto.GoPriority(n.workContext(), func() {
 		n.finishPreAggregate(es, epoch, t, commitments, members)
 	})
 }
@@ -1008,58 +1128,121 @@ func (n *Node) handleRecon(msg ReconMessage, from p2p.NodeID) {
 	es := n.stateAtLocked(msg.Epoch)
 	if es == nil || es.aggregate == nil || es.digest != msg.Digest {
 		if es != nil {
-			es.pendingRecon = append(es.pendingRecon, msg)
+			duplicate, count := false, 0
+			for _, old := range es.pendingRecon {
+				if old.Share.Holder == from {
+					count++
+				}
+				duplicate = duplicate || old == msg
+			}
+			if !duplicate && count < 32 {
+				es.pendingRecon = append(es.pendingRecon, msg)
+			}
 		}
 		n.mu.Unlock()
 		return
 	}
-	t := n.State.Threshold()
-	if es.secret != nil || es.random != nil || es.reconstructing || len(es.reconShares) >= t || es.reconShares[from].CommitmentID != "" {
+	if es.secret != nil || es.random != nil || es.reconstructing || es.reconShares[from].CommitmentID != "" {
 		n.mu.Unlock()
 		return
 	}
-	aggregate := *es.aggregate
-	n.mu.Unlock()
-
-	start := time.Now()
-	okShare := n.PVSS.VerifyShare(aggregate, msg.Share)
-	if n.Perf != nil {
-		n.Perf.addVerify(time.Since(start))
+	if es.reconCandidates == nil {
+		es.reconCandidates = make(map[p2p.NodeID][]ReconMessage)
+		es.reconChecking = make(map[p2p.NodeID]ReconMessage)
 	}
-	if !okShare {
-		return
-	}
-	n.mu.Lock()
-	if es.secret != nil || es.random != nil || es.reconstructing || len(es.reconShares) >= t || es.reconShares[from].CommitmentID != "" {
+	if active, ok := es.reconChecking[from]; ok && active == msg {
 		n.mu.Unlock()
 		return
 	}
-	es.reconShares[from] = msg.Share
-	pending := es.pendingRecon
-	if len(pending) > 0 {
-		es.pendingRecon = nil
-	}
-	n.mu.Unlock()
-	for _, extra := range pending {
-		if extra.Digest != msg.Digest || extra.Epoch != msg.Epoch {
-			continue
-		}
-		n.mu.Lock()
-		if es.secret != nil || es.random != nil || es.reconstructing || len(es.reconShares) >= t || es.reconShares[extra.Share.Holder].CommitmentID != "" {
+	pending := es.reconCandidates[from]
+	for _, old := range pending {
+		if old == msg {
 			n.mu.Unlock()
-			continue
+			return
 		}
-		n.mu.Unlock()
-		if !n.PVSS.VerifyShare(aggregate, extra.Share) {
-			continue
-		}
-		n.mu.Lock()
-		if es.aggregate != nil && es.digest == msg.Digest && es.secret == nil && es.random == nil && !es.reconstructing && len(es.reconShares) < t {
-			es.reconShares[extra.Share.Holder] = extra.Share
-		}
-		n.mu.Unlock()
 	}
-	n.tick(msg.Epoch)
+	if len(pending) < 32 {
+		if len(pending) == 0 {
+			es.reconOrder = append(es.reconOrder, from)
+		}
+		es.reconCandidates[from] = append(pending, msg)
+	}
+	n.mu.Unlock()
+	n.scheduleRecon(es)
+}
+
+func (n *Node) scheduleRecon(es *epochState) {
+	n.mu.Lock()
+	if es.aggregate == nil || es.secret != nil || es.random != nil || es.reconstructing {
+		n.mu.Unlock()
+		return
+	}
+	needed := n.State.Threshold() - len(es.reconShares)
+	if es.reconLocalPending {
+		needed--
+	}
+	var jobs []func()
+	for _, id := range es.reconOrder {
+		if len(es.reconChecking) >= needed {
+			break
+		}
+		if _, active := es.reconChecking[id]; active || es.reconShares[id].CommitmentID != "" || len(es.reconCandidates[id]) == 0 {
+			continue
+		}
+		msg := es.reconCandidates[id][0]
+		es.reconCandidates[id] = es.reconCandidates[id][1:]
+		es.reconChecking[id] = msg
+		aggregate := *es.aggregate
+		jobs = append(jobs, func() {
+			defer n.finishReconCandidate(es, id, msg)
+			n.mu.Lock()
+			obsolete := es.secret != nil || es.random != nil || es.reconstructing || es.reconShares[id].CommitmentID != ""
+			n.mu.Unlock()
+			if obsolete {
+				return
+			}
+			start := time.Now()
+			ok := n.PVSS.VerifyShare(aggregate, msg.Share)
+			if n.Perf != nil {
+				n.Perf.addVerify(time.Since(start))
+				n.Perf.pvssReconVerifyCount.Add(1)
+			}
+			if !ok {
+				return
+			}
+			n.mu.Lock()
+			if es.digest == msg.Digest && es.secret == nil && es.random == nil && !es.reconstructing && len(es.reconShares) < n.State.Threshold() {
+				es.reconShares[id] = msg.Share
+			}
+			n.mu.Unlock()
+			n.tick(msg.Epoch)
+		})
+	}
+	kept := es.reconOrder[:0]
+	for _, id := range es.reconOrder {
+		if len(es.reconCandidates[id]) != 0 && es.reconShares[id].CommitmentID == "" {
+			kept = append(kept, id)
+		}
+	}
+	es.reconOrder = kept
+	n.mu.Unlock()
+	for _, job := range jobs {
+		n.Crypto.GoPriority(n.workContext(), func() { p2p.BenchmarkTask("recon-share-verify", job) })
+	}
+}
+
+func (n *Node) finishReconCandidate(es *epochState, id p2p.NodeID, msg ReconMessage) {
+	n.mu.Lock()
+	if active, ok := es.reconChecking[id]; !ok || active != msg {
+		n.mu.Unlock()
+		return
+	}
+	delete(es.reconChecking, id)
+	if es.reconShares[id].CommitmentID != "" {
+		delete(es.reconCandidates, id)
+	}
+	n.mu.Unlock()
+	n.scheduleRecon(es)
 }
 
 func (n *Node) tryReconstruct(es *epochState) {
@@ -1076,10 +1259,13 @@ func (n *Node) tryReconstruct(es *epochState) {
 
 	if !es.reconSent {
 		es.reconSent = true
+		es.reconLocalPending = true
 		aggregate := *es.aggregate
 		epoch := es.epoch
 		digest := es.digest
-		n.Crypto.Go(context.Background(), func() { n.broadcastRecon(epoch, digest, aggregate) })
+		n.Crypto.GoPriority(n.workContext(), func() {
+			p2p.BenchmarkTask("recon-share-generate", func() { n.broadcastRecon(epoch, digest, aggregate) })
+		})
 	}
 
 	if es.random != nil {
@@ -1104,7 +1290,7 @@ func (n *Node) tryReconstruct(es *epochState) {
 		aggregate := *es.aggregate
 		epoch := es.epoch
 		n.mu.Unlock()
-		n.Crypto.Go(context.Background(), func() {
+		n.Crypto.GoPriority(n.workContext(), func() {
 			start := time.Now()
 			recovered, err := n.PVSS.ReconTrusted(aggregate, decrypted, t)
 			if n.Perf != nil {
@@ -1142,6 +1328,18 @@ func (n *Node) broadcastRecon(epoch uint64, digest string, c asig.PVSSCommitment
 	if n.Perf != nil {
 		n.Perf.addPreRecon(time.Since(start))
 	}
+	n.mu.Lock()
+	es := n.stateAtLocked(epoch)
+	if es != nil && es.digest == digest {
+		es.reconLocalPending = false
+		if err == nil && share.Holder == n.ID && share.CommitmentID == c.SecretID && es.secret == nil && es.random == nil && !es.reconstructing {
+			es.reconShares[n.ID] = share
+		}
+	}
+	n.mu.Unlock()
+	if es != nil {
+		n.scheduleRecon(es)
+	}
 	if err != nil {
 		return
 	}
@@ -1150,6 +1348,7 @@ func (n *Node) broadcastRecon(epoch uint64, digest string, c asig.PVSSCommitment
 		Digest: digest,
 		Share:  share,
 	})
+	n.tick(epoch)
 }
 
 // A locally reconstructed output is delivered before collecting BEACON

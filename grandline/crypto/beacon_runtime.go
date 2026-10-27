@@ -1,11 +1,14 @@
 package crypto
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"sync"
 
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
+	"Tyche/utils/pairing"
 	"Tyche/utils/verification"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/share"
@@ -139,16 +142,29 @@ func (e *BeaconEpoch) verifyUncached(c *VerifiedBeaconCommitment, sh BeaconShare
 	if err != nil {
 		return nil, false
 	}
-	v, err := pointGTFromHex(sh.Sigma2)
+	// Equality to the canonical encoding of a computed pairing product below
+	// also proves GT subgroup membership. Do not decode the untrusted GT with
+	// another full subgroup exponentiation before checking the same equality.
+	if len(sh.Sigma2) != 2*suite().GT().Point().MarshalSize() {
+		return nil, false
+	}
+	wireGT, err := hex.DecodeString(sh.Sigma2)
 	if err != nil {
 		return nil, false
 	}
 	g := suite()
-	if !verifyBeaconDLEQWithCM1(g, e.msg, c.CM1, u, sh.Proof, e.gr, cache) {
-		return nil, false
-	}
-	right := g.PairProduct([2]kyber.Point{e.gr, c.CM2}, [2]kyber.Point{u, hPoint(g)})
-	if !v.Equal(right) {
+	var v kyber.Point
+	// These two complete checks depend only on immutable, decoded inputs.
+	// Splitting the last candidate lets both execution slots contribute even
+	// when an odd number of foreign shares is needed for the threshold.
+	if !cryptoexec.AllLabeled("share-verify", 2, func(i int) bool {
+		if i == 0 {
+			return verifyBeaconDLEQWithCM1(g, e.msg, c.CM1, u, sh.Proof, e.gr, cache)
+		}
+		v = g.PairProduct([2]kyber.Point{e.gr, c.CM2}, [2]kyber.Point{u, hPoint(g)})
+		canonical, err := v.MarshalBinary()
+		return err == nil && bytes.Equal(wireGT, canonical)
+	}) {
 		return nil, false
 	}
 	return &VerifiedBeaconShare{signer: sh.Signer, binding: e.binding, sigma: v}, true
@@ -182,7 +198,7 @@ func (e *BeaconEpoch) Recover(shares []*VerifiedBeaconShare, threshold int, memb
 	if len(points) < threshold {
 		return nil, "", errors.New("not enough bound verified shares")
 	}
-	sigma, err := share.RecoverCommit(suite().GT(), points, threshold, len(members))
+	sigma, err := pairing.RecoverCommit(suite().GT(), points, threshold, len(members))
 	if err != nil {
 		return nil, "", err
 	}

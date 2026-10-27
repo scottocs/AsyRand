@@ -69,14 +69,16 @@ type shareMessage struct {
 }
 
 type roundState struct {
-	crypto     *asig.BeaconEpoch
-	epoch      uint64
-	msg        []byte
-	shares     map[p2p.NodeID]*asig.VerifiedBeaconShare
-	verifying  map[p2p.NodeID]verification.Key
-	candidates map[p2p.NodeID][]shareCandidate
-	delivered  bool
-	recovering bool
+	crypto         *asig.BeaconEpoch
+	epoch          uint64
+	msg            []byte
+	shares         map[p2p.NodeID]*asig.VerifiedBeaconShare
+	verifying      map[p2p.NodeID]verification.Key
+	candidates     map[p2p.NodeID][]shareCandidate
+	candidateOrder []p2p.NodeID
+	localPending   bool
+	delivered      bool
+	recovering     bool
 }
 
 type shareCandidate struct {
@@ -184,7 +186,10 @@ func (n *Node) RunEpoch(ctx context.Context, timeout time.Duration) (*Beacon, er
 	st := n.ensureRoundState(key, epoch, msg)
 
 	signStart := time.Now()
-	share, verified, err := n.signer.Share(st.crypto)
+	var share asig.BeaconShare
+	var verified *asig.VerifiedBeaconShare
+	var err error
+	p2p.BenchmarkTask("share-generate", func() { share, verified, err = n.signer.Share(st.crypto) })
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +366,7 @@ func (n *Node) recordShare(st *roundState, payload shareMessage) {
 		return
 	}
 	n.roundMu.Unlock()
-	commitment, ok := n.commitmentFor(payload.Share.Signer)
+	_, ok := n.commitmentFor(payload.Share.Signer)
 	if !ok {
 		n.roundMu.Lock()
 		if !st.delivered && !st.recovering {
@@ -379,33 +384,69 @@ func (n *Node) recordShare(st *roundState, payload shareMessage) {
 		return
 	}
 	key := verification.JSONKey("grandline/candidate", payload)
-	if active, ok := st.verifying[payload.Share.Signer]; ok {
-		if active != key {
-			if st.candidates == nil {
-				st.candidates = make(map[p2p.NodeID][]shareCandidate)
-			}
-			pending := st.candidates[payload.Share.Signer]
-			duplicate := false
-			for _, old := range pending {
-				if old.key == key {
-					duplicate = true
-					break
-				}
-			}
-			// Authenticated peers cannot occupy another identity's slots. Bound
-			// equivocation by faulty senders without dropping the next candidate.
-			if !duplicate && len(pending) < 32 {
-				st.candidates[payload.Share.Signer] = append(pending, shareCandidate{payload, key})
-			}
-		}
+	if active, ok := st.verifying[payload.Share.Signer]; ok && active == key {
 		n.roundMu.Unlock()
 		return
 	}
-	st.verifying[payload.Share.Signer] = key
+	if st.candidates == nil {
+		st.candidates = make(map[p2p.NodeID][]shareCandidate)
+	}
+	pending := st.candidates[payload.Share.Signer]
+	for _, old := range pending {
+		if old.key == key {
+			n.roundMu.Unlock()
+			return
+		}
+	}
+	if len(pending) < 32 {
+		if len(pending) == 0 {
+			st.candidateOrder = append(st.candidateOrder, payload.Share.Signer)
+		}
+		st.candidates[payload.Share.Signer] = append(pending, shareCandidate{payload, key})
+	}
 	n.roundMu.Unlock()
-	n.Crypto.GoPriority(n.workContext(), func() {
-		n.verifyAndRecordShare(st, payload, commitment, key)
-	})
+	n.scheduleCandidates(st)
+}
+
+// Reserve one slot for the locally generated share and admit only enough
+// distinct foreign checks to reach the unchanged threshold. Surplus candidates
+// stay available; a failed proof frees a slot, including for that holder's next
+// candidate. No worker waits for another proof while occupying a worker slot.
+func (n *Node) scheduleCandidates(st *roundState) {
+	n.roundMu.Lock()
+	if st.delivered || st.recovering {
+		n.roundMu.Unlock()
+		return
+	}
+	needed := n.State.Threshold() - len(st.shares)
+	if st.localPending {
+		needed--
+	}
+	var jobs []func()
+	for _, id := range st.candidateOrder {
+		if len(st.verifying) >= needed {
+			break
+		}
+		if _, active := st.verifying[id]; active || st.shares[id] != nil || len(st.candidates[id]) == 0 {
+			continue
+		}
+		candidate := st.candidates[id][0]
+		st.candidates[id] = st.candidates[id][1:]
+		commitment := n.commitments[id]
+		st.verifying[id] = candidate.key
+		jobs = append(jobs, func() { n.verifyAndRecordShare(st, candidate.payload, commitment, candidate.key) })
+	}
+	kept := st.candidateOrder[:0]
+	for _, id := range st.candidateOrder {
+		if len(st.candidates[id]) != 0 && st.shares[id] == nil {
+			kept = append(kept, id)
+		}
+	}
+	st.candidateOrder = kept
+	n.roundMu.Unlock()
+	for _, job := range jobs {
+		n.Crypto.GoPriority(n.workContext(), job)
+	}
 }
 
 func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commitment *asig.VerifiedBeaconCommitment, key verification.Key) {
@@ -417,7 +458,9 @@ func (n *Node) verifyAndRecordShare(st *roundState, payload shareMessage, commit
 	}
 	n.roundMu.Unlock()
 	acceptStart := time.Now()
-	verified, ok := st.crypto.VerifyShare(commitment, payload.Share, n.checks)
+	var verified *asig.VerifiedBeaconShare
+	var ok bool
+	p2p.BenchmarkTask("share-verify", func() { verified, ok = st.crypto.VerifyShare(commitment, payload.Share, n.checks) })
 	if !ok {
 		return
 	}
@@ -445,6 +488,9 @@ func (n *Node) storeVerifiedShare(st *roundState, payload shareMessage, verified
 	}
 	parts := make([]*asig.VerifiedBeaconShare, 0, len(st.shares)+1)
 	st.shares[payload.Share.Signer] = verified
+	if payload.Share.Signer == n.ID {
+		st.localPending = false
+	}
 	for _, share := range st.shares {
 		parts = append(parts, share)
 	}
@@ -459,10 +505,14 @@ func (n *Node) storeVerifiedShare(st *roundState, payload shareMessage, verified
 	n.roundMu.Unlock()
 
 	if len(parts) < threshold {
+		n.scheduleCandidates(st)
 		return
 	}
 	recoverStart := time.Now()
-	random, signature, err := st.crypto.Recover(parts, threshold, n.State.MembersSnapshot())
+	var random []byte
+	var signature string
+	var err error
+	p2p.BenchmarkTask("reconstruct", func() { random, signature, err = st.crypto.Recover(parts, threshold, n.State.MembersSnapshot()) })
 	if n.Perf != nil {
 		n.Perf.addRecover(time.Since(recoverStart))
 	}
@@ -522,10 +572,11 @@ func (n *Node) ensureRoundState(key string, epoch uint64, msg []byte) *roundStat
 	var pending []shareMessage
 	if !exists {
 		st = &roundState{
-			epoch:  epoch,
-			msg:    msg,
-			shares: make(map[p2p.NodeID]*asig.VerifiedBeaconShare),
-			crypto: asig.NewBeaconEpoch(epoch, msg),
+			localPending: true,
+			epoch:        epoch,
+			msg:          msg,
+			shares:       make(map[p2p.NodeID]*asig.VerifiedBeaconShare),
+			crypto:       asig.NewBeaconEpoch(epoch, msg),
 		}
 		n.rounds[key] = st
 		pending = append(pending, n.pendingShares[key]...)
@@ -582,20 +633,9 @@ func (n *Node) finishCandidate(st *roundState, id p2p.NodeID, key verification.K
 		return
 	}
 	delete(st.verifying, id)
-	pending := st.candidates[id]
 	if st.delivered || st.recovering || st.shares[id] != nil {
 		delete(st.candidates, id)
-		n.roundMu.Unlock()
-		return
-	}
-	var next *shareCandidate
-	if len(pending) > 0 {
-		copy := pending[0]
-		next = &copy
-		st.candidates[id] = pending[1:]
 	}
 	n.roundMu.Unlock()
-	if next != nil {
-		n.recordShare(st, next.payload)
-	}
+	n.scheduleCandidates(st)
 }

@@ -33,7 +33,7 @@ func newALBATROSSFixture(t *testing.T, n, threshold int) pvssFixture {
 }
 
 func TestALBATROSSRoundTrip(t *testing.T) {
-	for _, param := range [][2]int{{1, 1}, {4, 1}, {4, 2}, {7, 3}, {4, 4}} {
+	for _, param := range [][2]int{{1, 1}, {4, 1}, {4, 2}, {7, 3}, {4, 4}, {40, 14}} {
 		t.Run(fmt.Sprintf("n=%d/t=%d", param[0], param[1]), func(t *testing.T) {
 			f := newALBATROSSFixture(t, param[0], param[1])
 			c, secret := f.sharing(t)

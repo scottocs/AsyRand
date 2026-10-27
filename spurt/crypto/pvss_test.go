@@ -2,11 +2,49 @@ package crypto
 
 import (
 	"bytes"
+	"fmt"
+	"maps"
 	"testing"
 
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
+
+// Run with TYCHE_CRYPTO_PARALLELISM=1 and =2 in separate processes. The
+// distributed benchmark still decides whether the shorter generation path
+// improves complete beacon latency under the shared CPU budget.
+func BenchmarkPVSSProduction(b *testing.B) {
+	for _, n := range []int{16, 31} {
+		b.Run(fmt.Sprintf("n%d", n), func(b *testing.B) {
+			ids := make([]p2p.NodeID, n)
+			keys := make(map[p2p.NodeID]PVSSKeyPair, n)
+			public := make(map[p2p.NodeID]kyber.Point, n)
+			for i := range ids {
+				ids[i] = p2p.NodeID(fmt.Sprintf("node%d", i))
+				keys[ids[i]] = PVSSKeyPairFromSeed([]byte(ids[i]))
+				public[ids[i]] = keys[ids[i]].Public
+			}
+			scheme, err := NewPVSSScheme(ids[0], (n-1)/3+1, keys[ids[0]].Private, public)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			var last PVSSCommitment
+			for i := 0; i < b.N; i++ {
+				cryptoexec.WithCPUGroup(func() { last, _, err = scheme.Share(ids[0], uint64(i+1), ids) })
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			if !scheme.Verify(last) {
+				b.Fatal("generated commitment failed complete verification")
+			}
+		})
+	}
+}
 
 func TestPVSSVerifyPreReconAndRecon(t *testing.T) {
 	ids := []p2p.NodeID{"n0", "n1", "n2", "n3"}
@@ -33,6 +71,19 @@ func TestPVSSVerifyPreReconAndRecon(t *testing.T) {
 	tampered.SecretID = commitmentID(tampered)
 	if dealer.Verify(tampered) {
 		t.Fatal("tampered pvss commitment verified")
+	}
+	// Every independent partition must reject a bad proof, including the
+	// last member rather than only the caller's first partition.
+	for _, id := range ids {
+		bad := commit
+		bad.DLEQ = maps.Clone(commit.DLEQ)
+		proof := bad.DLEQ[id]
+		proof.Response = "00"
+		bad.DLEQ[id] = proof
+		bad.SecretID = commitmentID(bad)
+		if dealer.Verify(bad) {
+			t.Fatalf("invalid DLEQ accepted for member %s", id)
+		}
 	}
 
 	shares := make([]PVSSDecryptedShare, 0, 2)
@@ -93,6 +144,15 @@ func TestPVSSAggregateRecon(t *testing.T) {
 	}
 	if !leader.Verify(aggregate) {
 		t.Fatal("valid aggregate commitment did not verify")
+	}
+	for _, id := range ids {
+		bad := aggregate
+		bad.Cipher = copyStringMap(aggregate.Cipher)
+		bad.Cipher[id] = "00"
+		bad.SecretID = commitmentID(bad)
+		if leader.Verify(bad) || verifyAggregate(bad) {
+			t.Fatalf("invalid aggregate point accepted for member %s", id)
+		}
 	}
 	column := make([]PVSSColumnEntry, 0, len(commits))
 	for _, c := range commits {

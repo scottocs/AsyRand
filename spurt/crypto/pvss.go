@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"Tyche/utils/cryptoexec"
 	"bytes"
 	"encoding/hex"
 	"errors"
@@ -196,16 +197,27 @@ func (s *PVSSPairingFreeScheme) Share(dealer p2p.NodeID, seq uint64, members []p
 	commit := make(map[p2p.NodeID]string, len(members))
 	cipher := make(map[p2p.NodeID]string, len(members))
 	proofs := make(map[p2p.NodeID]DLEQProof, len(members))
-	for i, member := range members {
-		pk := s.public[member]
-		if pk == nil {
+	for _, member := range members {
+		if s.public[member] == nil {
 			return PVSSCommitment{}, nil, fmt.Errorf("missing pvss public key for %s", member)
 		}
+	}
+	commitValues, cipherValues := make([]string, len(members)), make([]string, len(members))
+	proofValues := make([]DLEQProof, len(members))
+	cryptoexec.AllLabeled("pvss-share", len(members), func(i int) bool {
+		// Polynomial shares are already sampled. Each independent equation
+		// owns its arithmetic objects and a fresh random stream for its nonce;
+		// secret scalar multiplication follows the unchanged backend path.
+		group := suite()
+		member, pk := members[i], s.public[members[i]]
 		vj := group.G2().Point().Mul(shares[i].V, g1Point(group))
 		cj := group.G1().Point().Mul(shares[i].V, pk)
-		commit[member] = mustPointHex(vj)
-		cipher[member] = mustPointHex(cj)
-		proofs[member] = dleqProveShare(group, member, g1Point(group), pk, vj, cj, shares[i].V)
+		commitValues[i], cipherValues[i] = mustPointHex(vj), mustPointHex(cj)
+		proofValues[i] = dleqProveShare(group, member, g1Point(group), pk, vj, cj, shares[i].V)
+		return true
+	})
+	for i, member := range members {
+		commit[member], cipher[member], proofs[member] = commitValues[i], cipherValues[i], proofValues[i]
 	}
 	out := PVSSCommitment{
 		Dealer: dealer, Seq: seq, Threshold: s.threshold, Members: members,
@@ -242,10 +254,11 @@ func (s *PVSSPairingFreeScheme) verifySharingUncached(c PVSSCommitment) bool {
 		return false
 	}
 	members := normalizeMembers(c.Members)
-	group := suite()
 	// Section V-B: DLEQ establishes knowledge of each exponent. Once it
 	// verifies, the corresponding pairing consistency check is redundant.
-	for _, member := range members {
+	if !cryptoexec.AllLabeled("pvss-verify", len(members), func(i int) bool {
+		group := suite()
+		member := members[i]
 		pk := s.public[member]
 		if pk == nil {
 			return false
@@ -261,8 +274,11 @@ func (s *PVSSPairingFreeScheme) verifySharingUncached(c PVSSCommitment) bool {
 		if !s.dleqVerifyShare(group, member, g1Point(group), pk, vj, cj, c.DLEQ[member]) {
 			return false
 		}
+		return true
+	}) {
+		return false
 	}
-	return s.verifyRSDualCodeG2(group, c, members)
+	return s.verifyRSDualCodeG2(suite(), c, members)
 }
 
 func (s *PVSSPairingFreeScheme) Aggregate(dealer p2p.NodeID, seq uint64, commitments []PVSSCommitment, members []p2p.NodeID) (PVSSCommitment, error) {
@@ -291,20 +307,27 @@ func (s *PVSSPairingFreeScheme) AggregateTrusted(dealer p2p.NodeID, seq uint64, 
 			return PVSSCommitment{}, errors.New("trusted pvss commitment id mismatch")
 		}
 	}
-	group := suite()
 	commit := make(map[p2p.NodeID]string, len(members))
 	cipher := make(map[p2p.NodeID]string, len(members))
-	for _, member := range members {
+	// Each holder's public sums are independent. Workers write disjoint
+	// result slots; install the maps only after every partition has joined.
+	commitValues, cipherValues := make([]string, len(members)), make([]string, len(members))
+	memberErrors := make([]error, len(members))
+	valid := cryptoexec.AllLabeled("pvss-aggregate", len(members), func(i int) bool {
+		group := suite()
+		member := members[i]
 		var vSum kyber.Point
 		var cSum kyber.Point
 		for _, c := range commitments {
 			vj, err := s.pointG2FromHex(c.Commit[member])
 			if err != nil {
-				return PVSSCommitment{}, err
+				memberErrors[i] = err
+				return false
 			}
 			cj, err := s.pointG1FromHex(c.Cipher[member])
 			if err != nil {
-				return PVSSCommitment{}, err
+				memberErrors[i] = err
+				return false
 			}
 			if vSum == nil {
 				vSum = vj.Clone()
@@ -315,10 +338,23 @@ func (s *PVSSPairingFreeScheme) AggregateTrusted(dealer p2p.NodeID, seq uint64, 
 			}
 		}
 		if vSum == nil || cSum == nil {
-			return PVSSCommitment{}, errors.New("empty aggregate share")
+			memberErrors[i] = errors.New("empty aggregate share")
+			return false
 		}
-		commit[member] = mustPointHex(vSum)
-		cipher[member] = mustPointHex(cSum)
+		commitValues[i] = mustPointHex(vSum)
+		cipherValues[i] = mustPointHex(cSum)
+		return true
+	})
+	if !valid {
+		for _, err := range memberErrors {
+			if err != nil {
+				return PVSSCommitment{}, err
+			}
+		}
+		return PVSSCommitment{}, errors.New("invalid aggregate member")
+	}
+	for i, member := range members {
+		commit[member], cipher[member] = commitValues[i], cipherValues[i]
 	}
 	sources := make([]PVSSSource, 0, len(commitments))
 	for _, c := range commitments {
@@ -349,7 +385,7 @@ func (s *PVSSPairingFreeScheme) PreReconTrusted(c PVSSCommitment, holder p2p.Nod
 	if holder != s.id {
 		return PVSSDecryptedShare{}, fmt.Errorf("pvss scheme for %s cannot decrypt as %s", s.id, holder)
 	}
-	cipher, err := pointG1FromHex(c.Cipher[holder])
+	cipher, err := s.pointG1FromHex(c.Cipher[holder])
 	if err != nil {
 		return PVSSDecryptedShare{}, err
 	}
@@ -381,7 +417,12 @@ func (s *PVSSPairingFreeScheme) verifyShareUncached(c PVSSCommitment, sh PVSSDec
 	if err != nil {
 		return false
 	}
-	if !group.Pair(plain, g1Point(group)).Equal(group.Pair(h0Point(group), vj)) {
+	// Check the complete same pairing equation with one shared final
+	// exponentiation. Both decoded subgroup points are still required.
+	product := group.PairProduct(
+		[2]kyber.Point{plain, g1Point(group)},
+		[2]kyber.Point{group.G1().Point().Neg(h0Point(group)), vj})
+	if !product.Equal(group.GT().Point().Null()) {
 		return false
 	}
 	s.cacheMu.Lock()
@@ -422,7 +463,7 @@ func (s *PVSSPairingFreeScheme) ReconTrusted(c PVSSCommitment, shares []PVSSDecr
 		if !ok {
 			continue
 		}
-		plain, err := pointG1FromHex(sh.Value)
+		plain, err := s.pointG1FromHex(sh.Value)
 		if err != nil {
 			continue
 		}
@@ -463,8 +504,6 @@ func (s *PVSSPairingFreeScheme) verifyColumnUncached(holder p2p.NodeID, aggregat
 		return false
 	}
 	seen := make(map[string]struct{}, len(entries))
-	commitSum := group.G2().Point().Null()
-	cipherSum := group.G1().Point().Null()
 	for _, entry := range entries {
 		if entry.Source.Dealer == "" || entry.Source.SecretID == "" || entry.Source.Seq == 0 {
 			return false
@@ -477,6 +516,12 @@ func (s *PVSSPairingFreeScheme) verifyColumnUncached(holder p2p.NodeID, aggregat
 		if !aggregateHasSource(aggregate, entry.Source) {
 			return false
 		}
+	}
+	commits := make([]kyber.Point, len(entries))
+	ciphers := make([]kyber.Point, len(entries))
+	if !cryptoexec.AllLabeled("private-data-verify", len(entries), func(i int) bool {
+		entry := entries[i]
+		group := suite()
 		vj, err := s.pointG2FromHex(entry.Commit)
 		if err != nil {
 			return false
@@ -493,8 +538,16 @@ func (s *PVSSPairingFreeScheme) verifyColumnUncached(holder p2p.NodeID, aggregat
 		if pk == nil || !s.dleqVerifyShare(group, holder, g1Point(group), pk, vj, cj, entry.Proof) {
 			return false
 		}
-		commitSum.Add(commitSum, vj)
-		cipherSum.Add(cipherSum, cj)
+		commits[i], ciphers[i] = vj, cj
+		return true
+	}) {
+		return false
+	}
+	commitSum := group.G2().Point().Null()
+	cipherSum := group.G1().Point().Null()
+	for i := range entries {
+		commitSum.Add(commitSum, commits[i])
+		cipherSum.Add(cipherSum, ciphers[i])
 	}
 	return commitSum.Equal(aggCommit) && cipherSum.Equal(aggCipher)
 }
@@ -617,13 +670,17 @@ func verifyAggregate(c PVSSCommitment) bool {
 		seen[source.Dealer] = true
 	}
 	members := normalizeMembers(c.Members)
-	for _, member := range members {
+	if !cryptoexec.AllLabeled("pvss-verify", len(members), func(i int) bool {
+		member := members[i]
 		if _, err := pointG1FromHex(c.Cipher[member]); err != nil {
 			return false
 		}
 		if _, err := pointG2FromHex(c.Commit[member]); err != nil {
 			return false
 		}
+		return true
+	}) {
+		return false
 	}
 	return verifyRSDualCodeG2(suite(), c, members)
 }
@@ -643,13 +700,17 @@ func (s *PVSSPairingFreeScheme) verifyAggregate(c PVSSCommitment) bool {
 		seen[source.Dealer] = true
 	}
 	members := normalizeMembers(c.Members)
-	for _, member := range members {
+	if !cryptoexec.AllLabeled("pvss-verify", len(members), func(i int) bool {
+		member := members[i]
 		if _, err := s.pointG1FromHex(c.Cipher[member]); err != nil {
 			return false
 		}
 		if _, err := s.pointG2FromHex(c.Commit[member]); err != nil {
 			return false
 		}
+		return true
+	}) {
+		return false
 	}
 	return s.verifyRSDualCodeG2(suite(), c, members)
 }

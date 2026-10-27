@@ -3,6 +3,7 @@
 package rbc
 
 import (
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"Tyche/utils/verification"
 	"crypto/ed25519"
@@ -128,7 +129,7 @@ func (b *Broadcaster) message(typ string, to p2p.NodeID, p Packet) p2p.Message {
 	p.Context = b.cfg.Context
 	p.Signature = ""
 	if typ == "READY" || !b.cfg.Authenticated {
-		p.Signature = hex.EncodeToString(ed25519.Sign(b.cfg.Private, statement(typ, b.cfg.ID, p)))
+		cryptoexec.WithCPUGroupFast(func() { p.Signature = hex.EncodeToString(ed25519.Sign(b.cfg.Private, statement(typ, b.cfg.ID, p))) })
 	}
 	m, _ := p2p.NewMessage(Protocol, typ, Key(p.Dealer, p.Seq), b.cfg.ID, to, p)
 	return m

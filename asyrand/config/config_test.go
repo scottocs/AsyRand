@@ -25,6 +25,16 @@ func TestDeploymentTemplatesAndDerivedParameters(t *testing.T) {
 			t.Fatal("accepted W<2")
 		}
 		bad = c
+		bad.AdaptiveProduction = true
+		bad.ProductionWindowMin = 1
+		if bad.Validate() == nil {
+			t.Fatal("adaptive window allowed W<2")
+		}
+		bad.ProductionWindowMin = bad.ProductionWindow + 1
+		if bad.Validate() == nil {
+			t.Fatal("adaptive minimum exceeds peer-message horizon")
+		}
+		bad = c
 		bad.F = len(c.Members())/3 + 1
 		if bad.Validate() == nil {
 			t.Fatal("accepted invalid fault bound")

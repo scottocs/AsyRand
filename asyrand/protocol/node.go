@@ -5,6 +5,7 @@ import (
 	"Tyche/asyrand/crypto"
 	"Tyche/asyrand/protocol/aba"
 	"Tyche/asyrand/protocol/rbc"
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"Tyche/utils/verification"
 	"context"
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -54,6 +56,7 @@ type envelope struct {
 	Signature string
 }
 type pendingRecon struct {
+	prepared                                 *crypto.VerifiedPVSS
 	header                                   reconHeader
 	object                                   Object
 	record                                   BeaconRecord
@@ -64,6 +67,16 @@ type pendingRecon struct {
 	done                                     chan struct{}
 	releasePending, released, reconstructing bool
 	entry                                    *Entry
+}
+
+// Local admission feedback only. The configured ProductionWindow remains the
+// fixed peer-message horizon; shrinking never discards accepted work/evidence.
+type productionControl struct {
+	active            int
+	pressure, deficit int
+	column            uint64
+	safeColumns       int
+	lastReview        time.Time
 }
 
 // Node owns a single serialized consumer/ABA/RBC actor. Crypto jobs return
@@ -85,8 +98,18 @@ type Node struct {
 	wg                sync.WaitGroup
 	start             sync.Once
 	events            chan func()
+	urgentEvents      chan func()
+	consumerPriority  bool
 	jobs              chan func()
 	urgentJobs        chan func()
+	validationJobs    chan func()
+	authJobs          chan p2p.Message
+	authStarted       atomic.Bool
+	cryptoActive      atomic.Int64
+	production        productionControl
+	prefetchEnabled   bool
+	prefetchHash      string
+	precomputedShares map[string]crypto.PVSSDecryptedShare
 	outgoingBytes     atomic.Int64
 	senders           map[p2p.NodeID]*sender
 	ready             map[uint64]map[p2p.NodeID]Object
@@ -144,8 +167,21 @@ func New(cfg config.Config, id p2p.NodeID, t p2p.Transport) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{checks: checks, ID: id, Config: cfg, Transport: t, Public: setup, private: kp.Private, pvss: pv, verifier: v, events: make(chan func(), cfg.TransportBuffer), jobs: make(chan func(), cfg.TransportBuffer), senders: make(map[p2p.NodeID]*sender), ready: make(map[uint64]map[p2p.NodeID]Object), tasks: make(map[uint64]*columnTask), instances: make(map[string]*aba.Instance), coreArchive: make(map[string]map[uint64][]p2p.Message), validationPending: make(map[string][]p2p.Message), begun: make(map[uint64]bool), columns: v.columns, nextSeq: 1, history: make(map[uint64]Entry), columnArchive: make(map[uint64]Column), notify: make(chan struct{}), earlyShares: make(map[uint64]map[p2p.NodeID]reconPacket), witnesses: make(map[uint64]Entry)}
+	n.prefetchEnabled = enableConsumptionPrefetch(cfg.MaxPool)
+	n.consumerPriority = enableConsumerPriority()
+	n.urgentEvents = make(chan func(), cfg.TransportBuffer)
+	n.precomputedShares = make(map[string]crypto.PVSSDecryptedShare)
 	n.rbc = rbc.New(rbc.Config{Verification: checks, ID: id, F: cfg.F, Members: setup.Members, Context: setup.Context, Private: kp.Private, Public: setup.Signing, Authenticated: p2p.AuthenticatedDelivery(t)})
+	// The local public verifier uses the same fixed setup and immutable object
+	// handles; an external VerifyHistory still constructs its own fresh scheme.
+	v.pvss = pv
 	n.urgentJobs = make(chan func(), cfg.TransportBuffer)
+	n.validationJobs = make(chan func(), cfg.TransportBuffer)
+	n.authJobs = make(chan p2p.Message, cfg.TransportBuffer)
+	n.production.active = cfg.ProductionWindow
+	n.Perf.ProductionWindow.Store(uint64(cfg.ProductionWindow))
+	n.Perf.ProductionMinimum.Store(uint64(cfg.ProductionWindow))
+	n.Perf.ProductionMaximum.Store(uint64(cfg.ProductionWindow))
 	return n, nil
 }
 func (n *Node) Start(ctx context.Context) error {
@@ -157,6 +193,13 @@ func (n *Node) Start(ctx context.Context) error {
 			return
 		}
 		n.lastInstall = time.Now()
+		// READY signatures are immutable checks. Verify them off the actor,
+		// then admit the packet on the actor only after authentication succeeds.
+		n.authStarted.Store(true)
+		for i := 0; i < min(2, n.Config.MaxPool); i++ {
+			n.wg.Add(1)
+			go n.authenticateReady()
+		}
 		for _, id := range n.Public.Members {
 			s := &sender{wake: make(chan struct{}, 1), total: &n.outgoingBytes}
 			n.senders[id] = s
@@ -174,7 +217,13 @@ func (n *Node) Start(ctx context.Context) error {
 					case <-n.ctx.Done():
 						return
 					case job := <-n.urgentJobs:
-						job()
+						n.runCrypto(job)
+						continue
+					default:
+					}
+					select {
+					case job := <-n.validationJobs:
+						n.runCrypto(job)
 						continue
 					default:
 					}
@@ -182,9 +231,11 @@ func (n *Node) Start(ctx context.Context) error {
 					case <-n.ctx.Done():
 						return
 					case job := <-n.urgentJobs:
-						job()
+						n.runCrypto(job)
 					case job := <-n.jobs:
-						job()
+						n.runCrypto(job)
+					case job := <-n.validationJobs:
+						n.runCrypto(job)
 					}
 				}
 			}()
@@ -193,6 +244,31 @@ func (n *Node) Start(ctx context.Context) error {
 		go n.run()
 	})
 	return err
+}
+
+func (n *Node) runCrypto(job func()) {
+	n.cryptoActive.Add(1)
+	defer n.cryptoActive.Add(-1)
+	cryptoexec.WithCPUGroup(job)
+}
+
+func (n *Node) authenticateReady() {
+	defer n.wg.Done()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case m := <-n.authJobs:
+			p, ok := rbc.Authenticate(n.Public.Context, n.Public.Signing, m, n.checks)
+			n.post(func() {
+				if !ok {
+					n.Perf.Invalid.Add(1)
+					return
+				}
+				p2p.BenchmarkTask("rbc-handle", func() { n.handleAuthenticatedRBC(m, p) })
+			})
+		}
+	}
 }
 
 // Stop waits for actor/crypto/senders before transport shutdown; peers should
@@ -267,11 +343,39 @@ func (n *Node) work(f func()) {
 	case <-n.ctx.Done():
 	}
 }
+func (n *Node) postUrgent(f func()) {
+	if !n.consumerPriority {
+		n.post(f)
+		return
+	}
+	select {
+	case n.urgentEvents <- f:
+	case <-n.ctx.Done():
+	}
+}
+
+// A consumer completion can unlock the next output. Run only the existing
+// consumer admission/barriers before draining unrelated validation callbacks.
+func (n *Node) acceptUrgent(f func()) {
+	f()
+	n.Perf.ActorEvents.Add(1)
+	n.driveConsumer()
+}
 func (n *Node) workUrgent(f func()) {
 	select {
 	case n.urgentJobs <- f:
 	case <-n.ctx.Done():
 	}
+}
+func (n *Node) workColumn(column uint64, f func()) {
+	if column <= n.currentColumn()+1 {
+		select {
+		case n.validationJobs <- f:
+		case <-n.ctx.Done():
+		}
+		return
+	}
+	n.work(f)
 }
 func (n *Node) fail(err error) {
 	n.mu.Lock()
@@ -294,24 +398,90 @@ func (n *Node) run() {
 	n.ensureColumn(1)
 	n.drive()
 	for {
+		if n.consumerPriority {
+			select {
+			case f := <-n.urgentEvents:
+				n.acceptUrgent(f)
+				if !n.drainReady() {
+					return
+				}
+				n.drive()
+				continue
+			default:
+			}
+		}
 		select {
 		case <-n.ctx.Done():
 			return
 		case f := <-n.events:
 			f()
+			n.Perf.ActorEvents.Add(1)
+			if !n.drainReady() {
+				return
+			}
+			n.drive()
+		case f := <-n.urgentEvents:
+			n.acceptUrgent(f)
+			if !n.drainReady() {
+				return
+			}
 			n.drive()
 		case m, ok := <-n.Transport.Inbox():
 			if !ok {
 				return
 			}
 			n.handle(m)
+			n.Perf.ActorEvents.Add(1)
+			if !n.drainReady() {
+				return
+			}
 			n.drive()
 		case now := <-ticker.C:
+			n.reviewProduction(now)
 			n.emit(n.rbc.RetryPayloads(now))
 			n.recoverAt(now)
 			n.drive()
 		}
 	}
+}
+
+// Coalesce work already available without adding a timer or waiting for peers.
+// A bounded batch keeps recovery/cancellation responsive and all state changes
+// on this actor, while avoiding a complete frontier scan after every packet.
+func (n *Node) drainReady() bool {
+	for i := 0; i < 31; i++ {
+		if n.ctx.Err() != nil {
+			return false
+		}
+		if n.consumerPriority {
+			select {
+			case f := <-n.urgentEvents:
+				n.acceptUrgent(f)
+				continue
+			default:
+			}
+		}
+		select {
+		case f := <-n.events:
+			f()
+			n.Perf.ActorEvents.Add(1)
+			continue
+		default:
+		}
+		select {
+		case f := <-n.events:
+			f()
+		case m, ok := <-n.Transport.Inbox():
+			if !ok {
+				return false
+			}
+			n.handle(m)
+		default:
+			return true
+		}
+		n.Perf.ActorEvents.Add(1)
+	}
+	return n.ctx.Err() == nil
 }
 func (n *Node) WaitBeacon(ctx context.Context, e uint64) (Entry, error) {
 	for {
@@ -469,19 +639,32 @@ func (n *Node) handle(m p2p.Message) {
 	}
 	switch m.Protocol {
 	case aba.Protocol:
-		n.routeABA(m)
+		p2p.BenchmarkTask("aba-handle", func() { n.routeABA(m) })
 	case rbc.Protocol:
-		n.handleRBC(m)
+		p2p.BenchmarkTask("rbc-handle", func() { n.handleRBC(m) })
 	case Protocol:
 		n.handleBeacon(m)
 	}
 }
 func (n *Node) handleRBC(m p2p.Message) {
+	if m.Type == "READY" && n.authStarted.Load() {
+		select {
+		case n.authJobs <- m:
+			return
+		default:
+			// Bounded admission: a full queue uses the existing synchronous
+			// check rather than dropping a packet or allocating goroutines.
+		}
+	}
 	p, ok := rbc.Authenticate(n.Public.Context, n.Public.Signing, m, n.checks)
 	if !ok {
 		n.Perf.Invalid.Add(1)
 		return
 	}
+	n.handleAuthenticatedRBC(m, p)
+}
+
+func (n *Node) handleAuthenticatedRBC(m p2p.Message, p rbc.Packet) {
 	if !n.rbc.Admit(m, p) {
 		return
 	}
@@ -511,9 +694,13 @@ func (n *Node) handleRBC(m p2p.Message) {
 			n.validationPending[p.Hash] = []p2p.Message{m}
 			n.rbc.PayloadPending(p, true)
 			value := append([]byte(nil), p.Value...)
-			n.work(func() {
+			n.workColumn(p.Seq, func() {
 				var o crypto.PVSSCommitment
-				ok := json.Unmarshal(value, &o) == nil && o.Dealer == p.Dealer && o.Seq == p.Seq && string(encode(o)) == string(value) && n.pvss.Verify(o)
+				var prepared *crypto.VerifiedPVSS
+				ok := json.Unmarshal(value, &o) == nil && o.Dealer == p.Dealer && o.Seq == p.Seq && string(encode(o)) == string(value)
+				if ok {
+					p2p.BenchmarkTask("pvss-verify", func() { prepared, ok = n.pvss.Prepare(o) })
+				}
 				n.Perf.VerifyCount.Add(1)
 				n.post(func() {
 					pending := n.validationPending[p.Hash]
@@ -523,7 +710,7 @@ func (n *Node) handleRBC(m p2p.Message) {
 						n.emit(n.rbc.PayloadPending(p, false))
 						return
 					}
-					n.verifier.objects[p.Hash] = verifiedPVSS{o.Dealer, o.Seq}
+					n.verifier.objects[p.Hash] = verifiedPVSS{o.Dealer, o.Seq, prepared}
 					for _, old := range pending {
 						packet, _ := p2p.DecodePayload[rbc.Packet](old)
 						n.acceptRBC(old, packet)
@@ -562,6 +749,7 @@ func (n *Node) acceptRBC(m p2p.Message, p rbc.Packet) {
 	}
 }
 func (n *Node) drive() {
+	n.Perf.DriveCalls.Add(1)
 	if n.ctx.Err() != nil {
 		return
 	}
@@ -571,13 +759,21 @@ func (n *Node) drive() {
 	if n.begun[c] {
 		n.advanceColumn(c + 1)
 	}
+	n.driveConsumer()
+	n.prefetchConsumption()
+}
+
+func (n *Node) driveConsumer() {
+	if n.ctx.Err() != nil {
+		return
+	}
 	if n.state == nil && !n.initializeGenesis() {
 		return
 	}
 	if !n.consuming {
 		return
 	}
-	c = n.state.Column
+	c := n.state.Column
 	if !n.begun[c] {
 		n.begun[c] = true
 		n.ensureColumn(c + 1)
@@ -604,20 +800,35 @@ func (n *Node) initializeGenesis() bool {
 	return true
 }
 func (n *Node) produce() {
-	if n.producing || n.nextSeq > n.currentColumn()+uint64(n.Config.ProductionWindow)-1 {
+	window := n.production.active
+	if window == 0 {
+		window = n.Config.ProductionWindow
+	}
+	if n.producing || n.nextSeq > n.currentColumn()+uint64(window)-1 {
 		return
 	}
 	// Backpressure only speculative production. Current/successor positions
 	// remain enabled, so congestion cannot create a look-ahead dependency cycle.
 	if n.nextSeq > n.currentColumn()+1 && n.outgoingBytes.Load() > 16<<20 {
+		n.Perf.ProductionPaused.Add(1)
 		return
 	}
 
 	seq := n.nextSeq
 	n.nextSeq++
 	n.producing = true
-	n.work(func() {
-		o, _, err := n.pvss.Share(n.ID, seq, n.Public.Members)
+	n.workColumn(seq, func() {
+		var o crypto.PVSSCommitment
+		var err error
+		p2p.BenchmarkTask("pvss-share", func() { o, _, err = n.pvss.Share(n.ID, seq, n.Public.Members) })
+		var prepared *crypto.VerifiedPVSS
+		if err == nil {
+			var valid bool
+			p2p.BenchmarkTask("pvss-verify", func() { prepared, valid = n.pvss.Prepare(o) })
+			if !valid {
+				err = errors.New("locally generated PVSS object failed verification")
+			}
+		}
 		n.Perf.ShareCount.Add(1)
 		n.post(func() {
 			n.producing = false
@@ -626,10 +837,97 @@ func (n *Node) produce() {
 				return
 			}
 			value := encode(o)
-			n.verifier.objects[rbc.Hash(value)] = verifiedPVSS{o.Dealer, o.Seq}
+			n.verifier.objects[rbc.Hash(value)] = verifiedPVSS{o.Dealer, o.Seq, prepared}
 			n.emit(n.rbc.Broadcast(seq, value))
 		})
 	})
+}
+
+// Inventory-aware local admission. Initial validation backlog is pipeline
+// filling, not evidence that the production horizon is too large. Shrinking
+// requires three fully supplied column transitions and at least three complete
+// successor columns in reserve. No local feedback supplies an ABA input.
+func (n *Node) reviewProduction(now time.Time) {
+	if !n.Config.AdaptiveProduction {
+		return
+	}
+	s := &n.production
+	if !s.lastReview.IsZero() && now.Sub(s.lastReview) < 250*time.Millisecond {
+		return
+	}
+	s.lastReview = now
+	minimum := n.Config.ProductionWindowMin
+	if minimum == 0 {
+		minimum = 2
+	}
+	if s.active == 0 {
+		s.active = n.Config.ProductionWindow
+	}
+	c := n.currentColumn()
+	reserve := 0
+	for seq := c + 1; seq < c+uint64(n.Config.ProductionWindow); seq++ {
+		if len(n.ready[seq]) != len(n.Public.Members) {
+			if col, ok := n.columns[seq]; !ok || col.Record.Whole != aba.One {
+				break
+			}
+		}
+		reserve++
+	}
+	n.Perf.ProductionReserve.Store(uint64(reserve))
+	pressure := len(n.jobs) > 2*len(n.Public.Members) || len(n.validationJobs) > 2*len(n.Public.Members) || n.outgoingBytes.Load() > 8<<20
+	// An empty queue does not imply idle workers: they may both be inside
+	// long proofs (or awaiting their shared budget service).
+	spare := n.cryptoActive.Load() < int64(n.Config.MaxPool) && len(n.jobs)+len(n.urgentJobs)+len(n.validationJobs) == 0
+	deficit := reserve < 2 && !pressure && spare && n.outgoingBytes.Load() < 2<<20
+	before := s.active
+	if c != s.column {
+		s.column = c
+		col, decided := n.columns[c]
+		if c >= 3 && decided && col.Record.Whole == aba.One && reserve >= 2 {
+			s.safeColumns++
+		} else {
+			s.safeColumns = 0
+		}
+		// A fallback is a supply warning. Restore one position of lookahead;
+		// it never changes the decision or bypasses the successor barrier.
+		if c >= 3 && decided && col.Record.Whole == aba.Zero {
+			s.active = min(n.Config.ProductionWindow, s.active+1)
+		}
+	}
+	if pressure {
+		s.pressure++
+		s.deficit = 0
+	} else if deficit {
+		s.deficit++
+		s.pressure = 0
+		n.Perf.ProductionDeficit.Add(1)
+	} else {
+		s.pressure = 0
+		s.deficit = 0
+	}
+	// A persistently excessive inventory is itself evidence of needless
+	// speculation, even when queues drain between reviews. Keep two complete
+	// successors after a decrease; never shrink on startup backlog alone.
+	if s.safeColumns >= 3 && reserve >= 3 && len(n.urgentJobs)+len(n.validationJobs) == 0 {
+		s.active = max(minimum, s.active-1)
+		s.pressure = 0
+		s.safeColumns = 0
+	} else if s.deficit >= 2 {
+		s.active = min(n.Config.ProductionWindow, s.active+1)
+		s.deficit = 0
+	}
+	if s.active < before {
+		n.Perf.ProductionShrinks.Add(1)
+	} else if s.active > before {
+		n.Perf.ProductionGrows.Add(1)
+	}
+	n.Perf.ProductionWindow.Store(uint64(s.active))
+	if uint64(s.active) < n.Perf.ProductionMinimum.Load() {
+		n.Perf.ProductionMinimum.Store(uint64(s.active))
+	}
+	if uint64(s.active) > n.Perf.ProductionMaximum.Load() {
+		n.Perf.ProductionMaximum.Store(uint64(s.active))
+	}
 }
 func (n *Node) propose(a *aba.Instance, bit aba.Value) {
 	out, err := a.Propose(bit)
@@ -747,7 +1045,12 @@ func (n *Node) consume() {
 			return
 		}
 		h := reconHeader{record.Epoch, record.PreviousHash, record.Column, record.Source, record.ObjectHash}
-		n.recon = &pendingRecon{header: h, object: object, record: record, previousRandom: n.state.PreviousRandom, shares: make(map[p2p.NodeID]crypto.PVSSDecryptedShare), verifying: make(map[p2p.NodeID]bool), candidates: make(map[p2p.NodeID]reconPacket), done: make(chan struct{})}
+		prepared, err := n.verifier.preparedObject(record.ObjectHash, object.Transcript)
+		if err != nil {
+			n.fail(err)
+			return
+		}
+		n.recon = &pendingRecon{prepared: prepared, header: h, object: object, record: record, previousRandom: n.state.PreviousRandom, shares: make(map[p2p.NodeID]crypto.PVSSDecryptedShare), verifying: make(map[p2p.NodeID]bool), candidates: make(map[p2p.NodeID]reconPacket), done: make(chan struct{})}
 	}
 
 	r := n.recon
@@ -771,22 +1074,23 @@ func (n *Node) consume() {
 
 	if !r.releasePending {
 		r.releasePending = true
-		n.workUrgent(func() {
-			sh, err := n.pvss.PreReconTrusted(r.object.Transcript, n.ID)
-			n.post(func() {
-				if !n.live(h) {
-					return
-				}
-				if err != nil {
-					n.fail(err)
-					return
-				}
-				n.recon.released = true
-				n.recon.shares[n.ID] = sh
-				n.send("RECON", "", reconPacket{h, sh})
-				n.finishEpoch()
+		if sh, ok := n.precomputedShares[h.ObjectHash]; ok {
+			delete(n.precomputedShares, h.ObjectHash)
+			n.Perf.PrefetchHits.Add(1)
+			n.releaseOwnShare(h, sh, nil)
+		} else if n.prefetchHash == h.ObjectHash {
+			// This single, already admitted job will release only after rechecking
+			// the complete live predecessor/epoch/object header on the actor.
+			n.Perf.PrefetchJoins.Add(1)
+		} else {
+			n.workUrgent(func() {
+				var sh crypto.PVSSDecryptedShare
+				var err error
+				p2p.BenchmarkTask("recon-share-generate", func() { sh, err = n.pvss.PreReconPrepared(r.prepared, n.ID) })
+				n.Perf.PreReconCount.Add(1)
+				n.postUrgent(func() { n.releaseOwnShare(h, sh, err) })
 			})
-		})
+		}
 	}
 	if r.entry == nil && !r.reconstructing && len(r.shares) >= n.Config.Threshold() {
 		r.reconstructing = true
@@ -800,9 +1104,11 @@ func (n *Node) consume() {
 			shares[i] = r.shares[holders[i]]
 		}
 		n.workUrgent(func() {
-			z, err := n.pvss.ReconTrusted(r.object.Transcript, shares, n.Config.Threshold())
+			var z []byte
+			var err error
+			p2p.BenchmarkTask("reconstruct", func() { z, err = n.pvss.ReconPrepared(r.prepared, shares, n.Config.Threshold()) })
 			n.Perf.ReconCount.Add(1)
-			n.post(func() {
+			n.postUrgent(func() {
 				if !n.live(h) {
 					return
 				}
@@ -847,7 +1153,11 @@ func (n *Node) checkShares() {
 		return
 	}
 	for from, p := range r.candidates {
-		if len(r.shares)+len(r.verifying) >= n.Config.Threshold() {
+		reserved := 0
+		if _, present := r.shares[n.ID]; r.releasePending && !r.released && !present {
+			reserved = 1 // The scheduled, locally generated share supplies this slot.
+		}
+		if len(r.shares)+len(r.verifying)+reserved >= n.Config.Threshold() {
 			break
 		}
 		delete(r.candidates, from)
@@ -859,8 +1169,10 @@ func (n *Node) checkShares() {
 				return
 			default:
 			}
-			ok := n.pvss.VerifyShare(r.object.Transcript, p.Share)
-			n.post(func() {
+			var ok bool
+			p2p.BenchmarkTask("recon-share-verify", func() { ok = n.pvss.VerifyPreparedShare(r.prepared, p.Share) })
+			n.Perf.ShareCheckCount.Add(1)
+			n.postUrgent(func() {
 				if !n.live(p.Header) {
 					return
 				}
@@ -1136,3 +1448,87 @@ func (n *Node) bufferEpoch(e uint64) bool {
 
 // Begin releases the consumer after deployment prefill; it changes no consensus rule.
 func (n *Node) Begin() { n.post(func() { n.consuming = true }) }
+
+// This private cache contains only this holder's proofs for already certified
+// objects in the current consumption column. It neither produces extra PVSS
+// objects nor releases a future share. Admission uses otherwise idle capacity.
+func (n *Node) prefetchConsumption() {
+	if !n.prefetchEnabled || n.ctx.Err() != nil || n.state == nil || n.recon == nil || !n.consuming || n.prefetchHash != "" {
+		return
+	}
+	if len(n.urgentJobs)+len(n.validationJobs)+len(n.jobs) != 0 || n.cryptoActive.Load() >= int64(n.Config.MaxPool) {
+		return
+	}
+	column := n.columns[n.state.Column]
+	for _, id := range n.state.Remaining {
+		object, ok := objectFor(column, id)
+		if !ok {
+			continue
+		}
+		hash := object.Delivery.Hash
+		if hash == n.recon.header.ObjectHash {
+			continue
+		}
+		if _, ok := n.precomputedShares[hash]; ok {
+			continue
+		}
+		prepared, err := n.verifier.preparedObject(hash, object.Transcript)
+		if err != nil {
+			n.fail(err)
+			return
+		}
+		c := n.state.Column
+		n.prefetchHash = hash
+		n.Perf.PrefetchDecryptions.Add(1)
+		n.work(func() {
+			var share crypto.PVSSDecryptedShare
+			var err error
+			p2p.BenchmarkTask("recon-share-precompute", func() { share, err = n.pvss.PreReconPrepared(prepared, n.ID) })
+			n.Perf.PreReconCount.Add(1)
+			n.post(func() {
+				n.prefetchHash = ""
+				if err != nil {
+					n.fail(err)
+					return
+				}
+				if n.recon != nil && n.recon.header.ObjectHash == hash && n.recon.releasePending && !n.recon.released {
+					n.releaseOwnShare(n.recon.header, share, nil)
+					return
+				}
+				if n.state != nil && n.state.Column == c {
+					n.precomputedShares[hash] = share
+				}
+			})
+		})
+		return // At most one short speculative decryption in flight per node.
+	}
+}
+
+func (n *Node) releaseOwnShare(h reconHeader, share crypto.PVSSDecryptedShare, err error) {
+	if !n.live(h) {
+		return
+	}
+	if err != nil {
+		n.fail(err)
+		return
+	}
+	if share.Holder != n.ID || share.CommitmentID != n.recon.object.Transcript.SecretID {
+		n.fail(errors.New("local decryption share does not bind the selected object and holder"))
+		return
+	}
+	if n.recon.released {
+		return
+	}
+	n.recon.released = true
+	n.recon.shares[n.ID] = share
+	n.send("RECON", "", reconPacket{h, share})
+	n.finishEpoch()
+}
+
+func enableConsumptionPrefetch(workers int) bool {
+	return workers >= 2 && os.Getenv("TYCHE_ASY_PREDECRYPT") == "1"
+}
+
+func enableConsumerPriority() bool {
+	return os.Getenv("TYCHE_ASY_CONSUMER_PRIORITY") == "1"
+}

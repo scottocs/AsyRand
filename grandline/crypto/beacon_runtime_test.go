@@ -1,14 +1,18 @@
 package crypto
 
 import (
+	"Tyche/utils/cryptoexec"
 	"Tyche/utils/p2p"
 	"Tyche/utils/verification"
 	"bytes"
+	"encoding/hex"
+	"go.dedis.ch/kyber/v3"
+	"strings"
 	"sync"
 	"testing"
 )
 
-func runtimeFixture(t *testing.T) (GRandResult, []p2p.NodeID, []*VerifiedBeaconCommitment, []*BeaconSigner) {
+func runtimeFixture(t testing.TB) (GRandResult, []p2p.NodeID, []*VerifiedBeaconCommitment, []*BeaconSigner) {
 	t.Helper()
 	ids := []p2p.NodeID{"n0", "n1", "n2"}
 	g := suite()
@@ -39,6 +43,107 @@ func runtimeFixture(t *testing.T) (GRandResult, []p2p.NodeID, []*VerifiedBeaconC
 		}
 	}
 	return r, ids, cs, ss
+}
+
+// Independent reference retains the pre-optimization GT decoder, including
+// its full subgroup test, before applying both complete verification checks.
+func decodeThenVerifyGT(e *BeaconEpoch, c *VerifiedBeaconCommitment, sh BeaconShare) bool {
+	if sh.Epoch != e.epoch || sh.Signer != c.Signer {
+		return false
+	}
+	u, err := pointG1FromHex(sh.Sigma1)
+	if err != nil {
+		return false
+	}
+	v, err := pointGTFromHex(sh.Sigma2)
+	if err != nil {
+		return false
+	}
+	g := suite()
+	return cryptoexec.AllLabeled("reference-share", 2, func(i int) bool {
+		if i == 0 {
+			return verifyBeaconDLEQWithCM1(g, e.msg, c.CM1, u, sh.Proof, e.gr, nil)
+		}
+		return v.Equal(g.PairProduct([2]kyber.Point{e.gr, c.CM2}, [2]kyber.Point{u, hPoint(g)}))
+	})
+}
+
+func TestGTCanonicalEquationMatchesIndependentDecoder(t *testing.T) {
+	_, _, cs, ss := runtimeFixture(t)
+	e := NewBeaconEpoch(11, []byte("GT canonical equation / setup-A"))
+	for i := range ss {
+		wire, _, err := ss[i].Share(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := []BeaconShare{wire}
+		upper := wire
+		upper.Sigma2 = strings.ToUpper(wire.Sigma2)
+		cases = append(cases, upper)
+		for _, raw := range []string{"", wire.Sigma2[2:], wire.Sigma2 + "00", strings.Repeat("ff", 576), strings.Repeat("00", 576), strings.Repeat("zz", 576), mustPointHexGT(suite().GT().Point().Null())} {
+			bad := wire
+			bad.Sigma2 = raw
+			cases = append(cases, bad)
+		}
+		raw, _ := hex.DecodeString(wire.Sigma2)
+		for offset := 0; offset < len(raw); offset += 47 {
+			bad := wire
+			mutated := append([]byte(nil), raw...)
+			mutated[offset] ^= 1
+			bad.Sigma2 = hex.EncodeToString(mutated)
+			cases = append(cases, bad)
+		}
+		wrongEpoch := wire
+		wrongEpoch.Epoch++
+		cases = append(cases, wrongEpoch)
+		wrongSigner := wire
+		wrongSigner.Signer = "intruder"
+		cases = append(cases, wrongSigner)
+		badProof := wire
+		badProof.Proof.Response = mustScalarHex(suite().G1().Scalar().Zero())
+		cases = append(cases, badProof)
+		badProof = wire
+		badProof.Proof.A1 = mustPointHex(suite().G1().Point().Null())
+		cases = append(cases, badProof)
+		for j, input := range cases {
+			want := decodeThenVerifyGT(e, cs[i], input)
+			got, ok := e.verifyUncached(cs[i], input, nil)
+			if want != ok || ok != (j < 2) {
+				t.Fatalf("acceptance differs: signer=%d case=%d reference=%v new=%v", i, j, want, ok)
+			}
+			if ok {
+				point, err := pointGTFromHex(input.Sigma2)
+				if err != nil || !got.sigma.Equal(point) {
+					t.Fatal("retained GT changed")
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkColdGTShareVerification(b *testing.B) {
+	_, _, cs, ss := runtimeFixture(b)
+	e := NewBeaconEpoch(11, []byte("cold GT share"))
+	wire, _, err := ss[0].Share(e)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, method := range []string{"DecodeThenEquation", "CanonicalEquation"} {
+		b.Run(method, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if method == "DecodeThenEquation" {
+					if !decodeThenVerifyGT(e, cs[0], wire) {
+						b.Fatal("valid share rejected")
+					}
+				} else {
+					if _, ok := e.verifyUncached(cs[0], wire, nil); !ok {
+						b.Fatal("valid share rejected")
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestDecodedRecoveryEqualsLegacyAndPolynomialSecret(t *testing.T) {

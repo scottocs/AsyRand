@@ -6,11 +6,36 @@ import (
 	"Tyche/utils/p2p"
 	"Tyche/utils/pairing"
 	"Tyche/utils/verification"
+	"context"
 	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestParallelAdmissionReservesLocalShare(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	n := &Node{ID: "n0", ctx: ctx, State: NewState([]p2p.NodeID{"n0", "n1", "n2", "n3"}, 1), Crypto: cryptoexec.New(2), commitments: map[p2p.NodeID]*asig.VerifiedBeaconCommitment{}}
+	st := &roundState{shares: map[p2p.NodeID]*asig.VerifiedBeaconShare{}, localPending: true}
+	entered, release := make(chan struct{}, 2), make(chan struct{})
+	for i := 0; i < 2; i++ {
+		n.Crypto.Go(ctx, func() { entered <- struct{}{}; <-release })
+	}
+	<-entered
+	<-entered
+	for _, id := range []p2p.NodeID{"n1", "n2", "n3"} {
+		n.commitments[id] = new(asig.VerifiedBeaconCommitment)
+		n.recordShare(st, shareMessage{Share: asig.BeaconShare{Signer: id, Sigma1: "candidate", Sigma2: "candidate"}})
+	}
+	n.roundMu.Lock()
+	if len(st.verifying) != 1 || len(st.candidateOrder) != 2 {
+		t.Error("excess parallel checks", len(st.verifying), len(st.candidateOrder))
+	}
+	n.roundMu.Unlock()
+	cancel()
+	close(release)
+}
 
 func TestInvalidCandidateDoesNotDisplaceHonestShare(t *testing.T) {
 	g := pairing.NewSuite()
