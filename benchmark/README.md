@@ -1,4 +1,4 @@
-# Tyche Benchmark
+# Beacon benchmarks
 
 ## Docker simulation on a Linux host
 
@@ -109,97 +109,140 @@ To add W=2 as a fourth series, pass `--asyrand-w2-campaign <campaign-path>` and
 choose a separate output directory. The original AsyRand series must use W=8.
 Run values, summary CSVs and plot settings accompany the combined figure.
 
-This directory is the default benchmark workspace. Fabric tasks live here, while generated configs and run outputs are written under `generated/` and `runs/`.
+## Python environment
 
-## Setup
-
-```powershell
-cd benchmark
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
-```
-
-On macOS/Linux:
-
-```sh
-cd benchmark
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-## Run
+Install the AWS and plotting dependencies from the repository root:
 
 ```powershell
-cd benchmark
-.\.venv\Scripts\fab local --nodes=8 --epochs=1000
-.\.venv\Scripts\fab logs
+python -m venv benchmark/.venv
+benchmark/.venv/Scripts/python.exe -m pip install -r benchmark/requirements.txt -r benchmark/requirements-plot.txt
 ```
 
-AWS orchestration builds Linux binaries locally, uploads only those binaries plus generated configs to the EC2 nodes, and runs them over TCP:
+Native AWS runs also require the system OpenSSH client. Keep AWS credentials
+and the private key referenced by `settings.json` local.
+
+## Current AWS repeat workflow
+
+`aws_bench.py --scenario repeat` runs two additional no-fault repetitions of SPURT,
+Grandline and AsyRand at n=16,31,61,91,121. Each node produces 600 outputs;
+the first 200 are warmup. CPU, application Tx and wall time use the same
+completion-200 to completion-600 boundaries and a denominator of 400.
+
+The runner uses `aws_common.py` for the shared native EC2/security framework,
+`docker_bench.py` for configuration helpers and `bench_results.py` for node
+evidence, offline baseline conversion and shared JSON/CSV/SHA operations.
+The repeat workflow injects zero faults and
+preserves full n membership, f=(n-1)/3 and every cryptographic check.
+
+All protocols and both new repetitions run serially on a fixed committee for
+each size, using fresh protocol processes and per-run setup. Workers validate
+the complete output sequence and AsyRand history before compact collection.
+After bastion-side validation, all workers and their volumes are released
+before the compact result package is downloaded locally. The dedicated
+bastion never participates in a protocol. Unused qualification instances are
+reclaimed as soon as the committee is fixed.
+
+The completed campaign is `runs/aws-repeat23-20261028-600/`:
+
+- `results.csv`: 45 individual run rows, without mean rows.
+- `per-node.csv`: 2880 node rows, with raw boundary evidence in compact JSON packages.
+- `mean.csv`: 15 arithmetic means of the three run-level node means.
+- `combined.png`, `combined.pdf`, `combined.svg`: throughput, application Tx and CPU panels.
+- `report.txt`, `results.zip`: methodology, compact node results, provenance and audits.
+
+Each run averages all n honest nodes. CPU100% means the full two-vCPU quota;
+CPU milliseconds per output and outputs per CPU-second are retained alongside
+utilization. Application Tx excludes self-delivery and TLS/TCP overhead.
+Run1 is an independent earlier campaign; runs2/3 share instances at each size.
+Real WAN, shared SMT, T3a CPU credits and execution order limit causal inference.
+The figure is a descriptive mean of three runs without a significance claim.
+
+All AWS operations use the single `aws_bench.py` entry point. Select
+`--scenario single` for the original one-run comparison, `--scenario silent`
+for one silent AsyRand member, or `--scenario repeat` for two new no-fault runs.
+The original single-run mode retains its 100-output warmup; silent and repeat
+use 200. Preparation records the scenario and dependency SHAs, and mismatches
+are rejected before AWS initialization. Remote jobs retain the selected scenario.
 
 ```powershell
-cd benchmark
-.\.venv\Scripts\fab aws --nodes=4 --epochs=200
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py --help
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py --scenario repeat --help
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py compact-baseline --help
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py compact-node --help
 ```
 
-The `local` and `aws` Fabric tasks are Python runners and do not call `scripts/*.sh`. The AWS runner uses `settings.json` for `key.name`, `key.path`, instance type, and regions.
-By default, `fab aws` cross-compiles with `GOOS=linux`, `GOARCH=amd64`, and `CGO_ENABLED=0`. Override these with `AWS_GOOS`, `AWS_GOARCH`, and `AWS_CGO_ENABLED` if your EC2 fleet uses a different target.
-By default, benchmark output uses a stable directory name based only on mode, nodes, and epochs, such as `runs/aws_n8_e200`. A run writes into a hidden `.running` directory first, then appends successful protocol results into that shared configuration directory. Pass `--out=...` to force a specific directory and bypass this publish step.
-Each published run also writes `protocol_run_log.csv`, which records the latest run time and source log for every protocol in that configuration. Older results for the same protocol remain under `attempts/`, while plots use the latest run by default. To migrate older timestamped or hash-suffixed run directories into the stable layout:
+Controller actions are `prepare`, `run`, `resume`, `remote`, `inspect`, `bundle`
+and `analyze`, with the existing `--out`, `--settings`, `--campaign` and related
+options. `compact-baseline` requires `--source` and `--out`; `compact-node`
+requires `--folder`, `--protocol`, `--nodes` and `--repetition`.
+`aws_common.py` is the infrastructure library. `bench_results.py` uses only the
+standard library and can run on workers without cloud-controller dependencies.
+Controller archives include all required modules; compact worker payloads
+include just the result collector and verified protocol binaries.
+
+Use each completed campaign's frozen controller and offline verification tools
+to reproduce its analysis. Its `WORK.md`, manifests and audit receipts record
+the executed version. Do not resume a completed campaign or edit its frozen
+sources, manifests or delivered result package.
+
+## Other retained workflows
+
+`aws_bench.py --scenario silent` is the separate AsyRand one-silent-member workflow.
+It keeps the complete n-member committee and thresholds while the last member's
+protocol process remains stopped. Its results belong to a separate campaign.
+
+`docker_bench.py`, `plot_docker_results.py` and their measurement regression
+checks remain available for native Linux Docker comparisons. The standalone
+AsyRand optimization tools live under `../asyrand/benchmarks/`.
+
+The retired Fabric tasks, `tychebench` package, original Tyche/reconfiguration
+plots and direct log-fetch shell entry point have been removed. Historical
+run directories, archives and their frozen sources remain preserved.
+
+## Original single-run AWS workflow
+
+
+`aws_bench.py` runs SPURT, Grandline and adaptive-window AsyRand at
+n=16,31,61,91,121, one fresh 600-output run per point, with the first 100
+outputs excluded. It uses the eight-region `t3a.medium` settings from
+`settings.json`, native processes and direct authenticated peer TCP; there is
+no Docker or netem. A dedicated EC2 bastion distributes verified binaries,
+launches the nodes and collects complete evidence. It never joins a committee.
+
+The spare budgets match Silk: 24/24/32/32/40 instances by size, including the
+bastion, for at most 161 simultaneous instances. Instances use unlimited CPU
+credits and 24-GiB gp3 volumes. These are billable AWS resources. Every resource
+is campaign tagged; cleanup terminates only that campaign's instances and
+checks its volumes and security groups. Instance shutdown watchdogs provide a
+separate lifetime backstop.
 
 ```powershell
-cd benchmark
-.\.venv\Scripts\fab organize-runs
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py prepare --settings benchmark/settings.json --campaign tyche-aws-20261027-600 --out benchmark/runs/aws-20261027-600
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py run --out benchmark/runs/aws-20261027-600
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py inspect --out benchmark/runs/aws-20261027-600
 ```
 
-AWS per-epoch timeout defaults to `60s * ceil(nodes / 4)`, so larger deployments do not fail on the old fixed 60s timeout. Override with `EPOCH_TIMEOUT_MS` when you need a specific value.
-Large AWS runs can put enough CPU pressure on remote nodes that `sshd` is slow to send its SSH banner. If Paramiko reports `Error reading SSH protocol banner`, increase the SSH control-plane timeouts before running the benchmark:
+Run these commands from the repository root. Preparation verifies the current
+protocol sources against the validated frozen Linux binaries, then records
+source, payload and controller hashes. Preserve and execute a frozen controller
+copy for a long campaign. `resume` requires an explicitly reconciled stopped
+controller and an existing owned fleet; never use it to start a second controller.
+Native runs set post-completion linger to zero, after all-node measurement and
+fresh history verification. The bastion uses exclusive job claims and durable
+PID/exit files, so management reconnects do not duplicate protocol execution.
 
-```powershell
-$env:SSH_CONNECT_TIMEOUT = "20"
-$env:SSH_BANNER_TIMEOUT = "90"
-$env:SSH_AUTH_TIMEOUT = "60"
-$env:AWS_REMOTE_PROGRESS_POLL = "0"
-.\.venv\Scripts\fab aws --nodes=96 --epochs=100 --protocols=tyche-scrape
-```
+The user's private key and AWS credentials remain local. An ephemeral campaign
+SSH key is installed on the bastion and excluded from evidence archives. SSH
+ingress uses observed exact `/32` sources; split-tunnel VPNs can expose different
+HTTPS and raw-SSH exit addresses. The controller reconciles those sources on
+transport failure without opening world ingress.
 
-For CPU-heavy SCRAPE runs, also keep remote worker settings below the instance's vCPU count, leaving headroom for `sshd` and kernel networking. For example, use lower `MAX_POOL`/`GOMAXPROCS_REMOTE` or a larger instance type if the remote logs show sustained crypto queues and high CPU. Set `AWS_REMOTE_PROGRESS_POLL=0` on small instances to avoid opening extra SSH sessions while the protocol is running.
-
-## AWS Nodes
-
-AWS node lifecycle tasks use `settings.json` by default:
-
-```powershell
-
-cd benchmark
-.\.venv\Scripts\fab create --nodes=1
-.\.venv\Scripts\fab info
-.\.venv\Scripts\fab stop
-.\.venv\Scripts\fab start --max=10
-.\.venv\Scripts\fab destroy
-
-
-fab create --nodes=7;fab aws --nodes=8 --epochs=400 --protocols=tyche-scrape;fab aws --nodes=16 --epochs=300 --protocols=tyche-scrape;fab aws --nodes=32 --epochs=200 --protocols=tyche-scrape;fab aws --nodes=64 --epochs=100 --protocols=tyche-scrape;fab create --nodes=4;fab aws --nodes=96 --epochs=100 --protocols=tyche-scrape;fab destroy;
-
-
-fab create --nodes=7;fab aws --nodes=8 --epochs=400;fab aws --nodes=16 --epochs=300;fab aws --nodes=32 --epochs=200;fab destroy;
-
-fab create --nodes=16;fab aws --nodes=64 --epochs=100;fab aws --nodes=96 --epochs=100;fab destroy;
-
-fab create --nodes=7;fab aws --nodes=8 --epochs=400;fab aws --nodes=16 --epochs=300;fab aws --nodes=32 --epochs=200;fab create --nodes=9;fab aws --nodes=64 --epochs=100;fab aws --nodes=96 --epochs=100;fab destroy;  
-
-# n=96 tyche-scrape config.
-$env:TYCHE_REMOVAL_EXPIRATION_MS = "120000"
-$env:TYCHE_TRANSPORT_BUFFER = "32768"
-$env:PRODUCER_MS = "1000"
-$env:PREFILL_MS = "3000"
-$env:MAX_POOL = "2"
-$env:GOMAXPROCS_REMOTE = "2"
-$env:QUEUE_LEN = "2"
-
-# reconfig timeline
-python plot_reconfig_timeline.py runs/reconfig/aws_n16_e500/tyche-reconfig --epochs 500
-```
-
-`create --nodes=1` means one EC2 instance per region listed in `settings.json`. It waits for the instances to reach `running` and pass AWS status checks. The AWS `KeyName` must already exist in every configured region, and `key.path` must point to its local private key.
+Each protocol has its own native systemd cgroup, mapped into a private mount
+namespace for the unchanged measurement binary. CPU, application Tx and time
+use the completion-100 to completion-600 window: exactly 500 intervals. All
+nodes finish measurement before independent public-history verification starts.
+Full histories are retained in node archives; streamed per-size archives and
+all nested hashes, logs and metrics are independently checked locally before
+continuing. A separate n4/110-output qualification smoke is excluded from the
+15 formal samples. One run per point does not support replication SD or a
+performance-significance claim.

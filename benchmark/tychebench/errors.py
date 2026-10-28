@@ -1,2 +1,0 @@
-class BenchError(RuntimeError):
-    pass
