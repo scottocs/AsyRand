@@ -1,8 +1,8 @@
 package spurt
 
 import (
-	asig "Tyche/spurt/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/spurt/crypto"
+	"asyrand/utils/p2p"
 	"encoding/hex"
 	"strings"
 	"testing"

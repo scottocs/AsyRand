@@ -1,11 +1,11 @@
 package asyrand
 
 import (
-	"Tyche/asyrand/config"
-	"Tyche/asyrand/crypto"
-	"Tyche/asyrand/protocol/aba"
-	"Tyche/asyrand/protocol/rbc"
-	"Tyche/utils/p2p"
+	"asyrand/asyrand/config"
+	"asyrand/asyrand/crypto"
+	"asyrand/asyrand/protocol/aba"
+	"asyrand/asyrand/protocol/rbc"
+	"asyrand/utils/p2p"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -19,7 +19,7 @@ import (
 )
 
 func testConfig(n int, parallel bool) config.Config {
-	c := config.Config{Name: "test", Protocol: "asyrand-v2", Transport: "memory", F: (n - 1) / 3, Round: 12, EpochMS: 30000, MaxPool: 2, ProductionWindow: 2, TransportBuffer: 8192, SendRetryMS: 10, RecoveryMS: 1000, ABAFutureRounds: 4, HistoryBatch: 4, SessionID: fmt.Sprintf("test-%d-%t", n, parallel), ParallelConsumption: parallel, ClusterIndex: make(map[p2p.NodeID]int), NodeSeeds: make(map[p2p.NodeID]string)}
+	c := config.Config{Name: "test", Protocol: "asyrand", Transport: "memory", F: (n - 1) / 3, Round: 12, EpochMS: 30000, MaxPool: 2, ProductionWindow: 2, TransportBuffer: 8192, SendRetryMS: 10, RecoveryMS: 1000, ABAFutureRounds: 4, HistoryBatch: 4, SessionID: fmt.Sprintf("test-%d-%t", n, parallel), ParallelConsumption: parallel, ClusterIndex: make(map[p2p.NodeID]int), NodeSeeds: make(map[p2p.NodeID]string)}
 	for i := 0; i < n; i++ {
 		id := p2p.NodeID(fmt.Sprintf("node%d", i))
 		c.ClusterIndex[id] = i
@@ -88,7 +88,7 @@ func TestProtocolAndPublicHistory(t *testing.T) {
 				}
 				h := nodes[0].Export(outputs)
 				for _, object := range h.Genesis.Objects {
-					if object.Transcript.Version != "AsyRand-v1/ALBATROSS-DDH/edwards25519" || len(object.Transcript.Proof.Coefficients) != nodes[0].Config.Threshold() {
+					if object.Transcript.Version != "asyrand/ALBATROSS-DDH/edwards25519" || len(object.Transcript.Proof.Coefficients) != nodes[0].Config.Threshold() {
 						t.Fatal("protocol did not use ALBATROSS PVSS")
 					}
 				}
@@ -1348,7 +1348,7 @@ func (tap *consumptionTap) Send(ctx context.Context, to p2p.NodeID, message p2p.
 }
 
 func TestConsumptionPrefetchKeepsReleaseBindingAndPublicHistory(t *testing.T) {
-	t.Setenv("TYCHE_ASY_PREDECRYPT", "1")
+	t.Setenv("ASYRAND_ASY_PREDECRYPT", "1")
 	cfg := testConfig(4, true)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

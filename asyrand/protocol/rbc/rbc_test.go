@@ -1,7 +1,7 @@
 package rbc
 
 import (
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"crypto/ed25519"
 	"encoding/hex"
 	"testing"

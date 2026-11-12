@@ -1,7 +1,7 @@
 package grandline
 
 import (
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"sort"
 	"sync"
 )

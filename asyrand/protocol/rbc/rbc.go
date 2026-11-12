@@ -3,9 +3,9 @@
 package rbc
 
 import (
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"

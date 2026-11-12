@@ -1,4 +1,4 @@
-module Tyche/asyrand
+module asyrand/asyrand
 
 go 1.24.0
 
@@ -12,8 +12,8 @@ require (
 )
 
 require (
-	Tyche/utils v0.0.0
+	asyrand/utils v0.0.0
 	filippo.io/edwards25519 v1.1.0
 )
 
-replace Tyche/utils => ../utils
+replace asyrand/utils => ../utils

@@ -1,0 +1,25 @@
+# Defense in depth for source exports made with git archive.
+/.git export-ignore
+/.vscode export-ignore
+/.agents export-ignore
+/.codex export-ignore
+/.aws export-ignore
+/pems export-ignore
+/paper export-ignore
+/S&P export-ignore
+/Usenix export-ignore
+/artifacts export-ignore
+/benchmark/runs export-ignore
+/benchmark/records export-ignore
+/benchmark/aws_results export-ignore
+/benchmark/generated export-ignore
+/benchmark/settings.json export-ignore
+**/__pycache__ export-ignore
+*.pyc export-ignore
+*.pem export-ignore
+*.key export-ignore
+*.zip export-ignore
+*.tar export-ignore
+*.gz export-ignore
+*.tex export-ignore
+*.log export-ignore

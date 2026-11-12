@@ -2,10 +2,10 @@
 package main
 
 import (
-	"Tyche/asyrand/config"
-	asyrand "Tyche/asyrand/protocol"
-	"Tyche/asyrand/protocol/aba"
-	"Tyche/utils/p2p"
+	"asyrand/asyrand/config"
+	asyrand "asyrand/asyrand/protocol"
+	"asyrand/asyrand/protocol/aba"
+	"asyrand/utils/p2p"
 	"context"
 	"encoding/json"
 	"flag"

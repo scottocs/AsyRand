@@ -1,7 +1,7 @@
 package pairing
 
 import (
-	"Tyche/utils/cryptoexec"
+	"asyrand/utils/cryptoexec"
 	"errors"
 	"math/big"
 

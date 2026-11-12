@@ -117,8 +117,8 @@ def main():
               'python3 asyrand/benchmarks/latest_report.py <新目录>']
     report = '\n'.join(lines)+'\n'
     (out/"report.txt").write_text(report)
-    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir())/"tyche-latest-mpl"))
-    os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir())/"tyche-latest-cache"))
+    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir())/"asyrand-latest-mpl"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir())/"asyrand-latest-cache"))
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

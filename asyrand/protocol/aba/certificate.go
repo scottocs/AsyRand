@@ -12,9 +12,9 @@ import (
 	"sort"
 	"unicode/utf8"
 
-	asig "Tyche/asyrand/crypto"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	asig "asyrand/asyrand/crypto"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 )
 
 const Protocol = "asyrand/quadratic-aba/v1"

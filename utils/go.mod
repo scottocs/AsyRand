@@ -1,4 +1,4 @@
-module Tyche/utils
+module asyrand/utils
 
 go 1.24.0
 

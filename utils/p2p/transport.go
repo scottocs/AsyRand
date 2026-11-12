@@ -1,7 +1,7 @@
 package p2p
 
 import (
-	"Tyche/utils/cryptoexec"
+	"asyrand/utils/cryptoexec"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -45,8 +45,8 @@ func AuthenticatedDelivery(t Transport) bool {
 	return ok && x.AuthenticatedDelivery()
 }
 
-var benchmarkEnabled = os.Getenv("TYCHE_BENCHMARK") == "1"
-var benchmarkProfiled = benchmarkEnabled && os.Getenv("TYCHE_PROFILE_NODE") != "" && os.Getenv("TYCHE_PROFILE_NODE") == os.Getenv("TYCHE_BENCHMARK_NODE")
+var benchmarkEnabled = os.Getenv("ASYRAND_BENCHMARK") == "1"
+var benchmarkProfiled = benchmarkEnabled && os.Getenv("ASYRAND_PROFILE_NODE") != "" && os.Getenv("ASYRAND_PROFILE_NODE") == os.Getenv("ASYRAND_BENCHMARK_NODE")
 
 // BenchmarkTask labels only executed work, including its child calls. CPU
 // profiling remains off unless the common benchmark probe enables it.
@@ -90,7 +90,7 @@ func OpenBenchmark(node string, transport Transport, total uint64) (*BenchmarkPr
 	if !ok || total < 2 {
 		return nil, fmt.Errorf("benchmark requires TCP transport and at least two outputs")
 	}
-	dir := os.Getenv("TYCHE_BENCHMARK_DIR")
+	dir := os.Getenv("ASYRAND_BENCHMARK_DIR")
 	if dir == "" {
 		dir = "/results"
 	}
@@ -165,7 +165,7 @@ func (p *BenchmarkProbe) Output(count uint64, extra func() any) error {
 		return err
 	}
 	p.last = count
-	if count == 1 && os.Getenv("TYCHE_PROFILE_NODE") == p.node {
+	if count == 1 && os.Getenv("ASYRAND_PROFILE_NODE") == p.node {
 		p.profile, err = os.Create(filepath.Join(p.dir, "generation.cpu.pprof"))
 		if err != nil {
 			return err
@@ -193,7 +193,7 @@ func (p *BenchmarkProbe) Finish(ctx context.Context) error {
 	if err := os.WriteFile(filepath.Join(p.dir, "generation-complete"), []byte("complete\n"), 0600); err != nil {
 		return err
 	}
-	barrier := os.Getenv("TYCHE_VERIFY_BARRIER")
+	barrier := os.Getenv("ASYRAND_VERIFY_BARRIER")
 	if barrier == "" {
 		return fmt.Errorf("benchmark verification barrier is required")
 	}

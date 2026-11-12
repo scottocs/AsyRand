@@ -1,7 +1,7 @@
 package crypto
 
 import (
-	"Tyche/utils/cryptoexec"
+	"asyrand/utils/cryptoexec"
 	"bytes"
 	"encoding/hex"
 	"errors"
@@ -9,9 +9,9 @@ import (
 	"sort"
 	"sync"
 
-	"Tyche/utils/p2p"
-	"Tyche/utils/pairing"
-	"Tyche/utils/verification"
+	"asyrand/utils/p2p"
+	"asyrand/utils/pairing"
+	"asyrand/utils/verification"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/share"
 	"go.dedis.ch/kyber/v3/util/random"
@@ -598,7 +598,7 @@ var independentH1 kyber.Point
 
 func h1Point(group *pairing.Suite) kyber.Point {
 	h1Once.Do(func() {
-		independentH1 = pairing.HashG2([]byte("SPURT-v2/PVSS/independent-h1"), []byte("TYCHE_SPURT_BLS12381G2_XMD:SHA-256_SSWU_RO_"))
+		independentH1 = pairing.HashG2([]byte("SPURT-v2/PVSS/independent-h1"), []byte("ASYRAND_SPURT_BLS12381G2_XMD:SHA-256_SSWU_RO_"))
 	})
 	return independentH1.Clone()
 }

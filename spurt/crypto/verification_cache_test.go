@@ -1,7 +1,7 @@
 package crypto
 
 import (
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"encoding/json"
 	"go.dedis.ch/kyber/v3"
 	"testing"

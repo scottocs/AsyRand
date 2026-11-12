@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"Tyche/spurt/config"
-	asig "Tyche/spurt/crypto"
-	spurt "Tyche/spurt/protocol"
-	"Tyche/utils/p2p"
+	"asyrand/spurt/config"
+	asig "asyrand/spurt/crypto"
+	spurt "asyrand/spurt/protocol"
+	"asyrand/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

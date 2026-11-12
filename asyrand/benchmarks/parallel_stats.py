@@ -138,7 +138,7 @@ def main():
     out = (args.out or ROOT / "asyrand/benchmarks" / datetime.now().strftime("parallel_%Y%m%d_%H%M%S")).resolve()
     out.mkdir(parents=True, exist_ok=args.resume)
     env = dict(os.environ, GOMAXPROCS="8")
-    environment = dict(protocol="asyrand-v2", parallel_consumption=args.parallel, transport="memory",
+    environment = dict(protocol="asyrand", parallel_consumption=args.parallel, transport="memory",
                        production_window=8, gomaxprocs=8, workers_per_node=4, repeats=args.repeats,
                        warmup_outputs=args.warmup, measured_intervals=args.intervals,
                        full_run_intervals=args.warmup + args.intervals, nodes=args.nodes,

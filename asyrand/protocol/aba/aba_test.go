@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	asig "Tyche/asyrand/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/asyrand/crypto"
+	"asyrand/utils/p2p"
 )
 
 type testCoin struct {

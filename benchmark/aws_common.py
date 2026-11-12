@@ -245,7 +245,7 @@ class Fleet:
         self.root = Path(root).resolve()
         self.plan = read(self.root / 'plan.json')
         self.name = self.plan['campaign']
-        assert re.fullmatch(r'tyche-aws-[a-z0-9-]+', self.name)
+        assert re.fullmatch(r'asyrand-aws-[a-z0-9-]+', self.name)
         settings = read(self.plan['settings_path'])
         self.key_name = settings['key']['name']
         self.key = Path(settings['key']['path']).expanduser()
@@ -265,13 +265,13 @@ class Fleet:
         save(self.root / 'fleet.private.json', self.data)
 
     def tags(self, role):
-        return [{'Key': 'TycheCampaign', 'Value': self.name}, {'Key': 'Name', 'Value': self.name},
+        return [{'Key': 'AsyRandCampaign', 'Value': self.name}, {'Key': 'Name', 'Value': self.name},
                 {'Key': 'Role', 'Value': role}]
 
     def controller_access(self,host):
         group=self.data['groups'][host['region']][0]
         observed=self.clients[host['region']].describe_security_groups(GroupIds=[group])['SecurityGroups'][0]
-        assert any(t['Key']=='TycheCampaign' and t['Value']==self.name for t in observed['Tags'])
+        assert any(t['Key']=='AsyRandCampaign' and t['Value']==self.name for t in observed['Tags'])
         ips=egress_addresses()
         for ip in ips:self.ingress(host['region'],group,[dict(IpProtocol='tcp',FromPort=22,ToPort=22,
                                 IpRanges=[dict(CidrIp=ip+'/32',Description='campaign-control-egress')])])
@@ -336,9 +336,9 @@ class Fleet:
             if not ids:continue
             c=self.clients[region]
             observed=[i for batch in c.describe_instances(InstanceIds=ids)['Reservations'] for i in batch['Instances']]
-            assert all(any(t['Key']=='TycheCampaign' and t['Value']==self.name for t in i['Tags']) for i in observed)
+            assert all(any(t['Key']=='AsyRandCampaign' and t['Value']==self.name for t in i['Tags']) for i in observed)
             attached=c.describe_volumes(Filters=[dict(Name='attachment.instance-id',Values=ids)])['Volumes']
-            assert all(any(t['Key']=='TycheCampaign' and t['Value']==self.name for t in v['Tags']) for v in attached)
+            assert all(any(t['Key']=='AsyRandCampaign' and t['Value']==self.name for t in v['Tags']) for v in attached)
             volumes[region]=[v['VolumeId'] for v in attached]
             c.terminate_instances(InstanceIds=ids)
         deadline=time.monotonic()+600
@@ -360,7 +360,7 @@ class Fleet:
     def refresh(self):
         def one(region):
             rows = self.clients[region].describe_instances(Filters=[
-                {'Name': 'tag:TycheCampaign', 'Values': [self.name]},
+                {'Name': 'tag:AsyRandCampaign', 'Values': [self.name]},
                 {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped', 'shutting-down']}])
             return [dict(id=i['InstanceId'], region=region, ip=i.get('PublicIpAddress'),
                          private_ip=i.get('PrivateIpAddress'), state=i['State']['Name'],
@@ -394,13 +394,13 @@ class Fleet:
         c = self.clients[region]
         network = self.data['networks'][region]
         vpc = network['subnets'][0]['VpcId']
-        existing = c.describe_security_groups(Filters=[{'Name': 'tag:TycheCampaign', 'Values': [self.name]}])['SecurityGroups']
+        existing = c.describe_security_groups(Filters=[{'Name': 'tag:AsyRandCampaign', 'Values': [self.name]}])['SecurityGroups']
         found = {g['GroupName']: g['GroupId'] for g in existing}
         ids = []
         for suffix in ('ssh', 'peer0', 'peer1', 'peer2', 'peer3'):
             name = f'{self.name}-{suffix}'
             if name not in found:
-                found[name] = c.create_security_group(GroupName=name, VpcId=vpc, Description='Tyche scoped native AWS experiment',
+                found[name] = c.create_security_group(GroupName=name, VpcId=vpc, Description='AsyRand scoped native AWS experiment',
                     TagSpecifications=[{'ResourceType': 'security-group', 'Tags': self.tags(suffix)}])['GroupId']
             ids.append(found[name])
         with LOCK:
@@ -568,7 +568,7 @@ class Fleet:
         for attempt in range(12):
             volumes=[]
             for region in self.regions:
-                volumes.extend(self.clients[region].describe_volumes(Filters=[{'Name': 'tag:TycheCampaign', 'Values': [self.name]}])['Volumes'])
+                volumes.extend(self.clients[region].describe_volumes(Filters=[{'Name': 'tag:AsyRandCampaign', 'Values': [self.name]}])['Volumes'])
             if not volumes:break
             time.sleep(5)
         receipt = dict(valid=not errors and not volumes, checked_at=utc(), remaining_instances=[],
@@ -596,7 +596,7 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads=True
     request_queue_size=256
 class Handler(socketserver.BaseRequestHandler):
-    def handle(self): self.request.sendall(b'tyche-mesh-v1\n')
+    def handle(self): self.request.sendall(b'asyrand-mesh-v1\n')
 Server(('0.0.0.0',9000),Handler).serve_forever()
 '''
 
@@ -607,7 +607,7 @@ hosts=json.loads(sys.argv[1])
 def check(h):
     try:
         with socket.create_connection((h['ip'],9000),timeout=4) as s:
-            s.settimeout(4);assert s.makefile('rb').readline(64)==b'tyche-mesh-v1\n'
+            s.settimeout(4);assert s.makefile('rb').readline(64)==b'asyrand-mesh-v1\n'
         return h['id'],True
     except Exception:return h['id'],False
 with concurrent.futures.ThreadPoolExecutor(max_workers=16) as p: print(json.dumps(dict(p.map(check,hosts))))
@@ -673,10 +673,10 @@ def worker_launcher(base, cell, node, protocol, epochs, unit, procs):
         command += ['-setup-file', folder+'/setup.json']
     if protocol == 'asyrand':
         command += ['-history', folder+'/history.json']
-    env = dict(GOMAXPROCS=str(procs), GOMEMLIMIT='2800MiB', TYCHE_CRYPTO_PARALLELISM='2',
-               TYCHE_ASY_PREDECRYPT='1', TYCHE_ASY_CONSUMER_PRIORITY='1', TYCHE_BENCHMARK='1',
-               TYCHE_BENCHMARK_NODE=f'node{node}', TYCHE_PROFILE_NODE='node0',
-               TYCHE_BENCHMARK_DIR=folder, TYCHE_VERIFY_BARRIER=folder+'/verify-start')
+    env = dict(GOMAXPROCS=str(procs), GOMEMLIMIT='2800MiB', ASYRAND_CRYPTO_PARALLELISM='2',
+               ASYRAND_ASY_PREDECRYPT='1', ASYRAND_ASY_CONSUMER_PRIORITY='1', ASYRAND_BENCHMARK='1',
+               ASYRAND_BENCHMARK_NODE=f'node{node}', ASYRAND_PROFILE_NODE='node0',
+               ASYRAND_BENCHMARK_DIR=folder, ASYRAND_VERIFY_BARRIER=folder+'/verify-start')
     return ('#!/bin/bash\nset -eu\ncd '+shlex.quote(folder)+'\n'
             'finish() { code=$?; trap - EXIT; printf "%s\\n" "$code" > node.exit; chown -R ubuntu:ubuntu '+shlex.quote(folder)+'; exit "$code"; }\ntrap finish EXIT\n'
             'mount --make-rprivate /\n'

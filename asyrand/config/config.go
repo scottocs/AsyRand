@@ -10,8 +10,8 @@ import (
 	"os"
 	"sort"
 
-	asig "Tyche/asyrand/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/asyrand/crypto"
+	"asyrand/utils/p2p"
 )
 
 type Peer struct {
@@ -69,7 +69,7 @@ func Load(path string) (Config, error) {
 		cfg.Round = 1
 	}
 	if cfg.Protocol == "" {
-		cfg.Protocol = "asyrand-v2"
+		cfg.Protocol = "asyrand"
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = "memory"
@@ -130,7 +130,7 @@ func (c Config) Validate() error {
 	if n == 0 || c.F < 0 || 3*c.F >= n {
 		return errors.New("AsyRand requires n > 3f >= 0")
 	}
-	if c.Protocol != "asyrand-v2" || (c.Transport != "memory" && c.Transport != "tcp") {
+	if c.Protocol != "asyrand" || (c.Transport != "memory" && c.Transport != "tcp") {
 		return errors.New("invalid AsyRand protocol or transport")
 	}
 	if c.ProductionWindow < 2 || c.MaxPool < 1 || c.TransportBuffer < 1 || c.SendRetryMS < 1 || c.RecoveryMS < 1 || c.ABAFutureRounds < 1 || c.ABAFutureRounds > 256 || c.HistoryBatch < 1 || c.HistoryBatch > 64 || c.Round < 1 || c.EpochMS < 1 || c.Warmup < 0 || c.SessionID == "" {

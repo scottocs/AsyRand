@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 sys.dont_write_bytecode = True
@@ -54,7 +55,7 @@ def make_config(module, n, repeat, parallel, args, label):
                cluster_ips={id: "127.0.0.1" for id in ids},
                peers_p2p_port={id: 9000+i for i, id in enumerate(ids)},
                node_key_seed={id: old.get(id, hashlib.sha256(
-                   ("Tyche/local-benchmark/TEST-ONLY/"+id).encode()).hexdigest()) for id in ids},
+                   ("asyrand/local-benchmark/TEST-ONLY/"+id).encode()).hexdigest()) for id in ids},
                name=f"bench-local-{n}", transport="memory", f=(n-1)//3,
                round=args.warmup+args.intervals+1, warmup_outputs=args.warmup,
                prefill_ms=3000, epoch_timeout_ms=60000, report_interval_ms=60000, max_pool=4)
@@ -101,7 +102,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     (out/"bin").mkdir()
     env = dict(os.environ, GOMAXPROCS="8", GOARCH=args.goarch,
-               GOCACHE="/private/tmp/tyche-crypto-go-cache")
+               GOCACHE=os.environ.get("GOCACHE", str(Path(tempfile.gettempdir())/"asyrand-crypto-go-cache")))
     metadata = dict(platform=platform.platform(), go=command(["go", "version"]), target_goarch=args.goarch,
                     gomaxprocs=8, workers_per_node=4, transport="memory", nodes=args.nodes,
                     warmup_outputs=args.warmup, measured_intervals=args.intervals, repeats=args.repeats,
@@ -111,7 +112,7 @@ def main():
                     grandline_beacon_mode="standard: authenticated one-time online COMMIT, no outer signatures",
                     production_window=8, spurt_aggregation_lookahead=8, faults_injected=0,
                     spurt_quorum="n-f, equal to 2f+1 when n=3f+1; FINALIZE relay at f+1",
-                    git_revision=command(["git", "rev-parse", "HEAD"], cwd=ROOT), command=sys.argv,
+                    git_revision="anonymous-source", command=sys.argv,
                     run_order="serial; rotate variants each repetition",
                     byte_accounting="committee-wide sent bytes including loopback, not sent+received",
                     asyrand_snapshot="total counters and component counters derived from the same frozen per-type snapshots",

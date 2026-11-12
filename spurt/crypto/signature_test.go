@@ -3,7 +3,7 @@ package crypto
 import "testing"
 
 func TestNativeSignatureBindsMessageAndSigner(t *testing.T) {
-	msg := []byte("Tyche beacon certificate")
+	msg := []byte("AsyRand beacon certificate")
 	kp, err := GenerateKeyPair()
 	if err != nil {
 		t.Fatal(err)

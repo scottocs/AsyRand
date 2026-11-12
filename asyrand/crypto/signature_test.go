@@ -8,7 +8,7 @@ import (
 )
 
 func TestAggregateSignatureVerify(t *testing.T) {
-	msg := []byte("Tyche beacon certificate")
+	msg := []byte("AsyRand beacon certificate")
 	pubs := make(map[string]ed25519.PublicKey)
 	agg := NewAggregateSignature()
 
@@ -30,7 +30,7 @@ func TestAggregateSignatureVerify(t *testing.T) {
 }
 
 func TestBLSAggregateSignatureVerify(t *testing.T) {
-	msg := []byte("Tyche ready certificate")
+	msg := []byte("AsyRand ready certificate")
 	seeds := map[string][]byte{
 		"n0": HashBytes([]byte("n0")),
 		"n1": HashBytes([]byte("n1")),

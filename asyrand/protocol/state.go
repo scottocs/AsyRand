@@ -1,7 +1,7 @@
 package asyrand
 
 import (
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"errors"
 	"math/big"
 )

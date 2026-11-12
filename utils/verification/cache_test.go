@@ -1,7 +1,7 @@
 package verification
 
 import (
-	"Tyche/utils/cryptoexec"
+	"asyrand/utils/cryptoexec"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -16,7 +16,7 @@ import (
 )
 
 func TestBudgetServiceNestedProofsAndCacheOwnership(t *testing.T) {
-	if os.Getenv("TYCHE_TEST_CPU_GROUP") != "1" {
+	if os.Getenv("ASYRAND_TEST_CPU_GROUP") != "1" {
 		t.Skip("isolated Linux budget fixture")
 	}
 	c := New()
@@ -62,7 +62,7 @@ func TestBudgetServiceNestedProofsAndCacheOwnership(t *testing.T) {
 }
 
 func TestBudgetFastPrimitiveRunsBetweenProofEquations(t *testing.T) {
-	if os.Getenv("TYCHE_TEST_CPU_GROUP") != "1" {
+	if os.Getenv("ASYRAND_TEST_CPU_GROUP") != "1" {
 		t.Skip("isolated Linux budget fixture")
 	}
 	started, done := make(chan struct{}), make(chan struct{})
@@ -102,11 +102,11 @@ func TestParallelProofPartitionsRejectInvalidInput(t *testing.T) {
 // This test is run separately inside the controller's dedicated Linux cgroup.
 // It exercises actual TID migration, nesting, quota throttling and restoration.
 func TestCPUGroupLinuxIntegration(t *testing.T) {
-	if os.Getenv("TYCHE_TEST_CPU_GROUP") != "1" {
+	if os.Getenv("ASYRAND_TEST_CPU_GROUP") != "1" {
 		t.Skip("requires the isolated Linux controller fixture")
 	}
 	var cfg cryptoexec.CPUGroup
-	raw, err := os.ReadFile(os.Getenv("TYCHE_CRYPTO_CGROUP_CONFIG"))
+	raw, err := os.ReadFile(os.Getenv("ASYRAND_CRYPTO_CGROUP_CONFIG"))
 	if err != nil || json.Unmarshal(raw, &cfg) != nil {
 		t.Fatal("missing group config", err)
 	}
@@ -164,7 +164,7 @@ func TestCPUGroupLinuxIntegration(t *testing.T) {
 }
 
 func BenchmarkBudgetDispatch(b *testing.B) {
-	if os.Getenv("TYCHE_TEST_CPU_GROUP") != "1" {
+	if os.Getenv("ASYRAND_TEST_CPU_GROUP") != "1" {
 		b.Skip("isolated Linux cgroup fixture")
 	}
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)

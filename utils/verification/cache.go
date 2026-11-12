@@ -3,7 +3,7 @@
 package verification
 
 import (
-	"Tyche/utils/cryptoexec"
+	"asyrand/utils/cryptoexec"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"

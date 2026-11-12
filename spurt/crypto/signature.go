@@ -1,8 +1,8 @@
 package crypto
 
 import (
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/verification"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/verification"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"

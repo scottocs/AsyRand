@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LABEL = "tyche.benchmark"
+LABEL = "asyrand.benchmark"
 NETWORK = dict(profile="docker-netem-uniform-v1", bandwidth_mbps=1000,
                delay_distribution="uniform", delay_min_ms=10, delay_max_ms=30,
                loss_percent=0, reorder_percent=0, duplicate_percent=0,
@@ -79,7 +79,7 @@ def isolated_subnet(network, occupied):
 def config(protocol, n, epochs, seed, ips, epoch_timeout_ms, production_window=8):
     members = [f"node{i}" for i in range(n)]
     return dict(name=f"docker-{protocol}-n{n}-s{seed}", protocol={
-        "spurt": "spurt-v1", "grandline": "grandline", "asyrand": "asyrand-v2"}[protocol],
+        "spurt": "spurt-v1", "grandline": "grandline", "asyrand": "asyrand"}[protocol],
         transport="tcp", authenticated_tcp=True, f=(n-1)//3, round=epochs,
         listen_ip="0.0.0.0", prefill_ms=3000, epoch_timeout_ms=epoch_timeout_ms,
         report_interval_ms=60000, linger_ms=86400000, max_pool=1,
@@ -175,8 +175,8 @@ class CryptoBudget:
     def options(self, i):
         if not self.enabled: return []
         return ['--cgroup-parent',self.slice,
-            '--mount',f'type=bind,src={self.path},dst=/tyche-cgroups',
-            '-e',f'TYCHE_CRYPTO_CGROUP_CONFIG=/control/node{i}/crypto-group.json']
+            '--mount',f'type=bind,src={self.path},dst=/asyrand-cgroups',
+            '-e',f'ASYRAND_CRYPTO_CGROUP_CONFIG=/control/node{i}/crypto-group.json']
 
     def configure(self, containers):
         if not self.enabled: return
@@ -191,7 +191,7 @@ class CryptoBudget:
             self.helper(f'mkdir /budget/{scope}/crypto; echo threaded > /budget/{scope}/crypto/cgroup.type; '
                 f'echo +cpu > /budget/{scope}/cgroup.subtree_control; '
                 f'echo "{self.quota} 10000" > /budget/{scope}/crypto/cpu.max')
-            base=f'/tyche-cgroups/{scope}'
+            base=f'/asyrand-cgroups/{scope}'
             write_json(self.out/f'node{i}/crypto-group.json',dict(threads=base+'/crypto/cgroup.threads',
                 parent_threads=base+'/cgroup.threads',stat=base+'/crypto/cpu.stat',max=base+'/crypto/cpu.max',workers=self.args.crypto_workers))
             records.append(dict(node=i,container_id=c['Id'],scope=scope,
@@ -247,7 +247,7 @@ def run_cell(args, campaign, protocol, n, rep):
         raise RuntimeError(f"unvalidated existing cell {out}; preserve it and select a new campaign or archive the cell before retrying")
     out.mkdir(parents=True)
     token = hashlib.sha256(str(out).encode()).hexdigest()[:12]
-    network = f"tyche-{token}"
+    network = f"asyrand-{token}"
     names = [f"{network}-node{i}" for i in range(n)]
     seed = rep
     # Match Silk's /24 address and fixed MAC assignment; labels isolate cleanup.
@@ -297,7 +297,7 @@ def run_cell(args, campaign, protocol, n, rep):
             # Offline common setup is excluded from measured beacon execution.
             setup = docker("run", "--rm", "--network", "none", "--cpus", "4", "--memory", "8g",
                 "--label", f"{LABEL}.campaign={campaign.name}",
-                "-v", f"{out}:/results", "--entrypoint", "/opt/tyche/bin/grandline", args.image,
+                "-v", f"{out}:/results", "--entrypoint", "/opt/asyrand/bin/grandline", args.image,
                 "-config", "/results/config.json", "-write-setup", "/results/setup.json", timeout=7200)
             (out/"setup.log").write_text(setup.stdout+setup.stderr)
         docker("network", "create", "--subnet", subnet, "--label", f"{LABEL}.cell={network}", network)
@@ -311,10 +311,10 @@ def run_cell(args, campaign, protocol, n, rep):
                    "--cpus", str(args.cpu_cores), "--memory", f"{args.memory_mib}m", "--memory-swap", f"{args.memory_mib}m",
                    "--log-driver", "json-file", "--log-opt", "max-size=100m", "--log-opt", "max-file=3",
                    "-e", f"GOMAXPROCS={args.go_max_procs}",
-                   "-e", f"TYCHE_CRYPTO_PARALLELISM={args.crypto_parallelism}", "-e", f"NETEM_SEED={netem_seed(seed,i)}",
+                   "-e", f"ASYRAND_CRYPTO_PARALLELISM={args.crypto_parallelism}", "-e", f"NETEM_SEED={netem_seed(seed,i)}",
                    "-e", f"NODE_NEIGHBORS={neighbors}",
                    "-v", f"{node}:/results", "-v", f"{out}:/control:ro",
-                   args.image, f"/opt/tyche/bin/{protocol}", "-config", "/control/config.json",
+                   args.image, f"/opt/asyrand/bin/{protocol}", "-config", "/control/config.json",
                    "-node", f"node{i}", "-transport", "tcp"]
             if protocol == "grandline":
                 cmd += ["-setup-file", "/control/setup.json"]
@@ -324,9 +324,9 @@ def run_cell(args, campaign, protocol, n, rep):
                 cmd[1:1] = ["-e", f"GOMEMLIMIT={args.go_memory_limit}"]
             cmd[1:1] = budget.options(i)
             if args.measure_generation:
-                cmd[1:1] = ["-e","TYCHE_BENCHMARK=1","-e","TYCHE_PROFILE_NODE=node0",
-                    "-e",f"TYCHE_BENCHMARK_NODE=node{i}","-e","TYCHE_BENCHMARK_DIR=/results",
-                    "-e","TYCHE_VERIFY_BARRIER=/control/verify-start"]
+                cmd[1:1] = ["-e","ASYRAND_BENCHMARK=1","-e","ASYRAND_PROFILE_NODE=node0",
+                    "-e",f"ASYRAND_BENCHMARK_NODE=node{i}","-e","ASYRAND_BENCHMARK_DIR=/results",
+                    "-e","ASYRAND_VERIFY_BARRIER=/control/verify-start"]
             docker(*cmd)
             created.append(name)
         parallel(lambda name: docker("start", name), names)
@@ -499,7 +499,7 @@ def main():
                    help='Exclude the first W outputs using checkpoint W to N, W must be a multiple of 100')
     p.add_argument('--skip-oom-n80',action='store_true',help='Cancel remaining n80 cells after an n80 OOM')
     p.add_argument("--repetitions", type=int, default=3)
-    p.add_argument("--image", default="tyche-benchmark:latest")
+    p.add_argument("--image", default="asyrand-benchmark:latest")
     p.add_argument("--epoch-timeout-ms", type=int, default=600000)
     p.add_argument("--timeout-seconds", type=int, default=43200)
     p.add_argument("--poll-seconds", type=int, default=60)

@@ -151,7 +151,7 @@ def build_result(folder, protocol, n, repetition, epochs=600, history_receipt=No
                            origin='previously audited complete node archive receipt')
     hashes = {name: sha_file(folder / name) for name in
               ('stdout.log', 'measurement.jsonl', 'config.json', 'cpu.max', 'memory.events', 'node.exit')}
-    result = dict(schema='tyche-node-result-v1', valid=True, protocol=protocol, n=n, node=node,
+    result = dict(schema='asyrand-node-result-v1', valid=True, protocol=protocol, n=n, node=node,
                   repetition=repetition, faults_injected=0, fault_budget=(n-1)//3, outputs=epochs,
                   warmup=200, intervals=epochs-200, output_count=len(outputs), contiguous_outputs=True,
                   beacons_sha256=beacon_hash(outputs),

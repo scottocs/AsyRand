@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"sort"
 
-	"Tyche/utils/p2p"
-	"Tyche/utils/pairing"
-	"Tyche/utils/verification"
+	"asyrand/utils/p2p"
+	"asyrand/utils/pairing"
+	"asyrand/utils/verification"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/share"
 )
@@ -287,7 +287,7 @@ func recoverG1PublicKey(c PVSSCommitment, members []p2p.NodeID) (string, error) 
 }
 
 func hashToG1(group interface{ G1() kyber.Group }, msg []byte) kyber.Point {
-	return pairing.HashG2(msg, []byte("TYCHE_GRANDLINE_BEACON_BLS12381G2_XMD:SHA-256_SSWU_RO_"))
+	return pairing.HashG2(msg, []byte("ASYRAND_GRANDLINE_BEACON_BLS12381G2_XMD:SHA-256_SSWU_RO_"))
 }
 
 func proveBeaconDLEQ(group interface {

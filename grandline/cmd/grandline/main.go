@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	config "Tyche/grandline/config"
-	asig "Tyche/grandline/crypto"
-	grandline "Tyche/grandline/protocol"
-	"Tyche/utils/p2p"
+	config "asyrand/grandline/config"
+	asig "asyrand/grandline/crypto"
+	grandline "asyrand/grandline/protocol"
+	"asyrand/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

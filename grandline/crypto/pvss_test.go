@@ -5,7 +5,7 @@ import (
 	"crypto/ed25519"
 	"testing"
 
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

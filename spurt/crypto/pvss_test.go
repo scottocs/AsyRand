@@ -6,12 +6,12 @@ import (
 	"maps"
 	"testing"
 
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 
-// Run with TYCHE_CRYPTO_PARALLELISM=1 and =2 in separate processes. The
+// Run with ASYRAND_CRYPTO_PARALLELISM=1 and =2 in separate processes. The
 // distributed benchmark still decides whether the shorter generation path
 // improves complete beacon latency under the shared CPU budget.
 func BenchmarkPVSSProduction(b *testing.B) {

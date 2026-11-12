@@ -1,7 +1,7 @@
 package rbc
 
 import (
-	"Tyche/utils/verification"
+	"asyrand/utils/verification"
 	"testing"
 )
 

@@ -1,13 +1,13 @@
 package asyrand
 
 import (
-	"Tyche/asyrand/config"
-	"Tyche/asyrand/crypto"
-	"Tyche/asyrand/protocol/aba"
-	"Tyche/asyrand/protocol/rbc"
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/asyrand/config"
+	"asyrand/asyrand/crypto"
+	"asyrand/asyrand/protocol/aba"
+	"asyrand/asyrand/protocol/rbc"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -1526,9 +1526,9 @@ func (n *Node) releaseOwnShare(h reconHeader, share crypto.PVSSDecryptedShare, e
 }
 
 func enableConsumptionPrefetch(workers int) bool {
-	return workers >= 2 && os.Getenv("TYCHE_ASY_PREDECRYPT") == "1"
+	return workers >= 2 && os.Getenv("ASYRAND_ASY_PREDECRYPT") == "1"
 }
 
 func enableConsumerPriority() bool {
-	return os.Getenv("TYCHE_ASY_CONSUMER_PRIORITY") == "1"
+	return os.Getenv("ASYRAND_ASY_CONSUMER_PRIORITY") == "1"
 }

@@ -1,11 +1,11 @@
 package grandline
 
 import (
-	asig "Tyche/grandline/crypto"
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/pairing"
-	"Tyche/utils/verification"
+	asig "asyrand/grandline/crypto"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/pairing"
+	"asyrand/utils/verification"
 	"context"
 	"encoding/hex"
 	"strings"

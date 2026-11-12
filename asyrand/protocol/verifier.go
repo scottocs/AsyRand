@@ -1,11 +1,11 @@
 package asyrand
 
 import (
-	"Tyche/asyrand/crypto"
-	"Tyche/asyrand/protocol/aba"
-	"Tyche/asyrand/protocol/rbc"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/asyrand/crypto"
+	"asyrand/asyrand/protocol/aba"
+	"asyrand/asyrand/protocol/rbc"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	"errors"
 	"fmt"
 )

@@ -32,7 +32,7 @@ type BLSAggregateSignature struct {
 
 func NewBLSKeyPairFromSeed(seed []byte) BLSKeyPair {
 	suite := pairingSuite()
-	sk := suite.G2().Scalar().SetBytes(HashBytes([]byte("Tyche-v1/BLS/key"), seed))
+	sk := suite.G2().Scalar().SetBytes(HashBytes([]byte("asyrand/BLS/key"), seed))
 	if sk.Equal(suite.G2().Scalar().Zero()) {
 		sk = suite.G2().Scalar().One()
 	}

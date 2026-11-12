@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	"go.dedis.ch/kyber/v3"
 )
 

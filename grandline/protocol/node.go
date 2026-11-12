@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	asig "Tyche/grandline/crypto"
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	asig "asyrand/grandline/crypto"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 )
 
 const Protocol = "grandline/authenticated-v1"

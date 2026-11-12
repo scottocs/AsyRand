@@ -1,13 +1,13 @@
 package crypto
 
 import (
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	"go.dedis.ch/kyber/v3"
 )
 
-const albatrossPVSSVersion = "AsyRand-v1/ALBATROSS-DDH/edwards25519"
+const albatrossPVSSVersion = "asyrand/ALBATROSS-DDH/edwards25519"
 
 // NewALBATROSSPVSSScheme creates the single-secret ALBATROSS PVSS from
 // Cascudo and David, ASIACRYPT 2020, Sections 3.2 and 4.1:

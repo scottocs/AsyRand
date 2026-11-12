@@ -1,7 +1,7 @@
 package crypto
 
 import (
-	"Tyche/utils/verification"
+	"asyrand/utils/verification"
 	"testing"
 )
 

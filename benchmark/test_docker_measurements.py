@@ -228,7 +228,7 @@ class AwsRefactorTests(unittest.TestCase):
             root = Path(tmp)
             out = root / 'cell'
             out.mkdir()
-            result_io.save(root / 'plan.json', dict(campaign='tyche-aws-test'))
+            result_io.save(root / 'plan.json', dict(campaign='asyrand-aws-test'))
             ssh = Mock()
             ssh.call.return_value.stdout = json.dumps(dict(beacons_sha256='matching-output'))
             hosts = [dict(node=i, folder=f'/campaign/node{i}') for i in range(2)]
@@ -244,16 +244,16 @@ class AwsRefactorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=BENCH / 'local') as tmp:
             fleet = repeat.Fleet.__new__(repeat.Fleet)
             fleet.root = Path(tmp)
-            fleet.name = 'tyche-aws-test'
+            fleet.name = 'asyrand-aws-test'
             fleet.regions = ['region']
             gateway = dict(id='gateway', role='bastion', region='region')
             worker = dict(id='worker', role='candidate', region='region')
             fleet.refresh = Mock(return_value=[gateway, worker])
             client = Mock()
             client.describe_instances.return_value = dict(Reservations=[dict(Instances=[dict(
-                Tags=[dict(Key='TycheCampaign', Value=fleet.name)])])])
+                Tags=[dict(Key='AsyRandCampaign', Value=fleet.name)])])])
             client.describe_volumes.return_value = dict(Volumes=[dict(VolumeId='foreign',
-                Tags=[dict(Key='TycheCampaign', Value='another-campaign')])])
+                Tags=[dict(Key='AsyRandCampaign', Value='another-campaign')])])
             fleet.clients = {'region': client}
             with self.assertRaises(AssertionError):
                 fleet.release_workers(16, gateway)

@@ -1,8 +1,8 @@
 package aba
 
 import (
-	asig "Tyche/asyrand/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/asyrand/crypto"
+	"asyrand/utils/p2p"
 	"context"
 	"crypto/ed25519"
 	"strings"

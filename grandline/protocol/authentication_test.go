@@ -4,10 +4,10 @@ import (
 	"encoding/hex"
 	"testing"
 
-	asig "Tyche/grandline/crypto"
-	"Tyche/utils/p2p"
-	"Tyche/utils/pairing"
-	"Tyche/utils/verification"
+	asig "asyrand/grandline/crypto"
+	"asyrand/utils/p2p"
+	"asyrand/utils/pairing"
+	"asyrand/utils/verification"
 )
 
 func TestUnsignedShareRequiresAuthenticatedDeliveryBeforeBuffering(t *testing.T) {

@@ -1,15 +1,15 @@
 package spurt
 
 import (
-	"Tyche/utils/cryptoexec"
+	"asyrand/utils/cryptoexec"
 	"crypto/ed25519"
 	"encoding/hex"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	asig "Tyche/spurt/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/spurt/crypto"
+	"asyrand/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 )
 

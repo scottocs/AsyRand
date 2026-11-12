@@ -1,8 +1,7 @@
 # AsyRand implementation
 
-This module implements the individual-object AsyRand construction in
-`paper/Tyche/main.tex`. The previous copied SPURT command/state machine has been
-replaced. The current wire/config version is `asyrand-v2`: it follows the
+This module implements the individual-object AsyRand construction described in
+the manuscript. The configuration protocol name is `asyrand`: it follows the
 shared-column Producer and BEACON-only Consumer history. Version 1 archives
 and mixed-version peers cannot be reused under this version. It uses contextual single-secret ALBATROSS PVSS and local-coin Quadratic-ABA;
 beacon generation has no external common-coin service.
@@ -406,6 +405,6 @@ encodings identical to Kyber. Double-scalar proof equations share a doubling
 chain; the complete integer-order subgroup check is retained. Secret-key,
 polynomial and nonce operations keep the original constant-time `Mul` path.
 ALBATROSS generation, verification and public interpolation can use bounded
-independent partitions via `TYCHE_CRYPTO_PARALLELISM=2`. Cold-verification
+independent partitions via `ASYRAND_CRYPTO_PARALLELISM=2`. Cold-verification
 microbenchmarks clear both decoded-point and successful-proof caches; the
 warm-decoding variant still executes every proof, retaining only decoded points.

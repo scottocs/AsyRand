@@ -55,7 +55,7 @@ simulated offline setup; SPURT does not implement full view change.
 
 ```sh
 cd asyrand
-GOARCH=arm64 GOCACHE=/private/tmp/tyche-crypto-go-cache \
+GOARCH=arm64 GOCACHE=/private/tmp/asyrand-crypto-go-cache \
   go test ./crypto -run '^$' -bench '^BenchmarkCurve' \
   -benchmem -benchtime=1s -count=5 -cpu=1
 ```

@@ -13,16 +13,16 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	fasted "filippo.io/edwards25519"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/group/edwards25519"
 	"go.dedis.ch/kyber/v3/share"
 )
 
-const pvssVersion = "AsyRand-v1/SCRAPE-DDH/edwards25519"
+const pvssVersion = "asyrand/SCRAPE-DDH/edwards25519"
 const pvssPointCacheLimit = 4096
 
 // Independently map public labels to curve points and clear the cofactor.

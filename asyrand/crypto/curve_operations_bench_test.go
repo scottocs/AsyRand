@@ -1,7 +1,7 @@
 package crypto_test
 
 import (
-	"Tyche/utils/pairing"
+	"asyrand/utils/pairing"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/group/edwards25519"
 	"testing"

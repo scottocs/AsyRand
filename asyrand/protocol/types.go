@@ -1,11 +1,11 @@
 package asyrand
 
 import (
-	"Tyche/asyrand/config"
-	"Tyche/asyrand/crypto"
-	"Tyche/asyrand/protocol/aba"
-	"Tyche/asyrand/protocol/rbc"
-	"Tyche/utils/p2p"
+	"asyrand/asyrand/config"
+	"asyrand/asyrand/crypto"
+	"asyrand/asyrand/protocol/aba"
+	"asyrand/asyrand/protocol/rbc"
+	"asyrand/utils/p2p"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"

@@ -9,8 +9,8 @@ import (
 	"os"
 	"sort"
 
-	asig "Tyche/grandline/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/grandline/crypto"
+	"asyrand/utils/p2p"
 )
 
 type Peer struct {

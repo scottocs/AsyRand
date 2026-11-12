@@ -38,7 +38,7 @@ SPURT does not maintain a producer-consumer queue. Each leader/epoch caches only
 ## Run a Local 8-Node Memory Cluster
 
 ```bash
-cd /path/to/Tyche/spurt
+cd /path/to/asyrand/spurt
 GOCACHE=/private/tmp/spurt-go-cache go run ./cmd/spurt -config configs/local_8.json
 ```
 

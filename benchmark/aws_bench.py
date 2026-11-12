@@ -72,9 +72,9 @@ class RepeatFleet(common.Fleet):
                 return
             c = self.clients[region]
             observed = [i for r in c.describe_instances(InstanceIds=ids)['Reservations'] for i in r['Instances']]
-            assert all((any((t['Key'] == 'TycheCampaign' and t['Value'] == self.name for t in i['Tags'])) for i in observed))
+            assert all((any((t['Key'] == 'AsyRandCampaign' and t['Value'] == self.name for t in i['Tags'])) for i in observed))
             attached = c.describe_volumes(Filters=[dict(Name='attachment.instance-id', Values=ids)])['Volumes']
-            assert all((any((t['Key'] == 'TycheCampaign' and t['Value'] == self.name for t in v['Tags'])) for v in attached))
+            assert all((any((t['Key'] == 'AsyRandCampaign' and t['Value'] == self.name for t in v['Tags'])) for v in attached))
             volumes[region] = [v['VolumeId'] for v in attached]
             c.terminate_instances(InstanceIds=ids)
         parallel(terminate_region, self.regions, 8)
@@ -166,7 +166,7 @@ class SingleCampaign(Campaign):
         def deploy(item):
             (i, h) = item
             folder = base + '/' + cell + f'/node{i}'
-            unit = 'tyche-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24]
+            unit = 'asyrand-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24]
             ssh.call(h, 'mkdir -p ' + shlex.quote(folder) + '; test ! -e ' + shlex.quote(folder + '/node.exit'))
             ssh.put(h, out / 'config.json', folder + '/config.json')
             if protocol == 'grandline':
@@ -194,7 +194,7 @@ class SingleCampaign(Campaign):
             else:
                 raise RuntimeError('native namespace readiness timeout')
             return dict(h, unit=unit, folder=folder)
-        active = [dict(h, unit='tyche-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24], folder=base + '/' + cell + f'/node{i}') for (i, h) in enumerate(hosts)]
+        active = [dict(h, unit='asyrand-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24], folder=base + '/' + cell + f'/node{i}') for (i, h) in enumerate(hosts)]
         try:
             active = parallel(deploy, list(enumerate(hosts)))
             save(out / 'units.json', active)
@@ -281,8 +281,8 @@ class SingleCampaign(Campaign):
         cfg = read(settings)
         assert cfg['instances']['type'] == 't3a.medium' and len(cfg['instances']['regions']) == 8
         assert cfg.get('port', {}).get('p2p', 9000) == 9000
-        campaign = args.campaign or 'tyche-aws-' + datetime.now(timezone.utc).strftime('%Y%m%d') + '-600'
-        assert re.fullmatch('tyche-aws-[a-z0-9-]+', campaign)
+        campaign = args.campaign or 'asyrand-aws-' + datetime.now(timezone.utc).strftime('%Y%m%d') + '-600'
+        assert re.fullmatch('asyrand-aws-[a-z0-9-]+', campaign)
         direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with direct.open('https://checkip.amazonaws.com', timeout=20) as response:
             controller_ip = response.read().decode().strip()
@@ -443,7 +443,7 @@ class SilentCampaign(Campaign):
         def deploy(item):
             (i, h) = item
             folder = base + '/' + cell + f'/node{i}'
-            unit = 'tyche-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24]
+            unit = 'asyrand-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24]
             ssh.call(h, 'mkdir -p ' + shlex.quote(folder) + '; test ! -e ' + shlex.quote(folder + '/node.exit'))
             ssh.put(h, out / 'config.json', folder + '/config.json')
             if protocol == 'grandline':
@@ -471,7 +471,7 @@ class SilentCampaign(Campaign):
             else:
                 raise RuntimeError('native namespace readiness timeout')
             return dict(h, unit=unit, folder=folder)
-        active = [dict(h, unit='tyche-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24], folder=base + '/' + cell + f'/node{i}') for (i, h) in enumerate(hosts[:-1])]
+        active = [dict(h, unit='asyrand-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24], folder=base + '/' + cell + f'/node{i}') for (i, h) in enumerate(hosts[:-1])]
         try:
             active = parallel(deploy, list(enumerate(hosts[:-1])))
             assert len(active) == honest and hosts[-1]['id'] not in {h['id'] for h in active}
@@ -560,8 +560,8 @@ class SilentCampaign(Campaign):
         cfg = read(settings)
         assert cfg['instances']['type'] == 't3a.medium' and len(cfg['instances']['regions']) == 8
         assert cfg.get('port', {}).get('p2p', 9000) == 9000
-        campaign = args.campaign or 'tyche-aws-silent1-' + datetime.now(timezone.utc).strftime('%Y%m%d') + '-600'
-        assert re.fullmatch('tyche-aws-[a-z0-9-]+', campaign)
+        campaign = args.campaign or 'asyrand-aws-silent1-' + datetime.now(timezone.utc).strftime('%Y%m%d') + '-600'
+        assert re.fullmatch('asyrand-aws-[a-z0-9-]+', campaign)
         direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with direct.open('https://checkip.amazonaws.com', timeout=20) as response:
             controller_ip = response.read().decode().strip()
@@ -751,7 +751,7 @@ class RepeatCampaign(Campaign):
         if protocol == 'grandline':
             result = run([root / 'payload/bin/grandline', '-config', out / 'config.json', '-write-setup', out / 'setup.json'], timeout=3600)
             assert result.returncode == 0
-        active = [dict(h, unit='tyche-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24], folder=remote + '/' + cell + f'/node{i}') for (i, h) in enumerate(hosts)]
+        active = [dict(h, unit='asyrand-' + hashlib.sha256((inventory['campaign'] + cell + str(i) + self.version).encode()).hexdigest()[:24], folder=remote + '/' + cell + f'/node{i}') for (i, h) in enumerate(hosts)]
 
         def deploy(h):
             folder = h['folder']
@@ -874,8 +874,8 @@ class RepeatCampaign(Campaign):
         assert not (root / 'plan.json').exists()
         cfg = read(args.settings)
         assert cfg['instances']['type'] == 't3a.medium' and len(cfg['instances']['regions']) == 8
-        campaign = args.campaign or 'tyche-aws-repeat23-20261028-600'
-        assert re.fullmatch('tyche-aws-[a-z0-9-]+', campaign)
+        campaign = args.campaign or 'asyrand-aws-repeat23-20261028-600'
+        assert re.fullmatch('asyrand-aws-[a-z0-9-]+', campaign)
         manifest = common.stage_payload(root, __file__, self.protocols, compact=True, scenario=self.scenario)
         save(root / 'payload-manifest.json', manifest)
         run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', campaign, '-f', root / 'control-key'])

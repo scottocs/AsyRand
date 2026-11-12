@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	asyrand "Tyche/asyrand/protocol"
-	"Tyche/utils/p2p"
+	asyrand "asyrand/asyrand/protocol"
+	"asyrand/utils/p2p"
 )
 
 type splitMetricsTransport struct {

@@ -1,8 +1,8 @@
 package aba
 
 import (
-	asig "Tyche/asyrand/crypto"
-	"Tyche/utils/verification"
+	asig "asyrand/asyrand/crypto"
+	"asyrand/utils/verification"
 	"encoding/hex"
 	"testing"
 )

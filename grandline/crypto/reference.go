@@ -1,7 +1,7 @@
 package crypto
 
 import (
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"errors"
 	"fmt"
 	"go.dedis.ch/kyber/v3"

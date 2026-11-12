@@ -1,7 +1,7 @@
 {
   "key": {
-    "name": "AWS-Hou",
-    "path": "C:/Users/kanla/.ssh/AWS-Hou.pem"
+    "name": "AWS",
+    "path": "~/.ssh/AWS.pem"
   },
   "port": {
     "p2p": 9000

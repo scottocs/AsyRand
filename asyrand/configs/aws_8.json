@@ -1,6 +1,6 @@
 {
   "name": "aws-8",
-  "protocol": "asyrand-v2",
+  "protocol": "asyrand",
   "transport": "tcp",
   "f": 2,
   "round": 10,

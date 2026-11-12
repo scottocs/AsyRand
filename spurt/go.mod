@@ -1,4 +1,4 @@
-module Tyche/spurt
+module asyrand/spurt
 
 go 1.24.0
 
@@ -10,6 +10,6 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 )
 
-require Tyche/utils v0.0.0
+require asyrand/utils v0.0.0
 
-replace Tyche/utils => ../utils
+replace asyrand/utils => ../utils

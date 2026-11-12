@@ -1,7 +1,7 @@
 package main
 
 import (
-	config "Tyche/spurt/config"
+	config "asyrand/spurt/config"
 	"testing"
 )
 

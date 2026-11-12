@@ -1,7 +1,7 @@
 package asyrand
 
 import (
-	"Tyche/asyrand/protocol/aba"
+	"asyrand/asyrand/protocol/aba"
 	"sort"
 	"sync/atomic"
 )

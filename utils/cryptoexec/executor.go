@@ -38,7 +38,7 @@ var cpuThreads = struct {
 
 func configuredCPUGroup() *CPUGroup {
 	cpuGroup.Do(func() {
-		path := os.Getenv("TYCHE_CRYPTO_CGROUP_CONFIG")
+		path := os.Getenv("ASYRAND_CRYPTO_CGROUP_CONFIG")
 		if path == "" {
 			return
 		}
@@ -175,7 +175,7 @@ type budgetPool struct {
 	completed, helpers, waitNS atomic.Uint64
 }
 
-var profileBudgetTasks = os.Getenv("TYCHE_PROFILE_NODE") != "" && os.Getenv("TYCHE_PROFILE_NODE") == os.Getenv("TYCHE_BENCHMARK_NODE")
+var profileBudgetTasks = os.Getenv("ASYRAND_PROFILE_NODE") != "" && os.Getenv("ASYRAND_PROFILE_NODE") == os.Getenv("ASYRAND_BENCHMARK_NODE")
 
 func budgetLabel(label string, fn func()) {
 	if !profileBudgetTasks {
@@ -332,7 +332,7 @@ func CPUGroupStats() map[string]uint64 {
 }
 
 var batchWorkers = func() int {
-	raw := os.Getenv("TYCHE_CRYPTO_PARALLELISM")
+	raw := os.Getenv("ASYRAND_CRYPTO_PARALLELISM")
 	if raw == "" {
 		return 1
 	}

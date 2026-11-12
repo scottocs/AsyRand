@@ -15,7 +15,7 @@ mkdir -p bin
 (cd spurt && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../bin/spurt ./cmd/spurt)
 (cd grandline && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../bin/grandline ./cmd/grandline)
 (cd asyrand && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../bin/asyrand ./cmd/asyrand)
-docker build -f benchmark/docker/Dockerfile -t tyche-benchmark:latest .
+docker build -f benchmark/docker/Dockerfile -t asyrand-benchmark:latest .
 ```
 
 The default base image is the Silk runtime with seeded `tc netem`. Override
@@ -120,6 +120,9 @@ benchmark/.venv/Scripts/python.exe -m pip install -r benchmark/requirements.txt 
 
 Native AWS runs also require the system OpenSSH client. Keep AWS credentials
 and the private key referenced by `settings.json` local.
+Copy `settings.example.json` to `settings.json` and supply your own key name and
+path. Local settings and historical run/result directories are excluded from
+the anonymous source distribution.
 
 ## Current AWS repeat workflow
 
@@ -195,9 +198,8 @@ protocol process remains stopped. Its results belong to a separate campaign.
 checks remain available for native Linux Docker comparisons. The standalone
 AsyRand optimization tools live under `../asyrand/benchmarks/`.
 
-The retired Fabric tasks, `tychebench` package, original Tyche/reconfiguration
-plots and direct log-fetch shell entry point have been removed. Historical
-run directories, archives and their frozen sources remain preserved.
+Historical run directories, archives and their frozen sources remain local
+and are excluded from source exports.
 
 ## Original single-run AWS workflow
 
@@ -217,7 +219,7 @@ checks its volumes and security groups. Instance shutdown watchdogs provide a
 separate lifetime backstop.
 
 ```powershell
-benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py prepare --settings benchmark/settings.json --campaign tyche-aws-20261027-600 --out benchmark/runs/aws-20261027-600
+benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py prepare --settings benchmark/settings.json --campaign asyrand-aws-20261027-600 --out benchmark/runs/aws-20261027-600
 benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py run --out benchmark/runs/aws-20261027-600
 benchmark/.venv/Scripts/python.exe benchmark/aws_bench.py inspect --out benchmark/runs/aws-20261027-600
 ```

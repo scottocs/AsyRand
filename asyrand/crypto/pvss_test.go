@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"Tyche/utils/p2p"
+	"asyrand/utils/p2p"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/share"
 )

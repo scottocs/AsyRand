@@ -11,8 +11,8 @@ import (
 	"sort"
 	"sync"
 
-	asig "Tyche/asyrand/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/asyrand/crypto"
+	"asyrand/utils/p2p"
 )
 
 const (

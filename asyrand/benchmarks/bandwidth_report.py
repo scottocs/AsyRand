@@ -108,8 +108,8 @@ def main():
               "environment.json、validation.json、sources.tar.gz、bin/、配置、日志和公开历史均已保存。"]
     report="\n".join(lines)+"\n";(out/"bandwidth_report.txt").write_text(report)
 
-    os.environ.setdefault("MPLCONFIGDIR","/private/tmp/tyche-bandwidth-mpl")
-    os.environ.setdefault("XDG_CACHE_HOME","/private/tmp/tyche-bandwidth-cache")
+    os.environ.setdefault("MPLCONFIGDIR","/private/tmp/asyrand-bandwidth-mpl")
+    os.environ.setdefault("XDG_CACHE_HOME","/private/tmp/asyrand-bandwidth-cache")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

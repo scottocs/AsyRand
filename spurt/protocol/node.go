@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	asig "Tyche/spurt/crypto"
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	asig "asyrand/spurt/crypto"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 )
 
 const Protocol = "spurt/authenticated-v1"

@@ -1,6 +1,6 @@
 {
   "name": "local-8",
-  "protocol": "asyrand-v2",
+  "protocol": "asyrand",
   "transport": "memory",
   "f": 2,
   "round": 3,

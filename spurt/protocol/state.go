@@ -5,8 +5,8 @@ import (
 	"sort"
 	"sync"
 
-	asig "Tyche/spurt/crypto"
-	"Tyche/utils/p2p"
+	asig "asyrand/spurt/crypto"
+	"asyrand/utils/p2p"
 )
 
 type CommitmentRef struct {

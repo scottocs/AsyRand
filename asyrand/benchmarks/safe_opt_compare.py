@@ -60,7 +60,7 @@ def main():
     out = (args.out or ROOT / "asyrand/benchmarks" / datetime.now().strftime("safe_opt_%Y%m%d_%H%M%S")).resolve()
     out.mkdir(parents=True, exist_ok=False)
     environment = dict(
-        protocol="asyrand-v2", transport="memory", gomaxprocs=8, workers_per_node=4,
+        protocol="asyrand", transport="memory", gomaxprocs=8, workers_per_node=4,
         production_window=8, parallel_consumption=args.parallel, warmup=args.warmup,
         intervals=args.intervals, repeats=args.repeats, nodes=args.nodes,
         byte_window="runner counters from output warmup+1 through the last output",

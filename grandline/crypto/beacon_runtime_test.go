@@ -1,9 +1,9 @@
 package crypto
 
 import (
-	"Tyche/utils/cryptoexec"
-	"Tyche/utils/p2p"
-	"Tyche/utils/verification"
+	"asyrand/utils/cryptoexec"
+	"asyrand/utils/p2p"
+	"asyrand/utils/verification"
 	"bytes"
 	"encoding/hex"
 	"go.dedis.ch/kyber/v3"

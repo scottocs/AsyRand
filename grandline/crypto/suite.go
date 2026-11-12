@@ -1,7 +1,7 @@
 package crypto
 
 import (
-	"Tyche/utils/pairing"
+	"asyrand/utils/pairing"
 	"go.dedis.ch/kyber/v3"
 )
 

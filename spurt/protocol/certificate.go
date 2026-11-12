@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"sort"
 
-	asig "Tyche/spurt/crypto"
-	"Tyche/utils/verification"
+	asig "asyrand/spurt/crypto"
+	"asyrand/utils/verification"
 )
 
 // BeaconCertificate is SPURT Section VI's native public-verification evidence.

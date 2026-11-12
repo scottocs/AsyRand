@@ -1,7 +1,7 @@
 package main
 
 import (
-	config "Tyche/grandline/config"
+	config "asyrand/grandline/config"
 	"encoding/json"
 	"os"
 	"path/filepath"
