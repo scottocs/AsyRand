@@ -32,10 +32,3 @@ go -C spurt test ./...
 
 Historical results describe their recorded source versions. GRandLine uses
 simulated offline setup; SPURT does not implement full view change.
-
-## Source distribution
-
-Use `git archive` on a reviewed commit; `.gitattributes` excludes private and
-generated material. Anonymous hosting must also hide ownership and commit history.
-Example key seeds are public test fixtures. Keep local AWS settings private,
-and use matching source versions across all participants and scripts.
