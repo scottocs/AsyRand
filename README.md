@@ -24,11 +24,11 @@ go -C spurt test ./...
 
 ## Code and experiments
 
-- [asyrand/](asyrand/README.md): beacon implementation and configuration.
-- [spurt/](spurt/README.md), [grandline/](grandline/README.md): comparison implementations.
+- `asyrand/`: beacon implementation and configuration.
+- `spurt/`, `grandline/`: comparison implementations.
 - `utils/`: shared transport and cryptographic helpers.
-- [benchmark/](benchmark/README.md): AWS and Docker experiments.
-- [asyrand/benchmarks/](asyrand/benchmarks/README.md): local comparison scripts.
+- `benchmark/`: AWS and Docker experiments.
+- `asyrand/benchmarks/`: local comparison scripts.
 
 Historical results describe their recorded source versions. GRandLine uses
 simulated offline setup; SPURT does not implement full view change.
